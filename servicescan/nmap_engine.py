@@ -11,7 +11,7 @@ import shutil
 import xml.etree.ElementTree as ET
 
 from .config import ScanConfig
-from .models import Service
+from .models import Service, Host
 from webrecon import utils
 
 
@@ -28,12 +28,13 @@ def build_argv(cfg: ScanConfig) -> list[str]:
     if cfg.scan_rate:
         argv += ["--min-rate", str(cfg.scan_rate)]
     argv += cfg.nmap_args
-    argv.append(cfg.target)
+    # nmap expands CIDR / ranges / lists natively; hand it every token
+    argv += (cfg.targets or [cfg.target])
     return argv
 
 
-async def run_nmap(cfg: ScanConfig) -> tuple[str, list[Service], str]:
-    """Run nmap, return (resolved_ip, services, raw_xml). Never raises."""
+async def run_nmap(cfg: ScanConfig) -> tuple[list[Host], str]:
+    """Run nmap once over the whole spec, return ([Host], raw_xml). Never raises."""
     argv = build_argv(cfg)
     utils.info(f"nmap: {' '.join(argv)}")
     try:
@@ -45,72 +46,104 @@ async def run_nmap(cfg: ScanConfig) -> tuple[str, list[Service], str]:
         out, errb = await proc.communicate()
     except FileNotFoundError:
         utils.warn("nmap not found on PATH")
-        return "", [], ""
+        return [], ""
     except Exception as e:  # noqa: BLE001
         utils.err(f"nmap failed: {e}")
-        return "", [], ""
+        return [], ""
 
     xml = out.decode("utf-8", "replace")
     if proc.returncode not in (0, 1):   # 1 can still carry partial results
         utils.debug(f"nmap rc={proc.returncode}: {errb.decode('utf-8','replace')[:200]}")
-    ip, services = parse_nmap_xml(xml)
-    utils.good(f"nmap: {len(services)} open services on {ip or cfg.target}")
-    return ip, services, xml
+    hosts = parse_nmap_xml(xml)
+    nsvc = sum(len(h.services) for h in hosts)
+    utils.good(f"nmap: {nsvc} open service(s) across {len(hosts)} host(s)")
+    return hosts, xml
 
 
-def parse_nmap_xml(xml: str) -> tuple[str, list[Service]]:
-    """Parse nmap XML text into (ip, [Service])."""
-    services: list[Service] = []
-    ip = ""
+def _parse_port(port) -> Service | None:
+    state_el = port.find("state")
+    state = state_el.get("state", "") if state_el is not None else ""
+    if state != "open":
+        return None
+    svc_el = port.find("service")
+    svc = Service(
+        port=int(port.get("portid", "0")),
+        proto=port.get("protocol", "tcp"),
+        state=state,
+        sources=["nmap"],
+    )
+    if svc_el is not None:
+        svc.name = svc_el.get("name", "") or ""
+        svc.product = svc_el.get("product", "") or ""
+        svc.version = svc_el.get("version", "") or ""
+        svc.extrainfo = svc_el.get("extrainfo", "") or ""
+        tunnel = svc_el.get("tunnel", "")
+        if tunnel == "ssl":
+            svc.name = (svc.name or "https")
+            svc.tls = {"tunnel": "ssl"}
+        for cpe in svc_el.findall("cpe"):
+            if cpe.text:
+                svc.cpe.append(cpe.text)
+        if svc.product and svc.version:
+            svc.confidence = "high"
+        elif svc.product or svc.name:
+            svc.confidence = "medium"
+    return svc
+
+
+def _hostname_of(host_el) -> str:
+    """Prefer the user-supplied name; fall back to PTR."""
+    hns = host_el.find("hostnames")
+    if hns is None:
+        return ""
+    user = ptr = ""
+    for hn in hns.findall("hostname"):
+        name = hn.get("name", "") or ""
+        if not name:
+            continue
+        if hn.get("type") == "user" and not user:
+            user = name
+        elif not ptr:
+            ptr = name
+    return user or ptr
+
+
+def parse_nmap_xml(xml: str) -> list[Host]:
+    """Parse nmap XML into one Host per scanned machine (open ports only)."""
+    hosts: list[Host] = []
     if not xml.strip():
-        return ip, services
+        return hosts
     try:
         root = ET.fromstring(xml)
     except ET.ParseError as e:
         utils.debug(f"nmap xml parse error: {e}")
-        return ip, services
+        return hosts
 
-    for host in root.findall("host"):
-        addr = host.find("address")
-        if addr is not None:
-            ip = addr.get("addr", ip)
-        ports = host.find("ports")
-        if ports is None:
-            continue
-        for port in ports.findall("port"):
-            state_el = port.find("state")
-            state = state_el.get("state", "") if state_el is not None else ""
-            if state != "open":
-                continue
-            svc_el = port.find("service")
-            svc = Service(
-                port=int(port.get("portid", "0")),
-                proto=port.get("protocol", "tcp"),
-                state=state,
-                sources=["nmap"],
-            )
-            if svc_el is not None:
-                svc.name = svc_el.get("name", "") or ""
-                svc.product = svc_el.get("product", "") or ""
-                svc.version = svc_el.get("version", "") or ""
-                svc.extrainfo = svc_el.get("extrainfo", "") or ""
-                tunnel = svc_el.get("tunnel", "")
-                if tunnel == "ssl":
-                    svc.name = (svc.name or "https")
-                    svc.tls = {"tunnel": "ssl"}
-                for cpe in svc_el.findall("cpe"):
-                    if cpe.text:
-                        svc.cpe.append(cpe.text)
-                # nmap's own confidence (conf 0-10 attr)
-                conf = svc_el.get("conf", "")
-                if svc.product and svc.version:
-                    svc.confidence = "high"
-                elif svc.product or svc.name:
-                    svc.confidence = "medium"
-            services.append(svc)
+    for host_el in root.findall("host"):
+        ip = ""
+        for addr in host_el.findall("address"):
+            if addr.get("addrtype") in ("ipv4", "ipv6"):
+                ip = addr.get("addr", ip)
+                break
+        if not ip:
+            addr = host_el.find("address")
+            ip = addr.get("addr", "") if addr is not None else ""
+        hostname = _hostname_of(host_el)
 
-    services.sort(key=lambda s: s.port)
-    return ip, services
+        services: list[Service] = []
+        ports = host_el.find("ports")
+        if ports is not None:
+            for port in ports.findall("port"):
+                svc = _parse_port(port)
+                if svc is not None:
+                    services.append(svc)
+        services.sort(key=lambda s: s.port)
+
+        if services:
+            hosts.append(Host(target=hostname or ip, ip=ip,
+                              hostname=hostname, services=services))
+
+    return hosts
 
 
 def needs_fingerprint(svc: Service) -> bool:

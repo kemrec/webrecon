@@ -7,7 +7,10 @@ from dataclasses import dataclass, field
 @dataclass
 class ScanConfig:
     # target
-    target: str = ""                      # IP or hostname
+    target: str = ""                      # original spec, for display
+    targets: list[str] = field(default_factory=list)  # one or more tokens:
+    #   IP / hostname / CIDR (10.0.0.0/24) / range (10.0.0.1-50); nmap expands
+    #   these natively, the no-nmap fallback expands them via targets.expand()
 
     # port scan
     ports: str = "-"                      # nmap -p spec; "-" == all 65535

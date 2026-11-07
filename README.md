@@ -232,7 +232,30 @@ servicescan host --no-nmap -p 80,443,8080 # fingerprint-only, no nmap
 NVD_API_KEY=xxxx servicescan host         # raise NVD rate limit (recommended)
 ```
 
-Key flags: `-p/--ports`, `--top-ports`, `--rate` (nmap `--min-rate`),
+#### Targets: one host, many hosts, a range, or a file
+
+The target can be a single IP/hostname or several at once. Each host is scanned
+and then runs the fingerprint + CVE (+ optional `--web`) pipeline independently,
+reported under its own block. Accepted forms (mix freely):
+
+```bash
+servicescan 10.0.0.5                       # single IP or hostname
+servicescan 10.0.0.5 10.0.0.6 app.lab      # several targets in one run
+servicescan 10.0.0.5,10.0.0.6              # comma-separated also works
+servicescan 10.0.0.0/24                    # a CIDR block
+servicescan 10.0.0.1-50                    # an nmap-style range (any octet)
+servicescan -iL targets.txt                # read targets from a file
+servicescan 10.0.0.0/24 --web --min-cvss 7 # whole subnet, web-chain, high CVEs
+```
+
+`-iL FILE` reads one target per line (`#` comments allowed; commas/spaces split
+too). With nmap present, the whole spec is scanned in a single nmap invocation
+(it expands CIDR/ranges/lists natively); in `--no-nmap` mode servicescan expands
+the spec itself. Results group per host in the console, in `scan.json`
+(`hosts[]`), and host-prefixed in `services.txt` / `cves.txt`. With `--web`,
+each host gets its own `web/<ip>/<port>-<scheme>/` output subtree.
+
+Key flags: `-iL/--target-file`, `-p/--ports`, `--top-ports`, `--rate` (nmap `--min-rate`),
 `--no-nmap`, `--fp-all`, `--no-cve`, `--no-nvd`, `--no-osv`, `--no-epss`,
 `--no-kev`, `--nvd-api-key`, `--min-cvss`, `--web`, `--full`, `--web-render`,
 `--web-depth`, `--web-max-pages`, `--write-hosts`, `-c/--concurrency`,

@@ -7,7 +7,7 @@ import os
 import sys
 
 from .config import ScanConfig
-from . import orchestrator, report
+from . import orchestrator, report, targets
 from webrecon import utils
 
 
@@ -28,10 +28,19 @@ def build_parser() -> argparse.ArgumentParser:
                                             #   pivoting on cert SANs (internal zones)
   servicescan 10.0.0.5 --full               # thorough web chain (render, depth 3)
   servicescan 10.0.0.5 --web --write-hosts  # also persist cert SANs to /etc/hosts
-  NVD_API_KEY=xxxx servicescan host         # raise NVD rate limit
+  servicescan 10.0.0.0/24                    # whole CIDR block
+  servicescan 10.0.0.1-50                    # nmap-style range
+  servicescan 10.0.0.5 10.0.0.6 host.lab     # several targets at once
+  servicescan -iL targets.txt --web          # targets from a file, one per line
+  NVD_API_KEY=xxxx servicescan host          # raise NVD rate limit
 """,
     )
-    p.add_argument("target", help="IP or hostname")
+    p.add_argument("target", nargs="*",
+                   help="one or more IPs / hostnames / CIDR blocks "
+                        "(10.0.0.0/24) / ranges (10.0.0.1-50)")
+    p.add_argument("-iL", "--target-file", dest="target_file", default=None,
+                   metavar="FILE",
+                   help="read targets from FILE (one per line, '#' comments ok)")
 
     sc = p.add_argument_group("port scan")
     sc.add_argument("-p", "--ports", default="-",
@@ -95,9 +104,27 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def collect_targets(a: argparse.Namespace) -> list[str]:
+    toks: list[str] = []
+    for t in (a.target or []):
+        toks.extend(t.replace(",", " ").split())
+    if a.target_file:
+        toks.extend(targets.read_target_file(a.target_file))
+    # de-dup, preserve order
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in toks:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
 def cfg_from_args(a: argparse.Namespace) -> ScanConfig:
+    toks = collect_targets(a)
     return ScanConfig(
-        target=a.target,
+        target=" ".join(toks),
+        targets=toks,
         ports=a.ports,
         top_ports=a.top_ports,
         scan_rate=a.rate,
@@ -128,11 +155,16 @@ def cfg_from_args(a: argparse.Namespace) -> ScanConfig:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     cfg = cfg_from_args(args)
+    if not cfg.targets:
+        parser.error("no targets given (positional target(s) or -iL FILE)")
     utils.set_log_levels(cfg.quiet, cfg.verbose)
 
-    utils.info(f"servicescan starting against {cfg.target}")
+    ntxt = (f"{len(cfg.targets)} target spec(s)" if len(cfg.targets) > 1
+            else cfg.target)
+    utils.info(f"servicescan starting against {ntxt}")
     try:
         result = asyncio.run(orchestrator.run(cfg))
     except KeyboardInterrupt:

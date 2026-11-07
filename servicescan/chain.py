@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 
 from .config import ScanConfig
-from .models import ScanResult, Service
+from .models import ScanResult, Service, Host
 from . import fingerprint
 from webrecon import utils
 from webrecon.config import Config as WebConfig
@@ -73,16 +73,33 @@ def _write_hosts(ip: str, hosts: list[str]) -> None:
         utils.warn(f"write-hosts: {e}")
 
 
-async def run_web_chain(cfg: ScanConfig, result: ScanResult) -> None:
-    ip = result.ip or ""
-    # original target: use the hostname form if the user gave one, else the IP.
-    target_host = utils.host_of(utils.ensure_scheme(cfg.target)) or cfg.target
-    is_ip_target = target_host == ip or not any(c.isalpha() for c in target_host)
+def _safe_seg(name: str) -> str:
+    return "".join(c if (c.isalnum() or c in ".-") else "_" for c in name)
 
-    web_svcs = [s for s in result.services if s.state == "open" and _is_web(s)]
-    if not web_svcs:
+
+async def run_web_chain(cfg: ScanConfig, result: ScanResult) -> None:
+    web_hosts = [h for h in result.hosts
+                 if any(s.state == "open" and _is_web(s) for s in h.services)]
+    if not web_hosts:
         utils.info("web chain: no HTTP(S) ports found, nothing to hand off")
         return
+    multi = len([h for h in result.hosts if h.services]) > 1
+    for h in web_hosts:
+        await _chain_host(cfg, h, multi)
+
+
+async def _chain_host(cfg: ScanConfig, host: Host, multi: bool) -> None:
+    ip = host.ip or ""
+    # use the hostname form if we have one, else the IP.
+    target_host = host.hostname or ip
+    is_ip_target = not host.hostname
+
+    web_svcs = [s for s in host.services if s.state == "open" and _is_web(s)]
+    if not web_svcs:
+        return
+    if multi:
+        utils.info(f"web chain: host {host.label()} "
+                   f"({len(web_svcs)} web port(s))")
 
     # ensure every TLS web port has its cert grabbed, even when nmap already
     # identified the service (the fingerprint gap-fill layer skips those, so
@@ -94,15 +111,16 @@ async def run_web_chain(cfg: ScanConfig, result: ScanResult) -> None:
             if t:
                 svc.tls.update(t)
 
-    sans = harvest_sans(result.services)
+    sans = harvest_sans(host.services)
     if sans:
-        utils.good(f"web chain: harvested {len(sans)} cert SAN host(s) to pivot on")
+        utils.good(f"web chain: harvested {len(sans)} cert SAN host(s) "
+                   f"to pivot on ({host.label()})")
 
     # every harvested name (and the primary hostname) resolves to the scanned IP
     resolve_map: dict[str, str] = {}
     if ip:
-        for h in sans:
-            resolve_map[h] = ip
+        for s in sans:
+            resolve_map[s] = ip
         if not is_ip_target:
             resolve_map.setdefault(target_host, ip)
 
@@ -111,6 +129,8 @@ async def run_web_chain(cfg: ScanConfig, result: ScanResult) -> None:
 
     seed_host = target_host if not is_ip_target else ip
     extra = set(sans)
+    # per-host output dir segment so multiple hosts don't collide
+    host_seg = _safe_seg(ip or target_host)
 
     for svc in web_svcs:
         tls = _is_tls(svc)
@@ -118,6 +138,11 @@ async def run_web_chain(cfg: ScanConfig, result: ScanResult) -> None:
         url = f"{scheme}://{seed_host}:{svc.port}/"
         utils.info(f"web chain: webrecon {url} "
                    f"(+{len(extra)} cert-SAN vhost candidates)")
+
+        if multi:
+            outdir = os.path.join(cfg.outdir, "web", host_seg, f"{svc.port}-{scheme}")
+        else:
+            outdir = os.path.join(cfg.outdir, "web", f"{svc.port}-{scheme}")
 
         wcfg = WebConfig(
             target=url,
@@ -129,7 +154,7 @@ async def run_web_chain(cfg: ScanConfig, result: ScanResult) -> None:
             verify_tls=False,
             resolve_map=dict(resolve_map),
             extra_hosts=extra,
-            outdir=os.path.join(cfg.outdir, "web", f"{svc.port}-{scheme}"),
+            outdir=outdir,
             quiet=True,
         )
         # pivot on cert SANs, not public CT logs: skip crt.sh, keep vhost fuzz
