@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 from .config import Config
 from .http_client import HTTPClient
-from . import utils, extract, secrets
+from . import utils, extract, secrets, tech
 
 
 @dataclass
@@ -27,6 +27,8 @@ class CrawlResult:
     params: dict[str, set[str]] = field(default_factory=dict)  # endpoint -> param names
     secret_findings: list = field(default_factory=list)
     hosts: set[str] = field(default_factory=set)               # hosts seen (vhost seeds)
+    tech: set[str] = field(default_factory=set)                # detected technologies
+    forms: list = field(default_factory=list)                  # {url,method,params}
 
 
 class Crawler:
@@ -84,9 +86,10 @@ class Crawler:
             except Exception:  # noqa: BLE001
                 pass
 
-    async def _render(self, url: str) -> tuple[int, str, set[str]]:
-        """Return (status, html, network_urls) using Playwright."""
+    async def _render(self, url: str) -> tuple[int, str, set[str], dict]:
+        """Return (status, html, network_urls, headers) using Playwright."""
         net_urls: set[str] = set()
+        headers: dict = {}
         ctx = await self._browser.new_context(
             user_agent=self.cfg.user_agent,
             ignore_https_errors=True,
@@ -103,6 +106,11 @@ class Crawler:
             resp = await page.goto(url, wait_until=self.cfg.wait_until,
                                    timeout=self.cfg.page_timeout)
             status = resp.status if resp else 0
+            if resp:
+                try:
+                    headers = dict(resp.headers)
+                except Exception:  # noqa: BLE001
+                    headers = {}
             # small settle for lazy JS
             try:
                 await page.wait_for_timeout(600)
@@ -114,7 +122,7 @@ class Crawler:
             html = ""
         finally:
             await ctx.close()
-        return status, html, net_urls
+        return status, html, net_urls, headers
 
     # -- per-page processing -------------------------------------------------
     async def _process_js(self, js_url: str) -> None:
@@ -143,15 +151,33 @@ class Crawler:
                             visited: set[str]) -> None:
         # render or plain GET
         if self.cfg.render and self._browser:
-            status, html, net_urls = await self._render(url)
+            status, html, net_urls, headers = await self._render(url)
         else:
             r = await self.http.fetch(url)
-            status, html, net_urls = r.status, r.text, set()
+            status, html, net_urls, headers = r.status, r.text, set(), r.headers
 
         self.result.pages[url] = status
         self.result.hosts.add(utils.host_of(url))
         if not html:
             return
+
+        # technology fingerprint (headers + body), best-effort
+        try:
+            self.result.tech |= tech.detect(headers, html)
+        except Exception as e:  # noqa: BLE001
+            utils.debug(f"tech {url}: {e}")
+
+        # HTML forms -> endpoints + parameters
+        for f in extract.extract_forms(html):
+            action = utils.normalize_url(url, f["action"]) if f["action"] else url
+            action = action or url
+            self.result.forms.append({"url": action, "method": f["method"],
+                                      "params": f["params"]})
+            if action.startswith("http"):
+                self.result.urls.add(action)
+                clean, _ = utils.split_params(action)
+                if f["params"]:
+                    self.result.params.setdefault(clean, set()).update(f["params"])
 
         # secrets in HTML / inline scripts
         if self.cfg.do_secrets:

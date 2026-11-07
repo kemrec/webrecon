@@ -49,6 +49,14 @@ def write_all(outdir: str, data: dict) -> None:
                       f"\t{s['source']}:{s['line']}")
     _w(os.path.join(outdir, "secrets.txt"), slines)
 
+    _w(os.path.join(outdir, "tech.txt"), sorted(data.get("tech", [])))
+
+    flines = []
+    for f in data.get("forms", []):
+        flines.append(f"{f.get('method','GET')}\t{f.get('url','')}\t"
+                      f"{','.join(f.get('params', []))}")
+    _w(os.path.join(outdir, "forms.txt"), flines)
+
     utils.good(f"output written to {outdir}/ (report.json + *.txt)")
 
 
@@ -74,6 +82,7 @@ def console_summary(data: dict) -> None:
     print(f"  {C.CYN}js files{C.R}          : {len(s.get('js_files', []))}")
     print(f"  {C.CYN}endpoints (raw){C.R}   : {len(s.get('endpoints', []))}")
     print(f"  {C.CYN}params'd endpoints{C.R}: {len(s.get('params', {}))}")
+    print(f"  {C.CYN}html forms{C.R}        : {len(s.get('forms', []))}")
     print(f"  {C.CYN}subdomains{C.R}        : {len(s.get('subdomains', []))}")
     print(f"  {C.CYN}vhosts found{C.R}      : {len(s.get('vhosts', []))}")
     print(f"  {C.CYN}alive urls{C.R}        : {len(s.get('alive_urls', []))}")
@@ -81,6 +90,10 @@ def console_summary(data: dict) -> None:
     sev_col = C.RED if high else (C.YEL if med else C.GRN)
     print(f"  {sev_col}secrets{C.R}           : {len(sec)} "
           f"({C.RED}{high} high{C.R}, {C.YEL}{med} med{C.R}, {low} low)")
+    techs = s.get("tech", [])
+    if techs:
+        print(f"  {C.CYN}technologies{C.R}      : {', '.join(techs[:12])}"
+              f"{' ...' if len(techs) > 12 else ''}")
     print(f"{C.B}{'='*60}{C.R}")
 
     if sec:

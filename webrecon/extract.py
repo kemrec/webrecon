@@ -74,6 +74,29 @@ def extract_html_links(html: str) -> set[str]:
     return out
 
 
+_FORM_RE = re.compile(r"<form\b[^>]*>(.*?)</form>", re.I | re.S)
+_FORM_ATTR = re.compile(r"""(action|method)\s*=\s*["']([^"']*)["']""", re.I)
+_FIELD_RE = re.compile(
+    r"""<(?:input|select|textarea|button)\b[^>]*\bname\s*=\s*["']([^"']+)["']""",
+    re.I | re.S,
+)
+
+
+def extract_forms(html: str) -> list[dict]:
+    """Return a list of {action, method, params:[names]} for each <form>."""
+    forms: list[dict] = []
+    for m in _FORM_RE.finditer(html or ""):
+        open_tag = m.group(0).split(">", 1)[0]     # just this form's <form ...>
+        attrs = {k.lower(): v for k, v in _FORM_ATTR.findall(open_tag)}
+        names = sorted({n for n in _FIELD_RE.findall(m.group(0))})
+        forms.append({
+            "action": attrs.get("action", ""),
+            "method": (attrs.get("method", "get") or "get").upper(),
+            "params": names,
+        })
+    return forms
+
+
 def extract_js_endpoints(js: str) -> set[str]:
     """Extract candidate endpoints/paths/URLs from a JS blob."""
     out: set[str] = set()

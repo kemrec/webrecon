@@ -87,6 +87,8 @@ async def run(cfg: Config) -> dict:
             "alive_urls": alive_urls,
             "alive_hosts": alive_hosts,
             "secrets": [f.to_dict() for f in agg.secret_findings],
+            "tech": sorted(agg.tech),
+            "forms": agg.forms,
         }
         return data
     finally:
@@ -102,6 +104,8 @@ def _merge(dst: CrawlResult, src: CrawlResult) -> None:
     for ep, keys in src.params.items():
         dst.params.setdefault(ep, set()).update(keys)
     dst.secret_findings.extend(src.secret_findings)
+    dst.tech |= src.tech
+    dst.forms.extend(src.forms)
 
 
 def _shallow(cfg: Config) -> Config:

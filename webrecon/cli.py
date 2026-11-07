@@ -58,6 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("-A", "--user-agent", default=DEFAULT_UA)
     n.add_argument("-H", "--header", action="append", default=[],
                    metavar="K:V", help="extra header (repeatable)")
+    n.add_argument("--cookie", default=None, metavar="STR",
+                   help="Cookie header for authenticated crawling "
+                        "(e.g. 'session=abc; csrf=xyz')")
+    n.add_argument("--bearer", default=None, metavar="TOKEN",
+                   help="Authorization: Bearer TOKEN for authenticated crawling")
     n.add_argument("--proxy", default=None, help="http(s) proxy url")
     n.add_argument("--verify-tls", action="store_true",
                    help="verify TLS certs (default: off for recon)")
@@ -96,6 +101,10 @@ def cfg_from_args(a: argparse.Namespace) -> Config:
         if ":" in h:
             k, _, v = h.partition(":")
             headers[k.strip()] = v.strip()
+    if a.cookie:
+        headers["Cookie"] = a.cookie
+    if a.bearer:
+        headers["Authorization"] = f"Bearer {a.bearer}"
 
     cfg = Config(
         target=utils.ensure_scheme(a.target),
