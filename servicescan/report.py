@@ -68,9 +68,16 @@ def write_all(outdir: str, result: ScanResult) -> None:
     if nlines:
         _w(os.path.join(outdir, "scripts.txt"), nlines)
 
+    # extra machine/human formats: CSV, JSONL, standalone HTML report
+    try:
+        from . import formats
+        formats.write_extra(outdir, result)
+    except Exception as e:  # noqa: BLE001
+        utils.debug(f"extra formats: {e}")
+
     extra = " + scripts.txt" if nlines else ""
-    utils.good(f"output written to {outdir}/ "
-               f"(scan.json + services.txt + cves.txt{extra})")
+    utils.good(f"output written to {outdir}/ (scan.json + services.txt + "
+               f"cves.txt{extra} + CSV + JSONL + report.html)")
 
 
 def _w(path: str, lines) -> None:
