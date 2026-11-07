@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# webrecon output
+webrecon-out/
+*-out/
+out/
+
+# Tooling / OS
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+*.log
+
+# Editors
+.idea/
+.vscode/
+*.swp
