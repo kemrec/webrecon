@@ -13,7 +13,11 @@ dependencies = [
 
 [project.scripts]
 webrecon = "webrecon.cli:main"
+servicescan = "servicescan.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["webrecon", "servicescan"]

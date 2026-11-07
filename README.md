@@ -14,9 +14,16 @@ endpoints and parameters from HTML and JS, check what's alive, enumerate
 subdomains, discover hidden vhosts from certificate SANs, and scan every
 response for API keys, tokens, passwords and other secrets.
 
+This repo ships **two CLIs** that share one async core:
+
+| Tool | Purpose |
+|------|---------|
+| **`webrecon`** | web app crawler & recon (crawl + JS + params + alive + subdomains + vhost + secrets) |
+| **`servicescan`** | port/service/version discovery (nmap + own fingerprint layer) with NVD/OSV CVE correlation |
+
 ---
 
-## Features
+## Features — webrecon
 
 | Capability | What it does |
 |---|---|
@@ -119,7 +126,7 @@ Full list: `webrecon -h`.
 
 ---
 
-## Output
+## Output — webrecon
 
 Written to `-o` (default `webrecon-out/`):
 
@@ -133,7 +140,7 @@ A colored summary and the top secret findings are printed to the console.
 
 ---
 
-## How it works
+## How webrecon works
 
 ```
  ┌───────────┐   ┌─────────────┐   ┌──────────────┐   ┌────────┐   ┌────────┐
@@ -154,6 +161,93 @@ A colored summary and the top secret findings are printed to the console.
 
 ---
 
+## servicescan — service/version discovery + CVE correlation
+
+A second CLI for the host/network side. It wraps **nmap** for the heavy
+lifting (port scan + `-sV` service detection), then runs **its own
+fingerprint layer** to recover versions nmap leaves blank, and finally
+correlates every `(product, version)` against **NVD** and **OSV** to list
+known CVEs.
+
+### Why a layer on top of nmap?
+
+nmap's `-sV` is excellent on classic TCP services but often returns a bare
+`http`/`unknown` with no product or version — especially for web apps behind
+a reverse proxy (WordPress behind nginx, Jira, Grafana, …). servicescan takes
+nmap's result and, for every under-identified port, adds:
+
+- **banner grab** (with protocol-appropriate nudges for SSH/FTP/SMTP/Redis/…),
+- **HTTP fingerprint** (`Server` / `X-Powered-By` headers, `generator` meta,
+  body signatures for common apps + their versions),
+- **TLS certificate** (subject/issuer/SAN, often naming the host/app).
+
+Evidence is merged by confidence, so nmap's good answers are kept and only the
+gaps get filled. The result is strictly **≥ nmap** on version coverage — not a
+claim to replace nmap's signature database, but to finish the job where `-sV`
+gives up.
+
+> **Reality check:** servicescan does not reimplement nmap's probe database.
+> It *wraps* nmap and augments it. With `--no-nmap` it still works on a set of
+> common ports using only its own probes, but port coverage is then limited —
+> keep nmap installed for full-port scans.
+
+### How servicescan works
+
+```
+ ┌──────────────┐   ┌──────────────────┐   ┌─────────────────────┐   ┌────────┐
+ │ 1. nmap -sV  │──▶│ 2. fingerprint   │──▶│ 3. CVE correlation  │──▶│4.Report│
+ │ (full port)  │   │  fill nmap gaps  │   │  NVD + OSV by CPE   │   │json+txt│
+ │  XML parse   │   │  banner/HTTP/TLS │   │  /product+version   │   │        │
+ └──────────────┘   └──────────────────┘   └─────────────────────┘   └────────┘
+```
+
+### Install (adds nmap)
+
+servicescan needs the `nmap` binary on PATH (the Python deps come with the
+package):
+
+```bash
+# Debian/Ubuntu/Kali
+sudo apt install nmap
+# macOS
+brew install nmap
+```
+
+### Usage
+
+```bash
+servicescan 10.0.0.5                      # full-port nmap + fingerprint + CVEs
+servicescan scanme.nmap.org -p 1-1000     # limited port range
+servicescan 10.0.0.5 --top-ports 1000 --rate 2000
+servicescan host --fp-all                 # fingerprint every open port, not just gaps
+servicescan host --no-cve                 # service/version detection only
+servicescan host --min-cvss 7             # only show CVSS >= 7.0
+servicescan host --no-nmap -p 80,443,8080 # fingerprint-only, no nmap
+NVD_API_KEY=xxxx servicescan host         # raise NVD rate limit (recommended)
+```
+
+Key flags: `-p/--ports`, `--top-ports`, `--rate` (nmap `--min-rate`),
+`--no-nmap`, `--fp-all`, `--no-cve`, `--no-nvd`, `--no-osv`, `--nvd-api-key`,
+`--min-cvss`, `-c/--concurrency`, `-t/--timeout`, `-o/--outdir`. Full list:
+`servicescan -h`.
+
+> **NVD rate limits:** without an API key NVD allows ~5 requests / 30s. Get a
+> free key at <https://nvd.nist.gov/developers/request-an-api-key> and pass it
+> via `--nvd-api-key` or the `NVD_API_KEY` env var for larger scans.
+
+### Output — servicescan
+
+Written to `-o` (default `servicescan-out/`):
+
+- `scan.json` — full results (services, versions, provenance, CVEs)
+- `services.txt` — `port/proto  state  name  product version  [conf]  (sources)`
+- `cves.txt` — `score  severity  CVE-ID  port/ident  source  url` (score-sorted)
+
+The console prints each service with its merged version, provenance
+(`nmap+http+banner`), and the top CVEs colored by severity.
+
+---
+
 ## Notes
 
 - TLS verification is **off** by default for recon (`--verify-tls` to enable).
@@ -161,6 +255,9 @@ A colored summary and the top secret findings are printed to the console.
   workers; `--no-render` is much faster but misses JS-dynamic links.
 - crt.sh and DNS resolution need outbound access; on restricted networks those
   phases may return empty.
+- `servicescan` needs the `nmap` binary for full port coverage, and outbound
+  HTTPS to `services.nvd.nist.gov` / `api.osv.dev` for CVE correlation; both
+  degrade gracefully (fingerprint-only / zero CVEs) when unavailable.
 
 ---
 
