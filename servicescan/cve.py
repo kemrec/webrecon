@@ -14,6 +14,7 @@ returns so the scan completes.
 from __future__ import annotations
 
 import asyncio
+import re
 
 from .config import ScanConfig
 from .models import Service, CVE
@@ -98,6 +99,79 @@ def cpe22_to_23(cpe: str | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# CPE version-range matching (reduce false positives on keyword search)
+# ---------------------------------------------------------------------------
+def _vcmp(a: str, b: str) -> int:
+    """Compare two version strings: -1 if a<b, 0 if equal, 1 if a>b."""
+    try:
+        from packaging.version import Version
+        va, vb = Version(a), Version(b)
+        return (va > vb) - (va < vb)
+    except Exception:  # noqa: BLE001
+        ta = tuple(int(x) for x in re.findall(r"\d+", a)) or (0,)
+        tb = tuple(int(x) for x in re.findall(r"\d+", b)) or (0,)
+        return (ta > tb) - (ta < tb)
+
+
+def _match_cpe(m: dict, want_version: str) -> bool:
+    """Does one NVD cpeMatch node apply to our detected version?"""
+    crit = m.get("criteria", "")
+    fields = crit.split(":")
+    cpe_ver = fields[5] if len(fields) > 5 else "*"
+    if cpe_ver not in ("*", "-", ""):
+        return _vcmp(cpe_ver, want_version) == 0
+    lo_i = m.get("versionStartIncluding")
+    lo_e = m.get("versionStartExcluding")
+    hi_i = m.get("versionEndIncluding")
+    hi_e = m.get("versionEndExcluding")
+    if not any([lo_i, lo_e, hi_i, hi_e]):
+        return True                       # product listed with no version bound
+    if lo_i and _vcmp(want_version, lo_i) < 0:
+        return False
+    if lo_e and _vcmp(want_version, lo_e) <= 0:
+        return False
+    if hi_i and _vcmp(want_version, hi_i) > 0:
+        return False
+    if hi_e and _vcmp(want_version, hi_e) >= 0:
+        return False
+    return True
+
+
+def _cpe_products(mapped_product: str, want_product: str) -> set[str]:
+    out = set()
+    if mapped_product:
+        out.add(mapped_product.lower())
+    if want_product:
+        out.add(want_product.strip().lower().replace(" ", "_"))
+    return out
+
+
+def version_applies(cve_obj: dict, products: set[str], want_version: str) -> bool:
+    """Keep a CVE only if our product+version falls inside its CPE ranges.
+
+    Used for keyword-search results (which are not version-filtered by NVD).
+    Conservative: if our product never appears in the CVE's configurations we
+    keep the CVE (can't disprove it); we only drop it when our product IS listed
+    but every matching node excludes our version.
+    """
+    if not want_version:
+        return True
+    matches = []
+    for conf in cve_obj.get("configurations", []):
+        for node in conf.get("nodes", []):
+            for m in node.get("cpeMatch", []):
+                if not m.get("vulnerable", False):
+                    continue
+                crit = m.get("criteria", "").lower()
+                prod = crit.split(":")[4] if len(crit.split(":")) > 4 else ""
+                if any(p and (p == prod or p in crit) for p in products):
+                    matches.append(m)
+    if not matches:
+        return True
+    return any(_match_cpe(m, want_version) for m in matches)
+
+
+# ---------------------------------------------------------------------------
 # NVD
 # ---------------------------------------------------------------------------
 def _nvd_severity_cvss(cve_obj: dict) -> tuple[float | None, str]:
@@ -151,7 +225,10 @@ def parse_nvd(payload: dict) -> list[CVE]:
 
 
 async def query_nvd(http, cfg: ScanConfig, cpe: str | None,
-                    keyword: str | None) -> list[CVE]:
+                    keyword: str | None, cache=None,
+                    products: set[str] | None = None,
+                    want_version: str = "") -> list[CVE]:
+    import json
     params = {"resultsPerPage": str(min(cfg.max_cves_per_service, 100))}
     if cpe:
         params["cpeName"] = cpe
@@ -162,14 +239,33 @@ async def query_nvd(http, cfg: ScanConfig, cpe: str | None,
         return []
     qs = "&".join(f"{k}={v}" for k, v in params.items() if v != "" or k == "isVulnerable")
     url = f"{NVD_URL}?{qs}"
-    headers = {"apiKey": cfg.nvd_api_key} if cfg.nvd_api_key else None
-    r = await http.fetch(url, method="GET", headers=headers, read_body=True)
-    if not r.ok or r.status != 200:
-        utils.debug(f"nvd {r.status} for {cpe or keyword}")
-        return []
-    import json
+
+    payload = cache.get(f"nvd:{qs}") if cache is not None else None
+    if payload is None:
+        headers = {"apiKey": cfg.nvd_api_key} if cfg.nvd_api_key else None
+        r = await http.fetch(url, method="GET", headers=headers, read_body=True)
+        if not r.ok or r.status != 200:
+            utils.debug(f"nvd {r.status} for {cpe or keyword}")
+            return []
+        try:
+            payload = json.loads(r.text)
+        except Exception as e:  # noqa: BLE001
+            utils.debug(f"nvd parse: {e}")
+            return []
+        if cache is not None:
+            cache.set(f"nvd:{qs}", payload)
+
+    # keyword results are NOT version-filtered by NVD -> prune with CPE ranges
+    if keyword and not cpe and products and want_version:
+        before = payload.get("vulnerabilities", [])
+        kept = [it for it in before
+                if version_applies(it.get("cve", {}), products, want_version)]
+        if len(kept) != len(before):
+            utils.debug(f"nvd kw: version-filtered {len(before)}->{len(kept)}")
+        payload = {**payload, "vulnerabilities": kept}
+
     try:
-        return parse_nvd(json.loads(r.text))
+        return parse_nvd(payload)
     except Exception as e:  # noqa: BLE001
         utils.debug(f"nvd parse: {e}")
         return []
@@ -212,16 +308,26 @@ def parse_osv(payload: dict) -> list[CVE]:
 # ---------------------------------------------------------------------------
 # EPSS (FIRST.org) + CISA KEV enrichment
 # ---------------------------------------------------------------------------
-async def epss_lookup(http, cfg, cve_ids: list[str]) -> dict[str, tuple[float, float]]:
+async def epss_lookup(http, cfg, cve_ids: list[str],
+                      cache=None) -> dict[str, tuple[float, float]]:
     """Map CVE-ID -> (epss_probability, percentile) via the FIRST.org EPSS API.
 
     EPSS estimates the probability a CVE is exploited in the wild in the next
     30 days. The API takes a comma-separated ``cve=`` list; we batch to stay
-    within URL limits.
+    within URL limits. Per-CVE results are cached so only unseen IDs are queried.
     """
     import json
     out: dict[str, tuple[float, float]] = {}
     ids = [c for c in cve_ids if c.startswith("CVE-")]
+    if cache is not None:
+        remaining = []
+        for cid in ids:
+            hit = cache.get(f"epss:{cid}", ttl=86400)
+            if hit is not None:
+                out[cid] = (hit[0], hit[1])
+            else:
+                remaining.append(cid)
+        ids = remaining
     for i in range(0, len(ids), 100):
         chunk = ids[i:i + 100]
         url = f"{EPSS_URL}?cve={','.join(chunk)}"
@@ -239,16 +345,22 @@ async def epss_lookup(http, cfg, cve_ids: list[str]) -> dict[str, tuple[float, f
             if not cid:
                 continue
             try:
-                out[cid] = (float(row["epss"]), float(row["percentile"]))
+                pair = (float(row["epss"]), float(row["percentile"]))
             except (KeyError, TypeError, ValueError):
-                pass
+                continue
+            out[cid] = pair
+            if cache is not None:
+                cache.set(f"epss:{cid}", list(pair))
     return out
 
 
-async def kev_lookup(http, cfg) -> set[str]:
+async def kev_lookup(http, cfg, cache=None) -> set[str]:
     """Return the set of CVE-IDs in the CISA Known Exploited Vulnerabilities
-    catalog (fetched once per run)."""
+    catalog (cached for 6h; it is a multi-MB download)."""
     import json
+    cached = cache.get("kev:catalog", ttl=21600) if cache is not None else None
+    if cached is not None:
+        return set(cached)
     r = await http.fetch(KEV_URL, method="GET", read_body=True)
     if not r.ok or r.status != 200:
         utils.debug(f"kev {r.status}")
@@ -258,11 +370,14 @@ async def kev_lookup(http, cfg) -> set[str]:
     except Exception as e:  # noqa: BLE001
         utils.debug(f"kev parse: {e}")
         return set()
-    return {v.get("cveID") for v in data.get("vulnerabilities", [])
-            if v.get("cveID")}
+    ids = {v.get("cveID") for v in data.get("vulnerabilities", [])
+           if v.get("cveID")}
+    if cache is not None:
+        cache.set("kev:catalog", sorted(ids))
+    return ids
 
 
-async def enrich(cfg, http, services: list[Service]) -> None:
+async def enrich(cfg, http, services: list[Service], cache=None) -> None:
     """Attach EPSS scores and CISA-KEV flags to every CVE already found, then
     re-rank each service's list so known-exploited / high-risk CVEs surface."""
     all_ids = sorted({c.id for s in services for c in s.cves
@@ -273,9 +388,9 @@ async def enrich(cfg, http, services: list[Service]) -> None:
     epss_map: dict[str, tuple[float, float]] = {}
     kev_set: set[str] = set()
     if cfg.epss:
-        epss_map = await epss_lookup(http, cfg, all_ids)
+        epss_map = await epss_lookup(http, cfg, all_ids, cache=cache)
     if cfg.kev:
-        kev_set = await kev_lookup(http, cfg)
+        kev_set = await kev_lookup(http, cfg, cache=cache)
     if not epss_map and not kev_set:
         return
 
@@ -297,21 +412,30 @@ async def enrich(cfg, http, services: list[Service]) -> None:
 # ---------------------------------------------------------------------------
 # Correlation entry point
 # ---------------------------------------------------------------------------
-async def correlate(cfg: ScanConfig, http, services: list[Service]) -> None:
+async def correlate(cfg: ScanConfig, http, services: list[Service],
+                    cache=None) -> None:
     """Attach CVEs to each service that has an identifiable product."""
     import httpx
+    if cache is None:
+        from .cache import Cache
+        cache = Cache(enabled=getattr(cfg, "cve_cache", True),
+                      ttl=getattr(cfg, "cache_ttl", 86400))
 
     async def osv_direct(name: str, version: str) -> list[CVE]:
-        try:
-            async with httpx.AsyncClient(timeout=cfg.timeout, verify=False) as cl:
-                resp = await cl.post(OSV_URL,
-                                     json={"package": {"name": name},
-                                           "version": version})
-            if resp.status_code == 200:
-                return parse_osv(resp.json())
-        except Exception as e:  # noqa: BLE001
-            utils.debug(f"osv {name} {version}: {type(e).__name__}")
-        return []
+        ckey = f"osv:{name}:{version}"
+        payload = cache.get(ckey)
+        if payload is None:
+            try:
+                async with httpx.AsyncClient(timeout=cfg.timeout, verify=False) as cl:
+                    resp = await cl.post(OSV_URL,
+                                         json={"package": {"name": name},
+                                               "version": version})
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    cache.set(ckey, payload)
+            except Exception as e:  # noqa: BLE001
+                utils.debug(f"osv {name} {version}: {type(e).__name__}")
+        return parse_osv(payload) if payload else []
 
     sem = asyncio.Semaphore(max(4, cfg.concurrency // 4))  # APIs are rate-limited
 
@@ -327,7 +451,11 @@ async def correlate(cfg: ScanConfig, http, services: list[Service]) -> None:
                 raw_cpe = svc.cpe[0] if svc.cpe else None
                 cpe = make_cpe(svc.product, svc.version) or cpe22_to_23(raw_cpe)
                 kw = None if cpe else f"{svc.product} {svc.version}".strip()
-                for c in await query_nvd(http, cfg, cpe, kw):
+                mapped = _CPE_MAP.get(svc.product.strip().lower())
+                products = _cpe_products(mapped[1] if mapped else "", svc.product)
+                for c in await query_nvd(http, cfg, cpe, kw, cache=cache,
+                                         products=products,
+                                         want_version=svc.version):
                     found.setdefault(c.id, c)
                 if cpe:
                     utils.debug(f":{svc.port} nvd via {cpe}")
@@ -351,4 +479,9 @@ async def correlate(cfg: ScanConfig, http, services: list[Service]) -> None:
 
     # --- enrichment: EPSS probabilities + CISA KEV flags across all findings ---
     if cfg.epss or cfg.kev:
-        await enrich(cfg, http, services)
+        await enrich(cfg, http, services, cache=cache)
+
+    # --- exploit availability (ExploitDB / Metasploit / GitHub PoC) ---
+    if getattr(cfg, "exploits", False):
+        from . import exploits as exploit_mod
+        await exploit_mod.enrich_exploits(cfg, http, services, cache=cache)

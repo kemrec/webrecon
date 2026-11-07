@@ -47,6 +47,7 @@ class CVE:
     epss: float | None = None           # EPSS exploitation probability (0..1)
     epss_pct: float | None = None       # EPSS percentile among all CVEs (0..1)
     kev: bool = False                   # listed in CISA KEV (known exploited)
+    exploits: list = field(default_factory=list)  # [{source,title,url}] public PoCs
 
     def to_dict(self) -> dict:
         return asdict(self)

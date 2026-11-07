@@ -68,10 +68,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="skip EPSS enrichment (FIRST.org exploit-probability)")
     cv.add_argument("--no-kev", action="store_true",
                     help="skip CISA KEV lookup (known-exploited flagging)")
+    cv.add_argument("--exploits", action="store_true",
+                    help="map CVEs to public exploits/PoCs (ExploitDB CSV, "
+                         "Metasploit modules, PoC-in-GitHub index)")
     cv.add_argument("--nvd-api-key", default=os.environ.get("NVD_API_KEY"),
                     help="NVD API key (or env NVD_API_KEY)")
     cv.add_argument("--min-cvss", type=float, default=0.0,
                     help="drop CVEs below this base score")
+    cv.add_argument("--no-cache", action="store_true",
+                    help="disable the on-disk CVE/enrichment cache")
+    cv.add_argument("--cache-ttl", type=int, default=86400,
+                    help="cache entry lifetime in seconds (default 86400)")
 
     wb = p.add_argument_group("web chain")
     wb.add_argument("--web", action="store_true",
@@ -138,8 +145,11 @@ def cfg_from_args(a: argparse.Namespace) -> ScanConfig:
         osv=not a.no_osv,
         epss=not a.no_epss,
         kev=not a.no_kev,
+        exploits=a.exploits,
         nvd_api_key=a.nvd_api_key,
         min_cvss=a.min_cvss,
+        cve_cache=not a.no_cache,
+        cache_ttl=a.cache_ttl,
         web=a.web or a.full,
         web_render=a.web_render or a.full,
         web_depth=(a.web_depth if a.web_depth is not None else (3 if a.full else 1)),

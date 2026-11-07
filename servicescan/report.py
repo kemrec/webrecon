@@ -51,8 +51,9 @@ def write_all(outdir: str, result: ScanResult) -> None:
         score = f"{c.cvss:.1f}" if c.cvss is not None else "  ?"
         epss = f"{c.epss*100:.1f}%" if c.epss is not None else "-"
         kev = "KEV" if c.kev else "-"
+        exp = f"EXP:{len(c.exploits)}" if getattr(c, "exploits", None) else "-"
         clines.append(f"{score}\t{c.severity or '?':8}\t{c.id}\t"
-                      f"{hid}\t{s.port}/{s.ident()}\tepss={epss}\t{kev}"
+                      f"{hid}\t{s.port}/{s.ident()}\tepss={epss}\t{kev}\t{exp}"
                       f"\t{c.source}\t{c.url}")
     _w(os.path.join(outdir, "cves.txt"), clines)
 
@@ -107,7 +108,9 @@ def _print_service(s) -> None:
         kev = f"  {C.RED}{C.B}[KEV]{C.R}" if c.kev else ""
         epss = (f"  {C.GRY}EPSS {c.epss*100:.1f}%{C.R}"
                 if c.epss is not None else "")
-        print(f"        {col}{c.id}  CVSS {score}  {c.severity}{C.R}{kev}{epss}  "
+        exp = (f"  {C.RED}{C.B}[EXPLOIT x{len(c.exploits)}]{C.R}"
+               if getattr(c, "exploits", None) else "")
+        print(f"        {col}{c.id}  CVSS {score}  {c.severity}{C.R}{kev}{exp}{epss}  "
               f"{C.GRY}{c.summary[:60]}{C.R}")
     if len(s.cves) > 6:
         print(f"        {C.GRY}... +{len(s.cves)-6} more (see cves.txt){C.R}")

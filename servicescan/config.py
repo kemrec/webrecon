@@ -32,9 +32,12 @@ class ScanConfig:
     osv: bool = True
     epss: bool = True                     # enrich CVEs with FIRST.org EPSS scores
     kev: bool = True                      # flag CVEs listed in CISA KEV catalog
+    exploits: bool = False                # map CVEs to public exploits/PoCs
     nvd_api_key: str | None = None        # optional, raises rate limit
     min_cvss: float = 0.0                 # filter out CVEs below this score
     max_cves_per_service: int = 50
+    cve_cache: bool = True                # cache NVD/OSV/EPSS/KEV lookups to disk
+    cache_ttl: int = 86400                # cache entry lifetime (seconds)
 
     # web chain (--web): hand discovered HTTP(S) ports to webrecon, pivoting on
     # TLS cert SANs to enumerate cert-only / internal virtual hosts
