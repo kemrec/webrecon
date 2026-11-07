@@ -120,6 +120,8 @@ webrecon example.com -H "Cookie: sid=abc" -H "X-Api-Key: k" \
 | `-c, --concurrency` | `40` | async concurrency |
 | `-t, --timeout` | `12` | per-request timeout (s) |
 | `-H, --header` | — | extra header, repeatable (`K:V`) |
+| `--cookie` | — | Cookie header for authenticated crawling |
+| `--bearer` | — | `Authorization: Bearer TOKEN` for authenticated crawling |
 | `--proxy` | — | HTTP(S) proxy URL |
 | `--verify-tls` | off | verify TLS certs (recon default: off) |
 | `-o, --outdir` | `webrecon-out` | output directory |
@@ -161,6 +163,8 @@ Written to `-o` (default `webrecon-out/`):
 - `params.txt` — `endpoint<TAB>param1,param2`
 - `subdomains.txt`, `alive.txt`, `vhosts.txt`
 - `secrets.txt` — `[SEVERITY] type  preview  source:line`
+- `tech.txt` — detected technologies (server, framework, CMS, JS libs)
+- `forms.txt` — `METHOD<TAB>action-url<TAB>field1,field2` for every HTML form
 
 A colored summary and the top secret findings are printed to the console.
 
@@ -255,8 +259,28 @@ servicescan host --no-cve                 # service/version detection only
 servicescan host --min-cvss 7             # only show CVSS >= 7.0
 servicescan host --no-epss --no-kev       # CVEs only, skip risk enrichment
 servicescan host --no-nmap -p 80,443,8080 # fingerprint-only, no nmap
+servicescan host --exploits               # map CVEs to public exploits/PoCs
+servicescan host --nse                    # also run nmap NSE 'vuln' scripts
+servicescan host --udp -p 53,161,123      # UDP services (needs root, slower)
 NVD_API_KEY=xxxx servicescan host         # raise NVD rate limit (recommended)
 ```
+
+#### Exploit mapping, NSE, UDP, and caching
+
+- `--exploits` maps each found CVE to public exploits/PoCs from three sources:
+  the local **ExploitDB** CSV (shipped with `exploitdb`/searchsploit on Kali),
+  **Metasploit** module metadata if present, and the **PoC-in-GitHub** index
+  (cached). CVEs with a known exploit re-rank to the top and get an
+  `[EXPLOIT xN]` badge; the first link is in `report.html` and `cves.csv`.
+- `--nse` runs nmap NSE scripts (default category `vuln`, override with
+  `--nse-scripts`). Output lands in `scripts.txt` and `scan.json`.
+- `--udp` adds a UDP service scan (`-sU`; needs root and is much slower).
+  UDP ports reported `open|filtered` are kept.
+- CVE / EPSS / KEV / OSV lookups are **cached to disk** (`~/.cache/servicescan`)
+  so re-runs are 2-3x faster and stay under the NVD rate limit. `--no-cache`
+  disables it; `--cache-ttl SECONDS` tunes freshness. Keyword-search NVD
+  results are additionally filtered by **CPE version range**, so a CVE whose
+  fixed/affected range excludes the detected version is dropped.
 
 #### Targets: one host, many hosts, a range, or a file
 
@@ -282,10 +306,16 @@ the spec itself. Results group per host in the console, in `scan.json`
 each host gets its own `web/<ip>/<port>-<scheme>/` output subtree.
 
 Key flags: `-iL/--target-file`, `-p/--ports`, `--top-ports`, `--rate` (nmap `--min-rate`),
-`--no-nmap`, `--fp-all`, `--no-cve`, `--no-nvd`, `--no-osv`, `--no-epss`,
-`--no-kev`, `--nvd-api-key`, `--min-cvss`, `--web`, `--full`, `--web-render`,
+`--no-nmap`, `--udp`, `--nse`, `--nse-scripts`, `--fp-all`, `--no-cve`,
+`--no-nvd`, `--no-osv`, `--no-epss`, `--no-kev`, `--exploits`, `--nvd-api-key`,
+`--min-cvss`, `--no-cache`, `--cache-ttl`, `--web`, `--full`, `--web-render`,
 `--web-depth`, `--web-max-pages`, `--write-hosts`, `-c/--concurrency`,
 `-t/--timeout`, `-o/--outdir`. Full list: `servicescan -h`.
+
+Every scan writes, alongside `scan.json`: `services.txt`, `cves.txt`,
+`services.csv`, `cves.csv`, `scan.jsonl` (one service per line), and a
+standalone `report.html` (summary cards + per-host service/CVE tables with
+CVSS colouring and KEV/exploit badges). `scripts.txt` is added when `--nse` ran.
 
 ### Web chain (`--web`): scan, then crawl every web port
 
