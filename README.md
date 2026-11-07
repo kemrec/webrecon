@@ -167,7 +167,10 @@ A second CLI for the host/network side. It wraps **nmap** for the heavy
 lifting (port scan + `-sV` service detection), then runs **its own
 fingerprint layer** to recover versions nmap leaves blank, and finally
 correlates every `(product, version)` against **NVD** and **OSV** to list
-known CVEs.
+known CVEs. Each CVE is then enriched with its **EPSS** score (FIRST.org
+exploitation probability) and flagged if it appears in the **CISA KEV**
+catalog of vulnerabilities known to be exploited in the wild — so the output
+ranks by real-world risk, not just CVSS.
 
 ### Why a layer on top of nmap?
 
@@ -197,7 +200,7 @@ gives up.
  ┌──────────────┐   ┌──────────────────┐   ┌─────────────────────┐   ┌────────┐
  │ 1. nmap -sV  │──▶│ 2. fingerprint   │──▶│ 3. CVE correlation  │──▶│4.Report│
  │ (full port)  │   │  fill nmap gaps  │   │  NVD + OSV by CPE   │   │json+txt│
- │  XML parse   │   │  banner/HTTP/TLS │   │  /product+version   │   │        │
+ │  XML parse   │   │  banner/HTTP/TLS │   │  + EPSS + CISA KEV  │   │        │
  └──────────────┘   └──────────────────┘   └─────────────────────┘   └────────┘
 ```
 
@@ -222,14 +225,15 @@ servicescan 10.0.0.5 --top-ports 1000 --rate 2000
 servicescan host --fp-all                 # fingerprint every open port, not just gaps
 servicescan host --no-cve                 # service/version detection only
 servicescan host --min-cvss 7             # only show CVSS >= 7.0
+servicescan host --no-epss --no-kev       # CVEs only, skip risk enrichment
 servicescan host --no-nmap -p 80,443,8080 # fingerprint-only, no nmap
 NVD_API_KEY=xxxx servicescan host         # raise NVD rate limit (recommended)
 ```
 
 Key flags: `-p/--ports`, `--top-ports`, `--rate` (nmap `--min-rate`),
-`--no-nmap`, `--fp-all`, `--no-cve`, `--no-nvd`, `--no-osv`, `--nvd-api-key`,
-`--min-cvss`, `-c/--concurrency`, `-t/--timeout`, `-o/--outdir`. Full list:
-`servicescan -h`.
+`--no-nmap`, `--fp-all`, `--no-cve`, `--no-nvd`, `--no-osv`, `--no-epss`,
+`--no-kev`, `--nvd-api-key`, `--min-cvss`, `-c/--concurrency`, `-t/--timeout`,
+`-o/--outdir`. Full list: `servicescan -h`.
 
 > **NVD rate limits:** without an API key NVD allows ~5 requests / 30s. Get a
 > free key at <https://nvd.nist.gov/developers/request-an-api-key> and pass it
@@ -239,12 +243,16 @@ Key flags: `-p/--ports`, `--top-ports`, `--rate` (nmap `--min-rate`),
 
 Written to `-o` (default `servicescan-out/`):
 
-- `scan.json` — full results (services, versions, provenance, CVEs)
+- `scan.json` — full results (services, versions, provenance, CVEs incl.
+  `epss`, `epss_pct` and `kev` fields per CVE)
 - `services.txt` — `port/proto  state  name  product version  [conf]  (sources)`
-- `cves.txt` — `score  severity  CVE-ID  port/ident  source  url` (score-sorted)
+- `cves.txt` — `score  severity  CVE-ID  port/ident  epss=  KEV  source  url`
+  (score-sorted)
 
 The console prints each service with its merged version, provenance
-(`nmap+http+banner`), and the top CVEs colored by severity.
+(`nmap+http+banner`), and the top CVEs colored by severity — with an `EPSS %`
+figure and a red `[KEV]` badge on anything in the CISA Known Exploited
+Vulnerabilities catalog. Per service, KEV-listed CVEs are ranked first.
 
 ---
 
@@ -256,8 +264,9 @@ The console prints each service with its merged version, provenance
 - crt.sh and DNS resolution need outbound access; on restricted networks those
   phases may return empty.
 - `servicescan` needs the `nmap` binary for full port coverage, and outbound
-  HTTPS to `services.nvd.nist.gov` / `api.osv.dev` for CVE correlation; both
-  degrade gracefully (fingerprint-only / zero CVEs) when unavailable.
+  HTTPS to `services.nvd.nist.gov` / `api.osv.dev` for CVE correlation, plus
+  `api.first.org` (EPSS) and `cisa.gov` (KEV) for risk enrichment; all degrade
+  gracefully (fingerprint-only / zero CVEs / no enrichment) when unavailable.
 
 ---
 

@@ -51,6 +51,10 @@ def build_parser() -> argparse.ArgumentParser:
     cv.add_argument("--no-cve", action="store_true", help="skip CVE correlation")
     cv.add_argument("--no-nvd", action="store_true", help="skip NVD source")
     cv.add_argument("--no-osv", action="store_true", help="skip OSV source")
+    cv.add_argument("--no-epss", action="store_true",
+                    help="skip EPSS enrichment (FIRST.org exploit-probability)")
+    cv.add_argument("--no-kev", action="store_true",
+                    help="skip CISA KEV lookup (known-exploited flagging)")
     cv.add_argument("--nvd-api-key", default=os.environ.get("NVD_API_KEY"),
                     help="NVD API key (or env NVD_API_KEY)")
     cv.add_argument("--min-cvss", type=float, default=0.0,
@@ -81,6 +85,8 @@ def cfg_from_args(a: argparse.Namespace) -> ScanConfig:
         cve=not a.no_cve,
         nvd=not a.no_nvd,
         osv=not a.no_osv,
+        epss=not a.no_epss,
+        kev=not a.no_kev,
         nvd_api_key=a.nvd_api_key,
         min_cvss=a.min_cvss,
         concurrency=a.concurrency,

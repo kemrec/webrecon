@@ -27,6 +27,8 @@ class ScanConfig:
     cve: bool = True
     nvd: bool = True
     osv: bool = True
+    epss: bool = True                     # enrich CVEs with FIRST.org EPSS scores
+    kev: bool = True                      # flag CVEs listed in CISA KEV catalog
     nvd_api_key: str | None = None        # optional, raises rate limit
     min_cvss: float = 0.0                 # filter out CVEs below this score
     max_cves_per_service: int = 50

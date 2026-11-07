@@ -22,6 +22,9 @@ from webrecon import utils
 
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 OSV_URL = "https://api.osv.dev/v1/query"
+EPSS_URL = "https://api.first.org/data/v1/epss"
+KEV_URL = ("https://www.cisa.gov/sites/default/files/feeds/"
+           "known_exploited_vulnerabilities.json")
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +71,30 @@ def make_cpe(product: str, version: str) -> str | None:
     vendor, prod = mapping
     ver = version.strip() or "*"
     return f"cpe:2.3:a:{vendor}:{prod}:{ver}:*:*:*:*:*:*:*"
+
+
+def cpe22_to_23(cpe: str | None) -> str | None:
+    """Convert a CPE 2.2 URI (``cpe:/a:vendor:product:version``) to the CPE 2.3
+    formatted string NVD's 2.0 API ``cpeName`` parameter requires
+    (``cpe:2.3:a:vendor:product:version:*:*:*:*:*:*:*``).
+
+    nmap emits CPE 2.2 URIs; feeding those to NVD verbatim 404s, so every
+    nmap-identified service would otherwise silently return zero CVEs.
+    Strings already in 2.3 form (or an unrecognized shape) are returned as-is.
+    """
+    if not cpe:
+        return None
+    cpe = cpe.strip()
+    if cpe.startswith("cpe:2.3:"):
+        return cpe
+    if cpe.startswith("cpe:/"):
+        # 2.2 components: part:vendor:product:version:update:edition:language
+        fields = cpe[len("cpe:/"):].split(":")
+        fields = [f if f else "*" for f in fields]
+        fields = (fields + ["*"] * 7)[:7]       # pad/trim to the 7 2.2 fields
+        fields += ["*"] * 4                       # extend to the 11 2.3 fields
+        return "cpe:2.3:" + ":".join(fields)
+    return cpe
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +210,91 @@ def parse_osv(payload: dict) -> list[CVE]:
 
 
 # ---------------------------------------------------------------------------
+# EPSS (FIRST.org) + CISA KEV enrichment
+# ---------------------------------------------------------------------------
+async def epss_lookup(http, cfg, cve_ids: list[str]) -> dict[str, tuple[float, float]]:
+    """Map CVE-ID -> (epss_probability, percentile) via the FIRST.org EPSS API.
+
+    EPSS estimates the probability a CVE is exploited in the wild in the next
+    30 days. The API takes a comma-separated ``cve=`` list; we batch to stay
+    within URL limits.
+    """
+    import json
+    out: dict[str, tuple[float, float]] = {}
+    ids = [c for c in cve_ids if c.startswith("CVE-")]
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        url = f"{EPSS_URL}?cve={','.join(chunk)}"
+        r = await http.fetch(url, method="GET", read_body=True)
+        if not r.ok or r.status != 200:
+            utils.debug(f"epss {r.status} for batch of {len(chunk)}")
+            continue
+        try:
+            data = json.loads(r.text)
+        except Exception as e:  # noqa: BLE001
+            utils.debug(f"epss parse: {e}")
+            continue
+        for row in data.get("data", []):
+            cid = row.get("cve")
+            if not cid:
+                continue
+            try:
+                out[cid] = (float(row["epss"]), float(row["percentile"]))
+            except (KeyError, TypeError, ValueError):
+                pass
+    return out
+
+
+async def kev_lookup(http, cfg) -> set[str]:
+    """Return the set of CVE-IDs in the CISA Known Exploited Vulnerabilities
+    catalog (fetched once per run)."""
+    import json
+    r = await http.fetch(KEV_URL, method="GET", read_body=True)
+    if not r.ok or r.status != 200:
+        utils.debug(f"kev {r.status}")
+        return set()
+    try:
+        data = json.loads(r.text)
+    except Exception as e:  # noqa: BLE001
+        utils.debug(f"kev parse: {e}")
+        return set()
+    return {v.get("cveID") for v in data.get("vulnerabilities", [])
+            if v.get("cveID")}
+
+
+async def enrich(cfg, http, services: list[Service]) -> None:
+    """Attach EPSS scores and CISA-KEV flags to every CVE already found, then
+    re-rank each service's list so known-exploited / high-risk CVEs surface."""
+    all_ids = sorted({c.id for s in services for c in s.cves
+                      if c.id.startswith("CVE-")})
+    if not all_ids:
+        return
+
+    epss_map: dict[str, tuple[float, float]] = {}
+    kev_set: set[str] = set()
+    if cfg.epss:
+        epss_map = await epss_lookup(http, cfg, all_ids)
+    if cfg.kev:
+        kev_set = await kev_lookup(http, cfg)
+    if not epss_map and not kev_set:
+        return
+
+    for svc in services:
+        for c in svc.cves:
+            if c.id in epss_map:
+                c.epss, c.epss_pct = epss_map[c.id]
+            if c.id in kev_set:
+                c.kev = True
+        # KEV first, then CVSS desc, then EPSS desc.
+        svc.cves.sort(key=lambda c: (not c.kev, -(c.cvss or 0),
+                                     -(c.epss or 0), c.id))
+
+    n_kev = sum(1 for s in services for c in s.cves if c.kev)
+    if n_kev:
+        utils.hit(f"{n_kev} CVE(s) listed in CISA KEV (known exploited in the wild)")
+
+
+# ---------------------------------------------------------------------------
 # Correlation entry point
 # ---------------------------------------------------------------------------
 async def correlate(cfg: ScanConfig, http, services: list[Service]) -> None:
@@ -210,8 +322,10 @@ async def correlate(cfg: ScanConfig, http, services: list[Service]) -> None:
             found: dict[str, CVE] = {}
             # --- NVD ---
             if cfg.nvd:
-                cpe = (svc.cpe[0] if svc.cpe else None) or make_cpe(
-                    svc.product, svc.version)
+                # Prefer a clean 2.3 CPE from our own map (carries the version);
+                # otherwise convert whatever nmap gave us (CPE 2.2 URI) to 2.3.
+                raw_cpe = svc.cpe[0] if svc.cpe else None
+                cpe = make_cpe(svc.product, svc.version) or cpe22_to_23(raw_cpe)
                 kw = None if cpe else f"{svc.product} {svc.version}".strip()
                 for c in await query_nvd(http, cfg, cpe, kw):
                     found.setdefault(c.id, c)
@@ -234,3 +348,7 @@ async def correlate(cfg: ScanConfig, http, services: list[Service]) -> None:
                           f"({crit} critical)")
 
     await asyncio.gather(*(one(s) for s in services))
+
+    # --- enrichment: EPSS probabilities + CISA KEV flags across all findings ---
+    if cfg.epss or cfg.kev:
+        await enrich(cfg, http, services)
