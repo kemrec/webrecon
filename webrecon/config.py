@@ -25,6 +25,14 @@ class Config:
     include_subdomains: bool = True       # subdomains count as in-scope
     wait_until: str = "networkidle"       # playwright nav wait state
     page_timeout: int = 20000             # ms per page
+    # resource throttling for render mode (keeps CPU/RAM bounded):
+    render_workers: int = 3               # max concurrent browser tabs/contexts
+    # resource types aborted during render — we only need DOM links + JS + the
+    # request URLs (captured before the abort), so images/media/fonts are pure
+    # cost. Loading them is what makes a headless crawl spike CPU/memory.
+    block_resources: set[str] = field(
+        default_factory=lambda: {"image", "media", "font"})
+    max_js_bytes: int = 4_000_000         # skip parsing JS bundles bigger than this
 
     # networking
     concurrency: int = 40                 # async concurrency for probes/fetches

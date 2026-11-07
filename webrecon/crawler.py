@@ -71,6 +71,19 @@ class Crawler:
         utils.info(f"browser launched (headless={not self.cfg.headful})")
 
     # -- rendering -----------------------------------------------------------
+    async def _route(self, route) -> None:
+        """Abort heavy, discovery-irrelevant resources (images/media/fonts)."""
+        try:
+            if route.request.resource_type in self.cfg.block_resources:
+                await route.abort()
+            else:
+                await route.continue_()
+        except Exception:  # noqa: BLE001
+            try:
+                await route.continue_()
+            except Exception:  # noqa: BLE001
+                pass
+
     async def _render(self, url: str) -> tuple[int, str, set[str]]:
         """Return (status, html, network_urls) using Playwright."""
         net_urls: set[str] = set()
@@ -81,7 +94,11 @@ class Crawler:
         )
         page = await ctx.new_page()
         status = 0
+        # record every request URL (fires before routing, so blocked resources
+        # are still discovered) then drop the heavy ones to save CPU/memory.
         page.on("request", lambda req: net_urls.add(req.url))
+        if self.cfg.block_resources:
+            await ctx.route("**/*", self._route)
         try:
             resp = await page.goto(url, wait_until=self.cfg.wait_until,
                                    timeout=self.cfg.page_timeout)
@@ -106,6 +123,10 @@ class Crawler:
         self.result.js_files.add(js_url)
         r = await self.http.fetch(js_url)
         if not r.ok or not r.text:
+            return
+        if len(r.text) > self.cfg.max_js_bytes:
+            utils.debug(f"skip large JS ({len(r.text)}B > "
+                        f"{self.cfg.max_js_bytes}B cap) {js_url}")
             return
         raw = extract.extract_js_endpoints(r.text)
         urls, pkeys, unresolved = extract.resolve_and_classify(js_url, raw)
@@ -196,7 +217,9 @@ class Crawler:
                     queue.task_done()
 
         # render-mode: fewer workers (browser contexts are heavy); http: more
-        n_workers = 3 if (self.cfg.render and self._browser) else min(self.cfg.concurrency, 15)
+        n_workers = (max(1, self.cfg.render_workers)
+                     if (self.cfg.render and self._browser)
+                     else min(self.cfg.concurrency, 15))
         workers = [asyncio.create_task(worker()) for _ in range(n_workers)]
         await asyncio.gather(*workers)
 

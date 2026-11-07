@@ -38,6 +38,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="playwright navigation wait (default networkidle)")
     g.add_argument("--page-timeout", type=int, default=20000,
                    help="per-page render timeout ms (default 20000)")
+    g.add_argument("--render-workers", type=int, default=3,
+                   help="max concurrent browser tabs in render mode (default 3)")
+    g.add_argument("--no-block-resources", action="store_true",
+                   help="load images/media/fonts too (default: aborted to "
+                        "save CPU/memory; does not affect link/JS discovery)")
+    g.add_argument("--max-js-bytes", type=int, default=4_000_000,
+                   help="skip parsing JS bundles larger than this (default 4MB)")
     g.add_argument("--no-subs-scope", action="store_true",
                    help="do NOT treat subdomains as in-scope for crawling")
 
@@ -98,6 +105,10 @@ def cfg_from_args(a: argparse.Namespace) -> Config:
         headful=a.headful,
         wait_until=a.wait_until,
         page_timeout=a.page_timeout,
+        render_workers=a.render_workers,
+        block_resources=(set() if a.no_block_resources
+                         else {"image", "media", "font"}),
+        max_js_bytes=a.max_js_bytes,
         include_subdomains=not a.no_subs_scope,
         concurrency=a.concurrency,
         timeout=a.timeout,

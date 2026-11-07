@@ -114,6 +114,9 @@ webrecon example.com -H "Cookie: sid=abc" -H "X-Api-Key: k" \
 | `--max-pages` | `300` | hard page cap |
 | `--no-render` | off | disable Playwright, HTTP-only |
 | `--headful` | off | run browser headed (debug) |
+| `--render-workers` | `3` | max concurrent browser tabs in render mode |
+| `--no-block-resources` | off | also load images/media/fonts (default: aborted) |
+| `--max-js-bytes` | `4000000` | skip parsing JS bundles bigger than this |
 | `-c, --concurrency` | `40` | async concurrency |
 | `-t, --timeout` | `12` | per-request timeout (s) |
 | `-H, --header` | — | extra header, repeatable (`K:V`) |
@@ -123,6 +126,29 @@ webrecon example.com -H "Cookie: sid=abc" -H "X-Api-Key: k" \
 | `-q / -v` | — | quiet / verbose |
 
 Full list: `webrecon -h`.
+
+### Resource usage (render mode)
+
+JS rendering is the expensive part of any crawler. webrecon keeps CPU/memory
+bounded without losing discovery:
+
+- **One shared browser per crawl**, reused across pages (not a launch per page),
+  with each page in its own context that is torn down right after — memory does
+  not accumulate across pages.
+- **Bounded parallelism**: at most `--render-workers` (3) tabs open at once;
+  the `--web` chain processes hosts and ports sequentially, so a `/24` scan
+  never spawns many browsers in parallel.
+- **Heavy resources aborted**: images, media and fonts are dropped during
+  render. Their request URLs are still recorded (so discovery is unaffected) —
+  only the download/decode is skipped, which is the bulk of the cost. On a
+  typical heavy page this cuts completed network work by ~65–70%. Use
+  `--no-block-resources` to load them anyway.
+- **Hard caps** on pages (`--max-pages`), depth (`-d`), per-page time
+  (`--page-timeout`) and JS parse size (`--max-js-bytes`).
+- Render is **off** inside the `--web` chain unless you pass `--web-render` /
+  `--full`; plain HTTP crawling barely uses the CPU at all.
+
+On a constrained box, `--render-workers 1` (or `--no-render`) is the safe dial.
 
 ---
 
