@@ -234,11 +234,11 @@ NVD_API_KEY=xxxx servicescan host         # raise NVD rate limit (recommended)
 
 Key flags: `-p/--ports`, `--top-ports`, `--rate` (nmap `--min-rate`),
 `--no-nmap`, `--fp-all`, `--no-cve`, `--no-nvd`, `--no-osv`, `--no-epss`,
-`--no-kev`, `--nvd-api-key`, `--min-cvss`, `--web`, `--web-render`,
+`--no-kev`, `--nvd-api-key`, `--min-cvss`, `--web`, `--full`, `--web-render`,
 `--web-depth`, `--web-max-pages`, `--write-hosts`, `-c/--concurrency`,
 `-t/--timeout`, `-o/--outdir`. Full list: `servicescan -h`.
 
-### Web chain (`--web`) — scan, then crawl every web port
+### Web chain (`--web`): scan, then crawl every web port
 
 `--web` turns the two tools into one pipeline: servicescan does the port /
 service / CVE pass, then hands every discovered HTTP(S) port to webrecon, which
@@ -247,21 +247,44 @@ crawls it, mines JS, and scans for secrets. Per-port webrecon output lands under
 service in `scan.json` (and the console).
 
 ```bash
-servicescan 10.0.0.5 --web                 # scan, then webrecon every web port
-servicescan 10.0.0.5 --web --web-render     # with JS rendering (Playwright)
-servicescan 10.0.0.5 --web --web-depth 2 --web-max-pages 150
-servicescan 10.0.0.5 --web --write-hosts    # also persist cert SANs to /etc/hosts
+servicescan 10.0.0.5 --web                              # default chain (fast)
+servicescan 10.0.0.5 --full                             # thorough chain (one flag)
+servicescan 10.0.0.5 --web --web-render                 # default + JS rendering
+servicescan 10.0.0.5 --web --web-depth 2 --web-max-pages 150   # deeper/wider crawl
+servicescan 10.0.0.5 --web --write-hosts                # also persist cert SANs
+servicescan 10.0.0.5 --full --web-depth 5               # full profile, depth tuned
 ```
 
-**The internal pivot.** On private networks, crt.sh is empty — but the TLS
+What the flags do (all require, or imply, `--web`):
+
+| Flag | Effect | Default |
+|------|--------|---------|
+| `--web` | run the chain: webrecon on every web port | HTTP-only, depth 1, 60 pages/port |
+| `--full` | thorough preset, **implies `--web`**: JS render on, depth 3, 300 pages/port | off |
+| `--web-render` | enable Playwright JS rendering (catches JS-injected links; slower, needs Chromium) | off (on under `--full`) |
+| `--web-depth N` | crawl depth per web port | 1 (3 under `--full`) |
+| `--web-max-pages N` | hard page cap per web port | 60 (300 under `--full`) |
+| `--write-hosts` | also append harvested cert SANs -> IP to `/etc/hosts` | off |
+
+`--full` is just a convenience profile: it sets render on and the deeper
+depth/page limits so you do not have to spell them out. **Any `--web-*` flag you
+pass still wins**, e.g. `--full --web-depth 5` keeps everything `--full` turns on
+but uses depth 5.
+
+`--write-hosts` is **not** needed for the crawl itself: the chain already reaches
+cert-only names in-process (see below). It is only for persisting those names so
+*other* tools (or a browser) resolve them afterwards, so it is opt-in and needs
+root.
+
+**The internal pivot.** On private networks crt.sh is empty, but the TLS
 certificate on a scanned port usually names other internal hosts in its SANs,
 and those names often exist *only* in the cert (an admin or staging vhost that
 was never put in DNS). The chain harvests every SAN across all TLS ports, maps
 each name to the scanned IP, and enumerates it against that IP with the right
 `Host` header and TLS SNI. So a cert-only name such as `admin.corp.internal`
-gets reached and crawled **without editing DNS or `/etc/hosts`** (the mapping is
-in-process; `--write-hosts` is opt-in, for feeding other tools). The browser
-path mirrors the same mapping via Chromium's `--host-resolver-rules`.
+gets reached and crawled **without editing DNS or `/etc/hosts`**: the mapping is
+in-process (`--write-hosts` is opt-in, for feeding other tools). The browser path
+mirrors the same mapping via Chromium's `--host-resolver-rules`.
 
 > **NVD rate limits:** without an API key NVD allows ~5 requests / 30s. Get a
 > free key at <https://nvd.nist.gov/developers/request-an-api-key> and pass it

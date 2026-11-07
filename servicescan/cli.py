@@ -26,6 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
   servicescan host --fp-all --min-cvss 7    # fingerprint every port, only high CVEs
   servicescan 10.0.0.5 --web                # scan, then webrecon every web port,
                                             #   pivoting on cert SANs (internal zones)
+  servicescan 10.0.0.5 --full               # thorough web chain (render, depth 3)
   servicescan 10.0.0.5 --web --write-hosts  # also persist cert SANs to /etc/hosts
   NVD_API_KEY=xxxx servicescan host         # raise NVD rate limit
 """,
@@ -68,13 +69,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="after scanning, run webrecon on every discovered "
                          "HTTP(S) port, pivoting on TLS cert SANs to enumerate "
                          "cert-only / internal virtual hosts against the IP")
+    wb.add_argument("--full", action="store_true",
+                    help="thorough web-chain profile (implies --web): JS "
+                         "rendering on, depth 3, 300 pages per port. Any "
+                         "--web-* flag you pass still overrides these.")
     wb.add_argument("--web-render", action="store_true",
                     help="use Playwright JS rendering in the web chain "
-                         "(slower; default is HTTP-only)")
-    wb.add_argument("--web-depth", type=int, default=1,
-                    help="crawl depth per web port (default 1)")
-    wb.add_argument("--web-max-pages", type=int, default=60,
-                    help="page cap per web port (default 60)")
+                         "(default HTTP-only; on under --full)")
+    wb.add_argument("--web-depth", type=int, default=None,
+                    help="crawl depth per web port (default 1, or 3 under --full)")
+    wb.add_argument("--web-max-pages", type=int, default=None,
+                    help="page cap per web port (default 60, or 300 under --full)")
     wb.add_argument("--write-hosts", action="store_true",
                     help="append harvested cert SANs -> IP to /etc/hosts "
                          "(needs root; for use by other tools)")
@@ -108,10 +113,11 @@ def cfg_from_args(a: argparse.Namespace) -> ScanConfig:
         kev=not a.no_kev,
         nvd_api_key=a.nvd_api_key,
         min_cvss=a.min_cvss,
-        web=a.web,
-        web_render=a.web_render,
-        web_depth=a.web_depth,
-        web_max_pages=a.web_max_pages,
+        web=a.web or a.full,
+        web_render=a.web_render or a.full,
+        web_depth=(a.web_depth if a.web_depth is not None else (3 if a.full else 1)),
+        web_max_pages=(a.web_max_pages if a.web_max_pages is not None
+                       else (300 if a.full else 60)),
         write_hosts=a.write_hosts,
         concurrency=a.concurrency,
         timeout=a.timeout,
