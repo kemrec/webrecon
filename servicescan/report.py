@@ -57,7 +57,20 @@ def write_all(outdir: str, result: ScanResult) -> None:
                       f"\t{c.source}\t{c.url}")
     _w(os.path.join(outdir, "cves.txt"), clines)
 
-    utils.good(f"output written to {outdir}/ (scan.json + services.txt + cves.txt)")
+    # scripts.txt  (NSE output, if any)
+    nlines = []
+    for h in result.hosts:
+        hid = h.ip or h.hostname or h.target
+        for s in h.services:
+            for sc in getattr(s, "scripts", []):
+                nlines.append(f"=== {hid} {s.port}/{s.proto} [{sc.get('id','')}] ===")
+                nlines.append(sc.get("output", ""))
+    if nlines:
+        _w(os.path.join(outdir, "scripts.txt"), nlines)
+
+    extra = " + scripts.txt" if nlines else ""
+    utils.good(f"output written to {outdir}/ "
+               f"(scan.json + services.txt + cves.txt{extra})")
 
 
 def _w(path: str, lines) -> None:
@@ -102,6 +115,9 @@ def _print_service(s) -> None:
           f"{ver_col}{s.ident():30}{C.R} {C.GRY}[{s.confidence}|{src}]{C.R}")
     if s.http.get("title"):
         print(f"        {C.GRY}title: {s.http['title']}{C.R}")
+    for sc in getattr(s, "scripts", []):
+        first = (sc.get("output", "").splitlines() or [""])[0].strip()
+        print(f"        {C.YEL}nse {sc.get('id','')}{C.R}: {C.GRY}{first[:80]}{C.R}")
     for c in s.cves[:6]:
         col = _sev_color(c.severity, c.cvss)
         score = f"{c.cvss:.1f}" if c.cvss is not None else "?"

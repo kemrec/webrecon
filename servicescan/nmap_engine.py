@@ -21,6 +21,10 @@ def nmap_available(path: str = "nmap") -> bool:
 
 def build_argv(cfg: ScanConfig) -> list[str]:
     argv = [cfg.nmap_path, "-sV", "-Pn", "-T4", "-oX", "-"]
+    if getattr(cfg, "udp", False):
+        argv.append("-sU")                # UDP service scan (needs root, slow)
+    if getattr(cfg, "nse", False):
+        argv += ["--script", cfg.nse_scripts or "vuln"]
     if cfg.top_ports:
         argv += ["--top-ports", str(cfg.top_ports)]
     else:
@@ -63,15 +67,21 @@ async def run_nmap(cfg: ScanConfig) -> tuple[list[Host], str]:
 def _parse_port(port) -> Service | None:
     state_el = port.find("state")
     state = state_el.get("state", "") if state_el is not None else ""
-    if state != "open":
+    # TCP: only "open"; UDP commonly reports "open|filtered" — keep those too
+    if not (state == "open" or state.startswith("open")):
         return None
-    svc_el = port.find("service")
     svc = Service(
         port=int(port.get("portid", "0")),
         proto=port.get("protocol", "tcp"),
         state=state,
         sources=["nmap"],
     )
+    # NSE script output attached to this port (--script / --nse)
+    for sc in port.findall("script"):
+        out = (sc.get("output") or "").strip()
+        if out:
+            svc.scripts.append({"id": sc.get("id", ""), "output": out[:2000]})
+    svc_el = port.find("service")
     if svc_el is not None:
         svc.name = svc_el.get("name", "") or ""
         svc.product = svc_el.get("product", "") or ""

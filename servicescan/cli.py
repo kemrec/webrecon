@@ -50,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--rate", type=int, default=None, help="nmap --min-rate")
     sc.add_argument("--no-nmap", action="store_true",
                     help="don't use nmap; fingerprint-only on common/-p ports")
+    sc.add_argument("--udp", action="store_true",
+                    help="also scan UDP (-sU; needs root, much slower)")
+    sc.add_argument("--nse", action="store_true",
+                    help="run nmap NSE scripts (default category 'vuln')")
+    sc.add_argument("--nse-scripts", default="vuln", metavar="SPEC",
+                    help="NSE script/category spec for --nse (default 'vuln')")
     sc.add_argument("--nmap-path", default="nmap")
     sc.add_argument("--nmap-arg", action="append", default=[],
                     metavar="ARG", help="extra nmap flag (repeatable)")
@@ -136,6 +142,9 @@ def cfg_from_args(a: argparse.Namespace) -> ScanConfig:
         top_ports=a.top_ports,
         scan_rate=a.rate,
         use_nmap=not a.no_nmap,
+        udp=a.udp,
+        nse=a.nse,
+        nse_scripts=a.nse_scripts,
         nmap_path=a.nmap_path,
         nmap_args=a.nmap_arg,
         fingerprint=not a.no_fingerprint,

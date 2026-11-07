@@ -19,6 +19,9 @@ class ScanConfig:
     nmap_args: list[str] = field(default_factory=list)  # extra nmap flags
     scan_rate: int | None = None          # nmap --min-rate
     top_ports: int | None = None          # nmap --top-ports (overrides ports)
+    udp: bool = False                     # add -sU (UDP scan; needs root, slow)
+    nse: bool = False                     # run NSE scripts (--script)
+    nse_scripts: str = "vuln"             # which NSE scripts/categories to run
 
     # fingerprint layer
     fingerprint: bool = True              # run our own layer on unknown services
