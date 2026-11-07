@@ -48,7 +48,8 @@ async def run(cfg: Config) -> dict:
         if cfg.do_crawl and new_hosts:
             utils.info(f"phase 3: shallow crawl of {len(new_hosts)} discovered hosts")
             scheme = "https" if cfg.target.startswith("https") else "http"
-            seeds = [f"{scheme}://{h}/" for h in new_hosts]
+            _, tgt_port = utils.hostport_of(cfg.target)
+            seeds = [f"{scheme}://{utils.with_port(h, tgt_port)}/" for h in new_hosts]
             sub_cfg = _shallow(cfg)
             sub_cfg.scope_hosts = cfg.scope_hosts | new_hosts
             async with Crawler(sub_cfg, http) as c2:

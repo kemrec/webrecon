@@ -46,6 +46,13 @@ async def run(cfg: ScanConfig) -> ScanResult:
         await http.close()
 
     result.services = services
+
+    # ---- optional phase 4: web chain (hand web ports to webrecon) ----
+    if cfg.web:
+        from . import chain
+        utils.info("web chain: handing discovered web ports to webrecon")
+        await chain.run_web_chain(cfg, result)
+
     return result
 
 

@@ -33,6 +33,14 @@ class ScanConfig:
     min_cvss: float = 0.0                 # filter out CVEs below this score
     max_cves_per_service: int = 50
 
+    # web chain (--web): hand discovered HTTP(S) ports to webrecon, pivoting on
+    # TLS cert SANs to enumerate cert-only / internal virtual hosts
+    web: bool = False                     # run webrecon on discovered web ports
+    web_render: bool = False              # use Playwright JS rendering in the chain
+    web_depth: int = 1                    # crawl depth per web port
+    web_max_pages: int = 60               # page cap per web port
+    write_hosts: bool = False             # append harvested cert SANs to /etc/hosts
+
     # output
     outdir: str = "servicescan-out"
     quiet: bool = False

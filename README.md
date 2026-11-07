@@ -202,6 +202,8 @@ gives up.
  │ (full port)  │   │  fill nmap gaps  │   │  NVD + OSV by CPE   │   │json+txt│
  │  XML parse   │   │  banner/HTTP/TLS │   │  + EPSS + CISA KEV  │   │        │
  └──────────────┘   └──────────────────┘   └─────────────────────┘   └────────┘
+                                      (--web) hand web ports + cert SANs │
+                                      webrecon crawl per HTTP(S) port ◀──┘
 ```
 
 ### Install (adds nmap)
@@ -232,8 +234,34 @@ NVD_API_KEY=xxxx servicescan host         # raise NVD rate limit (recommended)
 
 Key flags: `-p/--ports`, `--top-ports`, `--rate` (nmap `--min-rate`),
 `--no-nmap`, `--fp-all`, `--no-cve`, `--no-nvd`, `--no-osv`, `--no-epss`,
-`--no-kev`, `--nvd-api-key`, `--min-cvss`, `-c/--concurrency`, `-t/--timeout`,
-`-o/--outdir`. Full list: `servicescan -h`.
+`--no-kev`, `--nvd-api-key`, `--min-cvss`, `--web`, `--web-render`,
+`--web-depth`, `--web-max-pages`, `--write-hosts`, `-c/--concurrency`,
+`-t/--timeout`, `-o/--outdir`. Full list: `servicescan -h`.
+
+### Web chain (`--web`) — scan, then crawl every web port
+
+`--web` turns the two tools into one pipeline: servicescan does the port /
+service / CVE pass, then hands every discovered HTTP(S) port to webrecon, which
+crawls it, mines JS, and scans for secrets. Per-port webrecon output lands under
+`<outdir>/web/<port>-<scheme>/`, and a compact summary is attached to each
+service in `scan.json` (and the console).
+
+```bash
+servicescan 10.0.0.5 --web                 # scan, then webrecon every web port
+servicescan 10.0.0.5 --web --web-render     # with JS rendering (Playwright)
+servicescan 10.0.0.5 --web --web-depth 2 --web-max-pages 150
+servicescan 10.0.0.5 --web --write-hosts    # also persist cert SANs to /etc/hosts
+```
+
+**The internal pivot.** On private networks, crt.sh is empty — but the TLS
+certificate on a scanned port usually names other internal hosts in its SANs,
+and those names often exist *only* in the cert (an admin or staging vhost that
+was never put in DNS). The chain harvests every SAN across all TLS ports, maps
+each name to the scanned IP, and enumerates it against that IP with the right
+`Host` header and TLS SNI. So a cert-only name such as `admin.corp.internal`
+gets reached and crawled **without editing DNS or `/etc/hosts`** (the mapping is
+in-process; `--write-hosts` is opt-in, for feeding other tools). The browser
+path mirrors the same mapping via Chromium's `--host-resolver-rules`.
 
 > **NVD rate limits:** without an API key NVD allows ~5 requests / 30s. Get a
 > free key at <https://nvd.nist.gov/developers/request-an-api-key> and pass it
@@ -248,6 +276,9 @@ Written to `-o` (default `servicescan-out/`):
 - `services.txt` — `port/proto  state  name  product version  [conf]  (sources)`
 - `cves.txt` — `score  severity  CVE-ID  port/ident  epss=  KEV  source  url`
   (score-sorted)
+- with `--web`: per-port webrecon output under `web/<port>-<scheme>/`
+  (`report.json`, `urls.txt`, `secrets.txt`, `vhosts.txt`, …); each service in
+  `scan.json` also carries a compact `web` summary
 
 The console prints each service with its merged version, provenance
 (`nmap+http+banner`), and the top CVEs colored by severity — with an `EPSS %`

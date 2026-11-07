@@ -97,7 +97,9 @@ async def crtsh_subdomains(http: HTTPClient, apex: str) -> set[str]:
 # ---------------------------------------------------------------------------
 # DNS resolution helper (dnspython optional, fallback to socket)
 # ---------------------------------------------------------------------------
-def resolve(host: str) -> set[str]:
+def resolve(host: str, resolve_map: dict[str, str] | None = None) -> set[str]:
+    if resolve_map and host.lower() in resolve_map:
+        return {resolve_map[host.lower()]}
     ips: set[str] = set()
     try:
         import dns.resolver  # type: ignore
@@ -116,13 +118,15 @@ def resolve(host: str) -> set[str]:
     return ips
 
 
-async def resolve_many(hosts: set[str], concurrency: int = 50) -> dict[str, set[str]]:
+async def resolve_many(hosts: set[str], concurrency: int = 50,
+                       resolve_map: dict[str, str] | None = None
+                       ) -> dict[str, set[str]]:
     sem = asyncio.Semaphore(concurrency)
     out: dict[str, set[str]] = {}
 
     async def one(h: str):
         async with sem:
-            ips = await asyncio.to_thread(resolve, h)
+            ips = await asyncio.to_thread(resolve, h, resolve_map)
             if ips:
                 out[h] = ips
 
@@ -142,9 +146,9 @@ class VhostResult:
 
 
 async def vhost_scan(http: HTTPClient, ip: str, scheme: str,
-                     candidates: set[str]) -> VhostResult:
+                     candidates: set[str], port: int | None = None) -> VhostResult:
     """Send requests to `ip` with varied Host headers; flag divergent responses."""
-    base_url = f"{scheme}://{ip}/"
+    base_url = f"{scheme}://{utils.with_port(ip, port)}/"
     res = VhostResult(ip=ip)
 
     # baseline with a random/nonexistent host
@@ -193,6 +197,9 @@ async def run_discovery(cfg: Config, http: HTTPClient,
     apex = utils.registrable_hint(primary_host)
     dr = DiscoveryResult(apex=apex)
     candidates: set[str] = set(seed_hosts) | {primary_host}
+    # extra hosts handed in by a caller (e.g. cert SANs harvested upstream)
+    if getattr(cfg, "extra_hosts", None):
+        candidates |= set(cfg.extra_hosts)
 
     # 1) cert SANs (sync in thread)
     if cfg.do_vhost or cfg.do_subdomains:
@@ -237,13 +244,15 @@ async def run_discovery(cfg: Config, http: HTTPClient,
     # 4) resolve all candidates
     if cfg.do_subdomains or cfg.do_vhost:
         utils.info(f"resolving {len(candidates)} candidate hosts")
-        resolved = await resolve_many(candidates, concurrency=cfg.concurrency)
+        resolved = await resolve_many(candidates, concurrency=cfg.concurrency,
+                                      resolve_map=getattr(cfg, "resolve_map", None))
         dr.resolved = {h: sorted(ips) for h, ips in resolved.items()}
         utils.good(f"resolved {len(resolved)} hosts")
 
     # 5) vhost scan: group by IP, fuzz Host header for unresolved/wildcard names
     if cfg.do_vhost and dr.resolved:
         scheme = "https" if cfg.target.startswith("https") else "http"
+        _, tgt_port = utils.hostport_of(cfg.target)
         # IPs belonging to the primary host are the vhost targets
         primary_ips = set(dr.resolved.get(primary_host, []))
         if not primary_ips:
@@ -253,8 +262,9 @@ async def run_discovery(cfg: Config, http: HTTPClient,
         # candidate Host values: all known hostnames (test which the shared IP serves)
         host_cands = candidates
         for ip in list(target_ips)[:5]:   # cap to avoid scanning huge sets
-            utils.info(f"vhost fuzzing against {ip} ({len(host_cands)} hosts)")
-            vr = await vhost_scan(http, ip, scheme, host_cands)
+            utils.info(f"vhost fuzzing against {utils.with_port(ip, tgt_port)} "
+                       f"({len(host_cands)} hosts)")
+            vr = await vhost_scan(http, ip, scheme, host_cands, port=tgt_port)
             for f in vr.found:
                 dr.vhosts.append({"ip": ip, **f})
 

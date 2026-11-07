@@ -23,6 +23,7 @@ class Service:
     tls: dict = field(default_factory=dict)   # cert subject/issuer/SANs if TLS
     http: dict = field(default_factory=dict)  # server header, title, tech hints
     cves: list["CVE"] = field(default_factory=list)
+    web: dict = field(default_factory=dict)   # webrecon results (--web chain)
 
     def ident(self) -> str:
         v = f" {self.version}" if self.version else ""

@@ -76,6 +76,20 @@ def host_of(url: str) -> str:
         return ""
 
 
+def hostport_of(url: str) -> tuple[str, int | None]:
+    """Return (host, explicit_port_or_None) for a URL."""
+    try:
+        p = urlparse(ensure_scheme(url))
+        return (p.hostname or "").lower(), p.port
+    except Exception:
+        return "", None
+
+
+def with_port(host: str, port: int | None) -> str:
+    """host[:port] — port appended only when given (non-default caller choice)."""
+    return f"{host}:{port}" if port else host
+
+
 def registrable_hint(host: str) -> str:
     """Rough 'last two labels' apex guess (no PSL). e.g. a.b.example.com -> example.com"""
     parts = host.split(".")

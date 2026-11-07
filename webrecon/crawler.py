@@ -55,11 +55,18 @@ class Crawler:
             utils.warn("playwright not installed; falling back to HTTP-only crawl")
             self.cfg.render = False
             return
+        args = ["--no-sandbox", "--disable-dev-shm-usage",
+                "--ignore-certificate-errors"]
+        # mirror the httpx DNS override into Chromium so rendered requests to
+        # mapped hostnames also hit the chosen IP.
+        resolve_map = getattr(self.cfg, "resolve_map", None)
+        if resolve_map:
+            rules = ",".join(f"MAP {h} {ip}" for h, ip in resolve_map.items())
+            args.append(f"--host-resolver-rules={rules}")
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
             headless=not self.cfg.headful,
-            args=["--no-sandbox", "--disable-dev-shm-usage",
-                  "--ignore-certificate-errors"],
+            args=args,
         )
         utils.info(f"browser launched (headless={not self.cfg.headful})")
 

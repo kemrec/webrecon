@@ -10,6 +10,31 @@ from .config import Config
 from . import utils
 
 
+class _MappedTransport(httpx.AsyncHTTPTransport):
+    """Transport that redirects requests for mapped hostnames to a fixed IP.
+
+    The TCP connection goes to the mapped IP, but the original hostname is kept
+    for both the ``Host`` header (already set by the client before the request
+    reaches us) and the TLS SNI (via the ``sni_hostname`` extension). This lets
+    us enumerate virtual hosts / cert-only names against a known IP without
+    editing /etc/hosts. TLS verification is expected to be off for recon.
+    """
+
+    def __init__(self, resolve_map: dict, **kwargs):
+        super().__init__(**kwargs)
+        self._map = {h.lower(): ip for h, ip in resolve_map.items()}
+
+    async def handle_async_request(self, request):
+        host = (request.url.host or "").lower()
+        ip = self._map.get(host)
+        if ip:
+            ext = dict(request.extensions)
+            ext.setdefault("sni_hostname", host)
+            request.extensions = ext
+            request.url = request.url.copy_with(host=ip)
+        return await super().handle_async_request(request)
+
+
 @dataclass
 class Response:
     url: str
@@ -30,15 +55,24 @@ class HTTPClient:
         self.cfg = cfg
         self._sem = asyncio.Semaphore(cfg.concurrency)
         headers = {"User-Agent": cfg.user_agent, **cfg.extra_headers}
-        self._client = httpx.AsyncClient(
-            headers=headers,
-            timeout=cfg.timeout,
-            verify=cfg.verify_tls,
-            follow_redirects=True,
-            proxy=cfg.proxy,
-            limits=httpx.Limits(max_connections=cfg.concurrency * 2,
-                                max_keepalive_connections=cfg.concurrency),
-        )
+        limits = httpx.Limits(max_connections=cfg.concurrency * 2,
+                              max_keepalive_connections=cfg.concurrency)
+        resolve_map = getattr(cfg, "resolve_map", None)
+        if resolve_map:
+            # custom transport handles the hostname->IP mapping; verify/proxy
+            # must be set on the transport rather than the client.
+            transport = _MappedTransport(resolve_map, verify=cfg.verify_tls,
+                                         proxy=cfg.proxy, limits=limits,
+                                         retries=cfg.retries)
+            self._client = httpx.AsyncClient(
+                headers=headers, timeout=cfg.timeout,
+                follow_redirects=True, transport=transport,
+            )
+        else:
+            self._client = httpx.AsyncClient(
+                headers=headers, timeout=cfg.timeout, verify=cfg.verify_tls,
+                follow_redirects=True, proxy=cfg.proxy, limits=limits,
+            )
 
     async def close(self) -> None:
         await self._client.aclose()

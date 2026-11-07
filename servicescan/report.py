@@ -96,4 +96,14 @@ def console_summary(result: ScanResult) -> None:
                   f"{C.GRY}{c.summary[:60]}{C.R}")
         if len(s.cves) > 6:
             print(f"        {C.GRY}... +{len(s.cves)-6} more (see cves.txt){C.R}")
+        if s.web:
+            w = s.web
+            vh = w.get("vhosts", [])
+            print(f"        {C.CYN}web{C.R}: {w.get('pages',0)}p "
+                  f"{w.get('urls',0)}url {w.get('endpoints',0)}ep "
+                  f"{w.get('secrets',0)}secret {len(vh)}vhost  "
+                  f"{C.GRY}-> {w.get('outdir','')}{C.R}")
+            for v in vh[:5]:
+                print(f"           {C.GRN}vhost{C.R} {v.get('host')} "
+                      f"-> {v.get('status')} ({v.get('length')}b)")
     print(f"{C.B}{'='*66}{C.R}")

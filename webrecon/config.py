@@ -34,6 +34,14 @@ class Config:
     verify_tls: bool = False              # recon default: don't fail on bad certs
     extra_headers: dict[str, str] = field(default_factory=dict)
     proxy: str | None = None
+    # internal-DNS override: hostname -> IP. Requests to these hosts connect to
+    # the mapped IP while keeping the hostname for the Host header + TLS SNI, so
+    # names that live only in a cert (e.g. admin.corp.internal) are reachable
+    # without touching /etc/hosts.
+    resolve_map: dict[str, str] = field(default_factory=dict)
+    # extra candidate hosts injected into the discovery/vhost phase (e.g. cert
+    # SANs harvested by servicescan before handing off to webrecon).
+    extra_hosts: set[str] = field(default_factory=set)
 
     # feature toggles
     do_crawl: bool = True
