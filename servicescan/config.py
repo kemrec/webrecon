@@ -38,7 +38,11 @@ class ScanConfig:
     exploits: bool = False                # map CVEs to public exploits/PoCs
     nvd_api_key: str | None = None        # optional, raises rate limit
     min_cvss: float = 0.0                 # filter out CVEs below this score
-    max_cves_per_service: int = 50
+    max_cves_per_service: int = 50        # DISPLAY cap (applied after KEV/EPSS
+                                          # ranking, so KEV/critical survive)
+    max_cve_fetch: int = 2000             # hard ceiling on CVEs pulled per NVD
+                                          # query (paginated); guards pathological
+                                          # products with thousands of CVEs
     cve_cache: bool = True                # cache NVD/OSV/EPSS/KEV lookups to disk
     cache_ttl: int = 86400                # cache entry lifetime (seconds)
 

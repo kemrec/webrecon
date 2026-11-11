@@ -43,7 +43,8 @@ _CPE_MAP = {
     "redis": ("redis", "redis"),
     "postfix": ("postfix", "postfix"),
     "exim": ("exim", "exim"),
-    "vsftpd": ("vsftpd", "vsftpd"),
+    "vsftpd": ("vsftpd_project", "vsftpd"),   # NVD renames the vendor to
+                                              # <product>_project for this one
     "proftpd": ("proftpd", "proftpd"),
     "wordpress": ("wordpress", "wordpress"),
     "drupal": ("drupal", "drupal"),
@@ -224,12 +225,42 @@ def parse_nvd(payload: dict) -> list[CVE]:
     return out
 
 
+# NVD 2.0 allows up to 2000 results per page; we page through the whole result
+# set (bounded by cfg.max_cve_fetch) rather than taking only the first page, so
+# an old product with hundreds of CVEs (e.g. PHP 5.2.4 -> 324, with the KEV
+# CVE-2012-1823 at index 105) does not silently lose everything past page one.
+_NVD_PAGE = 2000
+
+
+async def _nvd_page(http, cfg, base_qs: str, start: int, cache):
+    """Fetch one NVD page (cached per start index). Returns the parsed payload
+    dict, or None on failure."""
+    import json
+    qs = f"{base_qs}&resultsPerPage={_NVD_PAGE}&startIndex={start}"
+    payload = cache.get(f"nvd:{qs}") if cache is not None else None
+    if payload is not None:
+        return payload
+    headers = {"apiKey": cfg.nvd_api_key} if cfg.nvd_api_key else None
+    r = await http.fetch(f"{NVD_URL}?{qs}", method="GET",
+                         headers=headers, read_body=True)
+    if not r.ok or r.status != 200:
+        utils.debug(f"nvd {r.status} start={start}")
+        return None
+    try:
+        payload = json.loads(r.text)
+    except Exception as e:  # noqa: BLE001
+        utils.debug(f"nvd parse: {e}")
+        return None
+    if cache is not None:
+        cache.set(f"nvd:{qs}", payload)
+    return payload
+
+
 async def query_nvd(http, cfg: ScanConfig, cpe: str | None,
                     keyword: str | None, cache=None,
                     products: set[str] | None = None,
                     want_version: str = "") -> list[CVE]:
-    import json
-    params = {"resultsPerPage": str(min(cfg.max_cves_per_service, 100))}
+    params = {}
     if cpe:
         params["cpeName"] = cpe
         params["isVulnerable"] = ""        # only CVEs applicable to this CPE
@@ -237,35 +268,37 @@ async def query_nvd(http, cfg: ScanConfig, cpe: str | None,
         params["keywordSearch"] = keyword
     else:
         return []
-    qs = "&".join(f"{k}={v}" for k, v in params.items() if v != "" or k == "isVulnerable")
-    url = f"{NVD_URL}?{qs}"
+    base_qs = "&".join(f"{k}={v}" for k, v in params.items()
+                       if v != "" or k == "isVulnerable")
 
-    payload = cache.get(f"nvd:{qs}") if cache is not None else None
-    if payload is None:
-        headers = {"apiKey": cfg.nvd_api_key} if cfg.nvd_api_key else None
-        r = await http.fetch(url, method="GET", headers=headers, read_body=True)
-        if not r.ok or r.status != 200:
-            utils.debug(f"nvd {r.status} for {cpe or keyword}")
-            return []
-        try:
-            payload = json.loads(r.text)
-        except Exception as e:  # noqa: BLE001
-            utils.debug(f"nvd parse: {e}")
-            return []
-        if cache is not None:
-            cache.set(f"nvd:{qs}", payload)
+    # page through the full result set up to the fetch ceiling
+    fetch_cap = max(_NVD_PAGE, getattr(cfg, "max_cve_fetch", _NVD_PAGE))
+    vulns: list = []
+    start = 0
+    while True:
+        payload = await _nvd_page(http, cfg, base_qs, start, cache)
+        if payload is None:
+            break
+        page = payload.get("vulnerabilities", [])
+        vulns.extend(page)
+        total = payload.get("totalResults", len(vulns))
+        start += _NVD_PAGE
+        if start >= total or len(vulns) >= fetch_cap or not page:
+            if total > fetch_cap:
+                utils.debug(f"nvd: {cpe or keyword} has {total} CVEs, "
+                            f"capped fetch at {fetch_cap}")
+            break
 
     # keyword results are NOT version-filtered by NVD -> prune with CPE ranges
     if keyword and not cpe and products and want_version:
-        before = payload.get("vulnerabilities", [])
-        kept = [it for it in before
-                if version_applies(it.get("cve", {}), products, want_version)]
-        if len(kept) != len(before):
-            utils.debug(f"nvd kw: version-filtered {len(before)}->{len(kept)}")
-        payload = {**payload, "vulnerabilities": kept}
+        before = vulns
+        vulns = [it for it in before
+                 if version_applies(it.get("cve", {}), products, want_version)]
+        if len(vulns) != len(before):
+            utils.debug(f"nvd kw: version-filtered {len(before)}->{len(vulns)}")
 
     try:
-        return parse_nvd(payload)
+        return parse_nvd({"vulnerabilities": vulns})
     except Exception as e:  # noqa: BLE001
         utils.debug(f"nvd parse: {e}")
         return []
@@ -459,6 +492,20 @@ async def correlate(cfg: ScanConfig, http, services: list[Service],
                     found.setdefault(c.id, c)
                 if cpe:
                     utils.debug(f":{svc.port} nvd via {cpe}")
+                    # A CPE that returns nothing usually means our vendor/product
+                    # guess disagrees with NVD's naming (NVD renames vendors,
+                    # e.g. vsftpd -> vsftpd_project). Fall back to a version-
+                    # filtered keyword search so a naming miss doesn't zero out
+                    # an otherwise well-known service.
+                    if not found and svc.product:
+                        kwfb = f"{svc.product} {svc.version}".strip()
+                        for c in await query_nvd(http, cfg, None, kwfb, cache=cache,
+                                                 products=products,
+                                                 want_version=svc.version):
+                            found.setdefault(c.id, c)
+                        if found:
+                            utils.debug(f":{svc.port} nvd cpe->kw fallback hit "
+                                        f"({len(found)})")
             # --- OSV (open-source packages) ---
             if cfg.osv and svc.version:
                 osv_name = _OSV_NAME.get(svc.product.lower())
@@ -466,10 +513,29 @@ async def correlate(cfg: ScanConfig, http, services: list[Service],
                     for c in await osv_direct(osv_name, svc.version):
                         found.setdefault(c.id, c)
 
+            # --- secondary products on the same port (PHP/ASP.NET via
+            #     X-Powered-By, etc.): own CVE subjects the single-product
+            #     Service would otherwise never query (e.g. PHP CVE-2012-1823).
+            if cfg.nvd:
+                for pair in getattr(svc, "aux", []):
+                    ap, av = (pair + ["", ""])[:2]
+                    acpe = make_cpe(ap, av)
+                    if not acpe:
+                        continue          # only correlate products we can map
+                    amapped = _CPE_MAP.get(ap.strip().lower())
+                    aprods = _cpe_products(amapped[1] if amapped else "", ap)
+                    for c in await query_nvd(http, cfg, acpe, None, cache=cache,
+                                             products=aprods, want_version=av):
+                        found.setdefault(c.id, c)
+                    utils.debug(f":{svc.port} aux nvd via {acpe}")
+
             cves = [c for c in found.values()
                     if (c.cvss is None or c.cvss >= cfg.min_cvss)]
             cves.sort(key=lambda c: (-(c.cvss or 0), c.id))
-            svc.cves = cves[: cfg.max_cves_per_service]
+            # keep the FULL set here; the display cap is applied in correlate()
+            # after KEV/EPSS enrichment so known-exploited / high-severity CVEs
+            # are never trimmed before they are ranked.
+            svc.cves = cves
             if svc.cves:
                 crit = sum(1 for c in svc.cves if (c.cvss or 0) >= 9)
                 utils.hit(f":{svc.port} {svc.ident()} -> {len(svc.cves)} CVEs "
@@ -480,6 +546,15 @@ async def correlate(cfg: ScanConfig, http, services: list[Service],
     # --- enrichment: EPSS probabilities + CISA KEV flags across all findings ---
     if cfg.epss or cfg.kev:
         await enrich(cfg, http, services, cache=cache)
+
+    # --- display cap: applied AFTER KEV/EPSS so a known-exploited or critical
+    #     CVE sitting past the cap by CVSS alone is not dropped before ranking.
+    cap = cfg.max_cves_per_service
+    for svc in services:
+        if len(svc.cves) > cap:
+            svc.cves.sort(key=lambda c: (not c.kev, -(c.cvss or 0),
+                                         -(c.epss or 0), c.id))
+            svc.cves = svc.cves[:cap]
 
     # --- exploit availability (ExploitDB / Metasploit / GitHub PoC) ---
     if getattr(cfg, "exploits", False):

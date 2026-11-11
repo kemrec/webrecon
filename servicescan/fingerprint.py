@@ -190,6 +190,40 @@ _HTTP_BODY_SIGS = [
 ]
 _SERVER_VER = re.compile(r"^([A-Za-z0-9+._-]+)(?:/([0-9][0-9A-Za-z._-]+))?")
 
+# secondary products a web server advertises alongside itself (X-Powered-By,
+# and some Server-header co-tokens). These run on the SAME port as the primary
+# server (e.g. Apache) but are separate CVE subjects (PHP, ASP.NET, OpenSSL):
+# the service carries one product, so without this they are never correlated.
+_POWERED_RX = re.compile(r"([A-Za-z][A-Za-z.+#-]{1,20})(?:/([0-9][0-9.]*))?")
+
+
+def _norm_ver(v: str) -> str:
+    """Strip distro/build suffixes: '5.2.4-2ubuntu5.10' -> '5.2.4' (keeps NVD
+    CPE matching from failing on the packaged version string)."""
+    m = re.match(r"\d+(?:\.\d+){0,3}", v or "")
+    return m.group(0) if m else ""
+
+
+def parse_powered(powered: str) -> list[list[str]]:
+    """Parse an X-Powered-By (or similar) header into [[product, version], ...].
+    Only well-formed name[/version] tokens are kept; version is normalized."""
+    out: list[list[str]] = []
+    for tok in (powered or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        m = _POWERED_RX.match(tok)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        ver = _norm_ver(m.group(2) or "")
+        if name.lower() in ("servlet", "jsp"):   # too generic for CVE lookup
+            continue
+        pair = [name, ver]
+        if pair not in out:
+            out.append(pair)
+    return out
+
 
 async def http_fingerprint(http, host: str, port: int, tls: bool):
     """Return dict with server/version/title/tech + (product,version,conf)."""
@@ -205,6 +239,9 @@ async def http_fingerprint(http, host: str, port: int, tls: bool):
     info["server"] = server
     if powered:
         info["x_powered_by"] = powered
+    aux = parse_powered(powered)
+    if aux:
+        info["aux"] = aux
     m = re.search(r"<title[^>]*>(.*?)</title>", r.text or "", re.I | re.S)
     if m:
         info["title"] = re.sub(r"\s+", " ", m.group(1)).strip()[:120]
@@ -316,6 +353,14 @@ def _merge_candidate(svc: Service, product: str, version: str,
         svc.sources.append(source)
 
 
+def _attach_aux(svc: Service, info: dict) -> None:
+    """Move any secondary products parsed from HTTP headers onto svc.aux (so
+    CVE correlation queries them too) and keep them out of the raw http dict."""
+    for pair in info.pop("aux", []):
+        if pair not in svc.aux:
+            svc.aux.append(pair)
+
+
 _HTTP_PORTS = {80, 8080, 8000, 8888, 591, 8008, 8081, 3000, 5000, 9000}
 _TLS_PORTS = {443, 8443, 9443, 4443}
 
@@ -380,6 +425,7 @@ async def fingerprint_service(cfg: ScanConfig, http, host: str,
         info, (p, v, c) = await http_fingerprint(http, host, svc.port, is_tls)
         tried_http = True
         if info.get("status"):
+            _attach_aux(svc, info)
             svc.http.update(info)
             _merge_candidate(svc, p, v, "http", c)
             if not svc.name:
@@ -390,6 +436,7 @@ async def fingerprint_service(cfg: ScanConfig, http, host: str,
         for use_tls in (False, True):
             info, (p, v, c) = await http_fingerprint(http, host, svc.port, use_tls)
             if info.get("status"):
+                _attach_aux(svc, info)
                 svc.http.update(info)
                 _merge_candidate(svc, p, v, "http", c)
                 if not svc.name:
