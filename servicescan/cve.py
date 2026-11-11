@@ -56,12 +56,33 @@ _CPE_MAP = {
     "jenkins": ("jenkins", "jenkins"),
 }
 
-# OSV ecosystem names (open-source packages OSV tracks well)
-_OSV_NAME = {
-    "wordpress": "WordPress",
-    "grafana": "grafana",
-    "nginx": "nginx",
-}
+# OSV is reliable only when queried WITH an ecosystem (PyPI, npm, Go, Packagist,
+# ...). A bare product-name query for a server product returns hundreds of
+# unversioned, cross-ecosystem distro trackers (e.g. 795 results for grafana
+# 8.3.0, vs NVD's correctly-scoped 39) with no CVSS -- pure noise. Server
+# products are NVD's domain, so this map is intentionally empty; add entries
+# only for genuine ecosystem packages where OSV version-scopes correctly.
+_OSV_NAME: dict[str, str] = {}
+
+
+def normalize_version(raw: str) -> str:
+    """Reduce a banner/nmap version string to a bare CPE-comparable token.
+
+    Service banners carry distro packaging and nmap uncertainty that break both
+    exact cpeName lookups and range comparison, e.g.
+      '4.7p1 Debian 8ubuntu1'  -> '4.7p1'   (OpenSSH; drop distro tail)
+      '5.0.51a-3ubuntu5'       -> '5.0.51a'  (MySQL; drop -distro suffix)
+      '8.3.0 - 8.3.7'          -> '8.3.0'    (nmap range; take the low end)
+      '2.2.8 (Ubuntu)'         -> '2.2.8'
+    Product-agnostic: take the first whitespace/comma token, cut a trailing
+    '-<distro>' suffix, and require it to start with a digit.
+    """
+    if not raw:
+        return ""
+    tok = raw.strip().replace(",", " ").split()[0] if raw.strip() else ""
+    tok = tok.split("-", 1)[0]                 # strip '-3ubuntu5' style suffixes
+    m = re.match(r"[0-9][0-9A-Za-z._]*", tok)
+    return m.group(0) if m else ""
 
 
 def make_cpe(product: str, version: str) -> str | None:
@@ -71,7 +92,7 @@ def make_cpe(product: str, version: str) -> str | None:
     if not mapping:
         return None
     vendor, prod = mapping
-    ver = version.strip() or "*"
+    ver = normalize_version(version) or "*"
     return f"cpe:2.3:a:{vendor}:{prod}:{ver}:*:*:*:*:*:*:*"
 
 
@@ -147,16 +168,21 @@ def _cpe_products(mapped_product: str, want_product: str) -> set[str]:
     return out
 
 
-def version_applies(cve_obj: dict, products: set[str], want_version: str) -> bool:
-    """Keep a CVE only if our product+version falls inside its CPE ranges.
+def version_applies(cve_obj: dict, products: set[str], want_version: str,
+                    require_product: bool = False) -> bool:
+    """Keep a CVE only if our product (+version, when known) fits its CPEs.
 
-    Used for keyword-search results (which are not version-filtered by NVD).
-    Conservative: if our product never appears in the CVE's configurations we
-    keep the CVE (can't disprove it); we only drop it when our product IS listed
-    but every matching node excludes our version.
+    Used to prune keyword-search results, which NVD does not scope to a product
+    or version. Two modes:
+      * require_product=False (CPE-anchored lookups): conservative. If our
+        product never appears in the CVE's configurations we keep it (can't
+        disprove); drop only when the product IS listed but every node excludes
+        our version.
+      * require_product=True (keyword search): strict. A keyword hit whose CPEs
+        never mention our product is a wrong-product match (e.g. a 'telnet'
+        search returning a FiberHome-router CVE, or 'grafana' returning an
+        ArcadeDB CVE) and is dropped. This is the main keyword FP killer.
     """
-    if not want_version:
-        return True
     matches = []
     for conf in cve_obj.get("configurations", []):
         for node in conf.get("nodes", []):
@@ -164,11 +190,19 @@ def version_applies(cve_obj: dict, products: set[str], want_version: str) -> boo
                 if not m.get("vulnerable", False):
                     continue
                 crit = m.get("criteria", "").lower()
-                prod = crit.split(":")[4] if len(crit.split(":")) > 4 else ""
-                if any(p and (p == prod or p in crit) for p in products):
+                parts = crit.split(":")
+                prod = parts[4] if len(parts) > 4 else ""
+                # match on the CPE product field or vendor field, not a loose
+                # substring of the whole criteria (which caused cross-product
+                # bleed), but still allow our token to equal either field.
+                vend = parts[3] if len(parts) > 3 else ""
+                if any(p and (p == prod or p == vend) for p in products):
                     matches.append(m)
     if not matches:
-        return True
+        # product absent from every CPE: keyword mode drops, CPE mode keeps
+        return not require_product
+    if not want_version:
+        return True                       # product matches, no version to test
     return any(_match_cpe(m, want_version) for m in matches)
 
 
@@ -289,13 +323,16 @@ async def query_nvd(http, cfg: ScanConfig, cpe: str | None,
                             f"capped fetch at {fetch_cap}")
             break
 
-    # keyword results are NOT version-filtered by NVD -> prune with CPE ranges
-    if keyword and not cpe and products and want_version:
+    # keyword results are NOT scoped by NVD to our product or version -> prune
+    # with a strict product+range gate (drops wrong-product and wrong-version
+    # hits). Runs even without a version, to drop cross-product keyword bleed.
+    if keyword and not cpe and products:
         before = vulns
         vulns = [it for it in before
-                 if version_applies(it.get("cve", {}), products, want_version)]
+                 if version_applies(it.get("cve", {}), products, want_version,
+                                    require_product=True)]
         if len(vulns) != len(before):
-            utils.debug(f"nvd kw: version-filtered {len(before)}->{len(vulns)}")
+            utils.debug(f"nvd kw: product/version-filtered {len(before)}->{len(vulns)}")
 
     try:
         return parse_nvd({"vulnerabilities": vulns})
@@ -307,12 +344,23 @@ async def query_nvd(http, cfg: ScanConfig, cpe: str | None,
 # ---------------------------------------------------------------------------
 # OSV
 # ---------------------------------------------------------------------------
+# Distro/vendor OSV trackers: each is a redundant repackaging of an upstream
+# CVE (which NVD already supplies, with CVSS). Querying OSV by bare package name
+# with no ecosystem returns hundreds of these (e.g. ALPINE-CVE-... for grafana),
+# flooding the result set with score-less duplicates -> drop them.
+_OSV_NOISE_PREFIX = ("ALPINE-", "DEBIAN-", "UBUNTU-", "RHSA-", "RHBA-", "RLSA-",
+                     "SUSE-", "OPENSUSE-", "CGA-", "MAL-", "BIT-")
+
+
 def parse_osv(payload: dict) -> list[CVE]:
     out: list[CVE] = []
     for v in payload.get("vulns", []):
         vid = v.get("id", "")
         aliases = v.get("aliases", [])
         cve_id = next((a for a in aliases if a.startswith("CVE-")), vid)
+        # skip distro-tracker duplicates that carry no canonical CVE alias
+        if cve_id.upper().startswith(_OSV_NOISE_PREFIX):
+            continue
         summary = v.get("summary") or v.get("details", "")
         score = None
         sev = ""
@@ -482,26 +530,28 @@ async def correlate(cfg: ScanConfig, http, services: list[Service],
                 # Prefer a clean 2.3 CPE from our own map (carries the version);
                 # otherwise convert whatever nmap gave us (CPE 2.2 URI) to 2.3.
                 raw_cpe = svc.cpe[0] if svc.cpe else None
+                nver = normalize_version(svc.version)
                 cpe = make_cpe(svc.product, svc.version) or cpe22_to_23(raw_cpe)
-                kw = None if cpe else f"{svc.product} {svc.version}".strip()
+                kw = None if cpe else f"{svc.product} {nver}".strip()
                 mapped = _CPE_MAP.get(svc.product.strip().lower())
                 products = _cpe_products(mapped[1] if mapped else "", svc.product)
                 for c in await query_nvd(http, cfg, cpe, kw, cache=cache,
                                          products=products,
-                                         want_version=svc.version):
+                                         want_version=nver):
                     found.setdefault(c.id, c)
                 if cpe:
                     utils.debug(f":{svc.port} nvd via {cpe}")
                     # A CPE that returns nothing usually means our vendor/product
                     # guess disagrees with NVD's naming (NVD renames vendors,
-                    # e.g. vsftpd -> vsftpd_project). Fall back to a version-
-                    # filtered keyword search so a naming miss doesn't zero out
-                    # an otherwise well-known service.
+                    # e.g. vsftpd -> vsftpd_project) or formats the version
+                    # differently (OpenSSH '4.7p1' vs NVD '4.7:p1'). Fall back to
+                    # a product+version filtered keyword search so a naming miss
+                    # does not zero out an otherwise well-known service.
                     if not found and svc.product:
-                        kwfb = f"{svc.product} {svc.version}".strip()
+                        kwfb = f"{svc.product} {nver}".strip()
                         for c in await query_nvd(http, cfg, None, kwfb, cache=cache,
                                                  products=products,
-                                                 want_version=svc.version):
+                                                 want_version=nver):
                             found.setdefault(c.id, c)
                         if found:
                             utils.debug(f":{svc.port} nvd cpe->kw fallback hit "
@@ -522,12 +572,20 @@ async def correlate(cfg: ScanConfig, http, services: list[Service],
                     acpe = make_cpe(ap, av)
                     if not acpe:
                         continue          # only correlate products we can map
+                    anver = normalize_version(av)
                     amapped = _CPE_MAP.get(ap.strip().lower())
                     aprods = _cpe_products(amapped[1] if amapped else "", ap)
-                    for c in await query_nvd(http, cfg, acpe, None, cache=cache,
-                                             products=aprods, want_version=av):
+                    hits = await query_nvd(http, cfg, acpe, None, cache=cache,
+                                           products=aprods, want_version=anver)
+                    # version '*' CPEs (no version detected) 404 at NVD; fall back
+                    # to a product-gated keyword search so the aux product still
+                    # correlates (e.g. a body-sig app with no version string).
+                    if not hits:
+                        hits = await query_nvd(http, cfg, None, ap, cache=cache,
+                                               products=aprods, want_version=anver)
+                    for c in hits:
                         found.setdefault(c.id, c)
-                    utils.debug(f":{svc.port} aux nvd via {acpe}")
+                    utils.debug(f":{svc.port} aux nvd via {acpe} ({len(hits)})")
 
             cves = [c for c in found.values()
                     if (c.cvss is None or c.cvss >= cfg.min_cvss)]

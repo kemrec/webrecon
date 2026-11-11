@@ -260,6 +260,40 @@ def parse_powered(powered: str) -> list[list[str]]:
     return out
 
 
+# Version endpoints for apps that are recognizable by name but hide their
+# version from the landing page. Data-driven and product-agnostic: add an app
+# by adding a (path, one-group regex) row -- the probing mechanism below needs
+# no per-app code. Only queried when such an app is identified without a version.
+_VERSION_PROBES = {
+    "grafana": ("/api/health", re.compile(r'"version"\s*:\s*"([0-9][0-9.]+)"')),
+    # WordPress exposes its version through the generator meta on any rendered
+    # page (already parsed into aux); readme.html carries no reliable version
+    # line and its GPL text ("version 2") invites a wrong match, so no probe.
+    "drupal": ("/CHANGELOG.txt", re.compile(r"Drupal\s+([0-9][0-9.]+)", re.I)),
+    "joomla": ("/administrator/manifests/files/joomla.xml",
+               re.compile(r"<version>\s*([0-9][0-9.]+)", re.I)),
+}
+
+
+async def _probe_app_version(http, host: str, port: int, tls: bool,
+                             app: str) -> str:
+    """Fetch an app's version endpoint (if one is registered) and extract it."""
+    spec = _VERSION_PROBES.get(app.strip().lower())
+    if not spec:
+        return ""
+    path, rx = spec
+    scheme = "https" if tls else "http"
+    try:
+        r = await http.fetch(f"{scheme}://{host}:{port}{path}",
+                             method="GET", read_body=True)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not getattr(r, "ok", False) or getattr(r, "status", 0) != 200:
+        return ""
+    m = rx.search(r.text or "")
+    return m.group(1) if m else ""
+
+
 async def http_fingerprint(http, host: str, port: int, tls: bool):
     """Return dict with server/version/title/tech + (product,version,conf)."""
     scheme = "https" if tls else "http"
@@ -289,29 +323,59 @@ async def http_fingerprint(http, host: str, port: int, tls: bool):
         product = sm.group(1)
         version = sm.group(2) or ""
         conf = "high" if version else "medium"
-    # app-level body/header signatures (may override generic server like nginx)
+    # app-level body/header signatures. A web app (WordPress, Grafana, ...) runs
+    # on the same port as the server (often Apache/nginx), so rather than
+    # overwrite the server product we add the app as an aux CVE subject -- then
+    # BOTH the server and the app are correlated. If the server itself was
+    # unidentified, the first app also becomes the primary identity.
     tech = []
+    app_aux: list[list[str]] = []
     body = r.text or ""
     for rx, label in _HTTP_BODY_SIGS:
         m = rx.search(body) or rx.search(server + " " + powered)
-        if m:
-            if label is None:  # generator meta
-                gen = m.group(1).strip()
-                tech.append(gen)
-                gm = re.match(r"([A-Za-z0-9 ._-]+?)\s*([0-9][0-9.]+)?$", gen)
-                if gm and not product:
-                    product, version = gm.group(1).strip(), (gm.group(2) or "")
-                    conf = "medium"
-            else:
-                tech.append(label)
-                ver = ""
-                if m.lastindex:
-                    ver = m.group(1) if (m.group(1) or "")[:1].isdigit() else ""
-                # app label is more interesting than 'nginx' for CVE purposes
-                if label.lower() not in ("atlassian",):
-                    product, version, conf = label, ver, ("medium" if ver else "low")
+        if not m:
+            continue
+        if label is None:  # generator meta -> "Name X.Y.Z"
+            gen = m.group(1).strip()
+            tech.append(gen)
+            gm = re.match(r"([A-Za-z][A-Za-z0-9 ._-]*?)\s*v?([0-9][0-9.]+)?\s*$", gen)
+            if gm:
+                app_aux.append([gm.group(1).strip(), gm.group(2) or ""])
+        else:
+            tech.append(label)
+            ver = m.group(1) if (m.lastindex and (m.group(1) or "")[:1].isdigit()) else ""
+            if label.lower() not in ("atlassian",):   # too broad to CVE-map
+                app_aux.append([label, ver])
+
+    # register recognized apps as aux products (deduped, preferring a version)
+    if app_aux:
+        aux = info.get("aux", [])
+        for name, ver in app_aux:
+            same = next((p for p in aux if p[0].lower() == name.lower()), None)
+            if same is None:
+                aux.append([name, ver])
+            elif ver and not same[1]:
+                same[1] = ver
+        info["aux"] = aux
+        if not product:                      # server unidentified -> app is it
+            product, version = aux[0][0], aux[0][1]
+            conf = "medium" if version else "low"
     if tech:
         info["tech"] = sorted(set(tech))
+
+    # fill missing versions from an app version endpoint (table-driven)
+    if product and not version and _VERSION_PROBES.get(product.lower()):
+        pv = await _probe_app_version(http, host, port, tls, product)
+        if pv:
+            version, conf = pv, "high"
+    for pair in info.get("aux", []):
+        if not pair[1] and _VERSION_PROBES.get(pair[0].lower()):
+            pv = await _probe_app_version(http, host, port, tls, pair[0])
+            if pv:
+                pair[1] = pv
+                if product.lower() == pair[0].lower() and not version:
+                    version = pv
+
     return info, (product, version, conf)
 
 
