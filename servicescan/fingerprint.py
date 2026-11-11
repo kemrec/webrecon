@@ -107,11 +107,73 @@ def parse_banner(banner: str):
         if m:
             ver = m.group(1) if grp and m.lastindex and m.lastindex >= grp else ""
             return product, ver, "high"
+    # UnrealIRCd advertises distinctive ISUPPORT tokens even without a version
+    # string (so nmap labels it 'irc' / product only). Confirm the product.
+    if _IRC_UNREAL.search(banner):
+        m = re.search(r"UnrealIRCd[-_ ]?([0-9][0-9a-zA-Z._-]*)", banner, re.I)
+        return "UnrealIRCd", (m.group(1) if m else ""), "high" if m else "medium"
     # generic name/version
     m = _GENERIC_VER.search(banner)
     if m and m.group(1).lower() not in ("http", "https"):
         return m.group(1), m.group(2), "medium"
     return "", "", ""
+
+
+# ---------------------------------------------------------------------------
+# interactive shell / bindshell detection (MSF2 ingreslock 1524 etc.)
+# A service that answers with a shell prompt or `id` output on connect is an
+# unauthenticated remote command shell -- the single worst finding on a host,
+# yet nmap routinely labels it 'unknown'. Match the prompt tail (unix user@host
+# prompt, a Windows version banner / drive prompt) or classic id(1) output.
+# ---------------------------------------------------------------------------
+# High-confidence only (universal code must not false-positive on other
+# services): a real user@host:path prompt, a Windows version/drive-prompt, or
+# id(1) output. A bare trailing '$'/'#' is deliberately NOT matched -- far too
+# many protocols end a line that way.
+_SHELL_UNIX = re.compile(r"(?:^|\n|\x07)\s*[\w.\-]+@[\w.\-]+:[~/][^\n]*[#$]\s*$")
+_SHELL_WIN = re.compile(r"Microsoft Windows \[Version|(?:^|\n)[A-Za-z]:\\[^\n]*>\s*$", re.M)
+_ID_OUTPUT = re.compile(r"uid=\d+\([^)]+\)\s+gid=\d+")
+_IRC_UNREAL = re.compile(r"(?=.*\bNAMESX\b)(?=.*\bWATCHOPTS\b)|\bUnrealIRCd\b",
+                         re.I | re.S)
+
+
+def detect_shell(banner: str) -> bool:
+    """True if a banner looks like an open interactive command shell."""
+    if not banner:
+        return False
+    b = banner.strip()
+    return bool(_SHELL_UNIX.search(b) or _SHELL_WIN.search(b)
+                or _ID_OUTPUT.search(b))
+
+
+async def irc_probe(host: str, port: int, timeout: float) -> str:
+    """IRC servers greet on connect but withhold the version; a VERSION command
+    elicits the ISUPPORT/351 numerics that identify (Unreal)IRCd. Returns the
+    greeting + VERSION reply, or ''."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return ""
+    data = b""
+    try:
+        try:
+            data = await asyncio.wait_for(reader.read(1024), timeout=min(3.0, timeout))
+        except asyncio.TimeoutError:
+            pass
+        writer.write(b"VERSION\r\n")
+        await writer.drain()
+        try:
+            data += await asyncio.wait_for(reader.read(2048), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+    return data.decode("latin-1", "replace").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -276,8 +338,29 @@ async def fingerprint_service(cfg: ScanConfig, http, host: str,
     # 1) banner grab for non-HTTP (or unknown) services
     if not is_http:
         banner = await banner_grab(host, svc.port, cfg.timeout)
+        # IRC greets on connect but hides its version; a VERSION command elicits
+        # the identifying numerics. Re-probe when the greeting looks like IRC.
+        if banner and ("irc" in banner.lower() or " NOTICE AUTH " in banner
+                       or re.search(r"^:[^ ]+ \d{3} ", banner, re.M)):
+            richer = await irc_probe(host, svc.port, cfg.timeout)
+            if richer and len(richer) > len(banner):
+                banner = richer
         if banner:
             svc.banner = banner[:300]
+            # an open interactive shell / bindshell = unauthenticated RCE; the
+            # worst finding on a host and one nmap usually leaves as 'unknown'.
+            if detect_shell(banner):
+                svc.name = "shell"
+                if not svc.product:
+                    svc.product = "Interactive command shell"
+                svc.extrainfo = "UNAUTHENTICATED command shell (bindshell/backdoor)"
+                svc.confidence = "high"
+                if "banner" not in svc.sources:
+                    svc.sources.append("banner")
+                svc.scripts.append({
+                    "id": "bindshell-detect",
+                    "output": "open interactive command shell on connect -- "
+                              "unauthenticated remote command execution (CRITICAL)"})
             p, v, c = parse_banner(banner)
             _merge_candidate(svc, p, v, "banner", c)
             # if the banner looks like HTTP, flag for an HTTP probe below
