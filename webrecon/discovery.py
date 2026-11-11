@@ -210,8 +210,8 @@ async def run_discovery(cfg: Config, http: HTTPClient,
         if sans:
             utils.good(f"cert SANs: {len(sans)} names")
 
-    # 2) crt.sh passive subdomains
-    if cfg.do_subdomains:
+    # 2) crt.sh passive subdomains (only for a real registrable domain)
+    if cfg.do_subdomains and not utils.is_ip(apex) and "." in apex:
         utils.info(f"querying crt.sh for *.{apex}")
         subs = await crtsh_subdomains(http, apex)
         dr.crtsh_subs = sorted(subs)
@@ -238,7 +238,18 @@ async def run_discovery(cfg: Config, http: HTTPClient,
         except OSError as e:
             utils.warn(f"vhost wordlist: {e}")
 
-    candidates = {c for c in candidates if c and "." in c}
+    # Confine to the target's registrable scope: cert SANs, crt.sh results and
+    # the target's own subdomains are fair game, but a host that merely appeared
+    # as an off-site link (github.com, a CDN, shields.io ...) must NEVER be
+    # resolved or vhost-fuzzed -- that was probing third-party infrastructure.
+    def _in_apex(h: str) -> bool:
+        return h == primary_host or h == apex or h.endswith("." + apex)
+    before = len(candidates)
+    candidates = {c for c in candidates
+                  if c and "." in c and not utils.is_ip(c) and _in_apex(c)}
+    dropped = before - len(candidates)
+    if dropped:
+        utils.debug(f"discovery: dropped {dropped} out-of-scope candidate host(s)")
     dr.all_hosts = sorted(candidates)
 
     # 4) resolve all candidates

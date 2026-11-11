@@ -86,8 +86,23 @@ def hostport_of(url: str) -> tuple[str, int | None]:
 
 
 def with_port(host: str, port: int | None) -> str:
-    """host[:port] — port appended only when given (non-default caller choice)."""
+    """host[:port] — port appended only when given (non-default caller choice).
+    An IPv6 literal is wrapped in brackets so `addr:port` stays unambiguous."""
+    if host and ":" in host and not host.startswith("["):
+        host = f"[{host}]"   # IPv6 literal
     return f"{host}:{port}" if port else host
+
+
+def is_ip(host: str) -> bool:
+    """True if host is an IPv4/IPv6 literal (no registrable domain / crt.sh)."""
+    import ipaddress
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+        return True
+    except ValueError:
+        return False
 
 
 def registrable_hint(host: str) -> str:

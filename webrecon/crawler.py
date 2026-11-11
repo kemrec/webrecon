@@ -125,6 +125,13 @@ class Crawler:
         return status, html, net_urls, headers
 
     # -- per-page processing -------------------------------------------------
+    def _in_scope(self, u: str) -> bool:
+        """Whether a URL's host is in crawl scope (fetch/secret-scan/vhost-seed
+        gate). When same_scope_only is off, everything is in scope."""
+        if not self.cfg.same_scope_only:
+            return True
+        return utils.in_scope(u, self.cfg.scope_hosts, self.cfg.include_subdomains)
+
     async def _process_js(self, js_url: str) -> None:
         if js_url in self.result.js_files:
             return
@@ -143,7 +150,8 @@ class Crawler:
         for ep, keys in pkeys.items():
             self.result.params.setdefault(ep, set()).update(keys)
         for u in urls:
-            self.result.hosts.add(utils.host_of(u))
+            if self._in_scope(u):
+                self.result.hosts.add(utils.host_of(u))
         if self.cfg.do_secrets:
             self.result.secret_findings.extend(secrets.scan(r.text, js_url))
 
@@ -195,9 +203,15 @@ class Crawler:
         for ep, keys in pkeys.items():
             self.result.params.setdefault(ep, set()).update(keys)
 
-        # schedule external JS for endpoint/secret mining
+        # schedule JS for endpoint/secret mining -- ONLY for in-scope hosts.
+        # Off-origin links (github.com, CDNs, shields.io ...) stay recorded in
+        # result.urls as discovered references, but we never FETCH or secret-scan
+        # them (that produced third-party false-positive secrets and off-target
+        # traffic), and we never seed the vhost phase with their hosts.
         js_tasks = []
         for u in urls:
+            if not self._in_scope(u):
+                continue
             self.result.hosts.add(utils.host_of(u))
             if utils.looks_like_js(u) and self.cfg.do_js_extract:
                 js_tasks.append(self._process_js(u))

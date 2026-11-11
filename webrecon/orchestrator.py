@@ -32,9 +32,21 @@ async def run(cfg: Config) -> dict:
 
         # ---- phase 2: discovery ----
         disco = None
-        if cfg.do_subdomains or cfg.do_vhost:
+        want_disco = cfg.do_subdomains or cfg.do_vhost
+        # An IP literal or a dotless/local host has no registrable domain, so
+        # crt.sh / cert-SAN / vhost discovery is meaningless (and previously
+        # produced 'crt.sh for *.0.1' and resolved off-target public IPs).
+        if want_disco and (utils.is_ip(primary_host) or "." not in primary_host):
+            utils.warn("skipping discovery (subdomain/cert/vhost): target is an IP "
+                       "or local host with no registrable domain")
+        elif want_disco:
             utils.info("phase 2: subdomain / cert / vhost discovery")
-            disco = await discovery.run_discovery(cfg, http, primary_host, agg.hosts)
+            try:
+                disco = await discovery.run_discovery(cfg, http, primary_host, agg.hosts)
+            except Exception as e:  # noqa: BLE001
+                # a discovery failure must never discard the crawl results
+                utils.warn(f"discovery phase failed ({e}); continuing with crawl results")
+                disco = None
 
         # ---- phase 3: crawl newly discovered live hosts (shallow) ----
         new_hosts: set[str] = set()
@@ -60,8 +72,14 @@ async def run(cfg: Config) -> dict:
         alive_urls, alive_hosts = [], []
         if cfg.do_alive:
             utils.info("phase 4: liveness probing")
-            # probe non-JS page-like urls (cap to keep it sane)
+            # probe non-JS page-like urls (cap to keep it sane). Off-target
+            # referenced URLs stay recorded in urls.txt but are NOT probed when
+            # scope confinement is on -- no active traffic to third-party hosts.
             probe_set = {u for u in agg.urls if not utils.looks_like_js(u)}
+            if cfg.same_scope_only:
+                probe_set = {u for u in probe_set
+                             if utils.in_scope(u, cfg.scope_hosts,
+                                               cfg.include_subdomains)}
             alive_urls = [a.to_dict() for a in await alive.probe_urls(cfg, http, probe_set)]
             if disco:
                 alive_hosts = [a.to_dict()
