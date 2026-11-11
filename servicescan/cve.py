@@ -65,6 +65,33 @@ _CPE_MAP = {
 _OSV_NAME: dict[str, str] = {}
 
 
+def _load_catalog_cpes() -> None:
+    """Extend _CPE_MAP with the (vendor, product) of every app in the generated
+    technology catalog (projectdiscovery/wappalyzergo, MIT). This expands the
+    hand-written ~20 entries to a few hundred CVE-correlatable web apps. Our own
+    entries take precedence (NVD vendor nuances we've verified, e.g. nginx)."""
+    import json
+    import os
+    path = os.path.join(os.path.dirname(__file__), "data",
+                        "tech_fingerprints.json")
+    try:
+        apps = json.load(open(path, encoding="utf-8")).get("apps", {})
+    except Exception as e:  # noqa: BLE001
+        utils.debug(f"catalog cpe harvest skipped: {type(e).__name__}")
+        return
+    added = 0
+    for name, entry in apps.items():
+        key = name.strip().lower()
+        cpe = entry.get("cpe")
+        if key not in _CPE_MAP and isinstance(cpe, list) and len(cpe) == 2:
+            _CPE_MAP[key] = (cpe[0], cpe[1])
+            added += 1
+    utils.debug(f"catalog cpe harvest: +{added} products (_CPE_MAP={len(_CPE_MAP)})")
+
+
+_load_catalog_cpes()
+
+
 def normalize_version(raw: str) -> str:
     """Reduce a banner/nmap version string to a bare CPE-comparable token.
 
@@ -563,26 +590,34 @@ async def correlate(cfg: ScanConfig, http, services: list[Service],
                     for c in await osv_direct(osv_name, svc.version):
                         found.setdefault(c.id, c)
 
-            # --- secondary products on the same port (PHP/ASP.NET via
-            #     X-Powered-By, etc.): own CVE subjects the single-product
-            #     Service would otherwise never query (e.g. PHP CVE-2012-1823).
+            # --- secondary products on the same port (PHP via X-Powered-By,
+            #     web apps/libraries detected in the body): own CVE subjects the
+            #     single-product Service would otherwise never query (e.g. PHP
+            #     CVE-2012-1823). Only when a VERSION was detected: a version-less
+            #     aux match (jQuery, an uninstalled CMS, an OS tag) would dump the
+            #     product's entire all-version CVE list -- noise. The primary
+            #     product (nmap/banner, higher confidence) still correlates
+            #     version-less; aux must be anchored by a version.
             if cfg.nvd:
                 for pair in getattr(svc, "aux", []):
                     ap, av = (pair + ["", ""])[:2]
+                    anver = normalize_version(av)
+                    if not anver:
+                        continue          # detected but unversioned -> tech only
                     acpe = make_cpe(ap, av)
                     if not acpe:
                         continue          # only correlate products we can map
-                    anver = normalize_version(av)
                     amapped = _CPE_MAP.get(ap.strip().lower())
                     aprods = _cpe_products(amapped[1] if amapped else "", ap)
                     hits = await query_nvd(http, cfg, acpe, None, cache=cache,
                                            products=aprods, want_version=anver)
-                    # version '*' CPEs (no version detected) 404 at NVD; fall back
-                    # to a product-gated keyword search so the aux product still
-                    # correlates (e.g. a body-sig app with no version string).
+                    # a CPE that 404s/returns nothing (NVD vendor rename or odd
+                    # version form) falls back to a product+version gated keyword
+                    # search so the aux product still correlates.
                     if not hits:
-                        hits = await query_nvd(http, cfg, None, ap, cache=cache,
-                                               products=aprods, want_version=anver)
+                        hits = await query_nvd(http, cfg, None, f"{ap} {anver}",
+                                               cache=cache, products=aprods,
+                                               want_version=anver)
                     for c in hits:
                         found.setdefault(c.id, c)
                     utils.debug(f":{svc.port} aux nvd via {acpe} ({len(hits)})")

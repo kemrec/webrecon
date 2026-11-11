@@ -294,6 +294,98 @@ async def _probe_app_version(http, host: str, port: int, tls: bool,
     return m.group(1) if m else ""
 
 
+# ---------------------------------------------------------------------------
+# Technology fingerprint catalog (generated from projectdiscovery/wappalyzergo,
+# MIT; see scripts/build_tech_catalog.py). Gives breadth our hand-written
+# _HTTP_BODY_SIGS can't: ~270 CVE-correlatable web apps with header/meta/script/
+# html detection patterns and version-capture groups. Loaded once, lazily.
+# ---------------------------------------------------------------------------
+import json as _json
+import os as _os
+
+_CATALOG: dict | None = None
+_META_TAG_RX = re.compile(
+    r'<meta[^>]+name=["\']([^"\']+)["\'][^>]+content=["\']([^"\']*)["\']', re.I)
+
+
+def _load_catalog() -> dict:
+    global _CATALOG
+    if _CATALOG is not None:
+        return _CATALOG
+    path = _os.path.join(_os.path.dirname(__file__), "data",
+                         "tech_fingerprints.json")
+    try:
+        raw = _json.load(open(path, encoding="utf-8"))
+        apps = raw.get("apps", {})
+        for entry in apps.values():
+            for s in entry.get("sigs", []):
+                try:
+                    s["_c"] = re.compile(s["re"], re.I)
+                except re.error:
+                    s["_c"] = None
+        _CATALOG = apps
+    except Exception as e:  # noqa: BLE001
+        utils.debug(f"tech catalog load failed: {type(e).__name__}")
+        _CATALOG = {}
+    return _CATALOG
+
+
+def match_catalog(headers, body: str) -> list[list[str]]:
+    """Return [[app, version], ...] for every catalog app whose signatures match
+    this HTTP response. Version is '' when no version-capturing sig matched."""
+    cat = _load_catalog()
+    if not cat:
+        return []
+    metas = {m.group(1).lower(): m.group(2)
+             for m in _META_TAG_RX.finditer(body or "")}
+    setcookie = ""
+    try:
+        setcookie = (headers.get("set-cookie", "") or "").lower()
+    except Exception:  # noqa: BLE001
+        pass
+    out: list[list[str]] = []
+    for name, entry in cat.items():
+        ver = ""
+        hit = False
+        for s in entry.get("sigs", []):
+            rx = s.get("_c")
+            if rx is None:
+                continue
+            loc = s["loc"]
+            if loc == "header":
+                target = ""
+                try:
+                    target = headers.get(s["key"], "") or ""
+                except Exception:  # noqa: BLE001
+                    target = ""
+                if not target:
+                    continue
+            elif loc == "meta":
+                if s["key"] not in metas:
+                    continue
+                target = metas[s["key"]]
+            elif loc == "cookie":
+                if s["key"] not in setcookie:
+                    continue
+                target = setcookie
+            else:                               # script / html -> whole body
+                target = body or ""
+            m = rx.search(target)
+            if not m:
+                continue
+            hit = True
+            if s["v"] and not ver:
+                try:
+                    g = m.group(s["v"])
+                    if g:
+                        ver = _norm_ver(g)
+                except (re.error, IndexError):
+                    pass
+        if hit:
+            out.append([name, ver])
+    return out
+
+
 async def http_fingerprint(http, host: str, port: int, tls: bool):
     """Return dict with server/version/title/tech + (product,version,conf)."""
     scheme = "https" if tls else "http"
@@ -346,6 +438,12 @@ async def http_fingerprint(http, host: str, port: int, tls: bool):
             ver = m.group(1) if (m.lastindex and (m.group(1) or "")[:1].isdigit()) else ""
             if label.lower() not in ("atlassian",):   # too broad to CVE-map
                 app_aux.append([label, ver])
+
+    # broad catalog detection (generated from wappalyzergo, MIT): adds
+    # CVE-mappable web apps with versions well beyond the hand-written sigs.
+    for cname, cver in match_catalog(r.headers, body):
+        tech.append(cname)
+        app_aux.append([cname, cver])
 
     # register recognized apps as aux products (deduped, preferring a version)
     if app_aux:
