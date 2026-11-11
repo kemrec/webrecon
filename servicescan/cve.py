@@ -53,6 +53,7 @@ _CPE_MAP = {
     "openssl": ("openssl", "openssl"),
     "php": ("php", "php"),
     "tomcat": ("apache", "tomcat"),
+    "apache tomcat": ("apache", "tomcat"),    # label the Coyote-fixup emits
     "jenkins": ("jenkins", "jenkins"),
 }
 
@@ -549,6 +550,11 @@ async def correlate(cfg: ScanConfig, http, services: list[Service],
 
     async def one(svc: Service):
         if not svc.product:
+            return
+        if getattr(svc, "cve_skip", False):
+            # product identified but no trustworthy version (e.g. a Tomcat whose
+            # server version the Coyote connector hid). Correlating version-less
+            # would attach every CVE for the product -> false positives.
             return
         async with sem:
             found: dict[str, CVE] = {}

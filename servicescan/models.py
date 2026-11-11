@@ -27,6 +27,9 @@ class Service:
     cves: list["CVE"] = field(default_factory=list)
     web: dict = field(default_factory=dict)   # webrecon results (--web chain)
     scripts: list = field(default_factory=list)  # nmap NSE output [{id, output}]
+    cve_skip: bool = False             # product known but version untrustworthy:
+                                       # correlate must NOT emit a version-less
+                                       # all-CVE dump (see Tomcat/Coyote fixup)
 
     def ident(self) -> str:
         v = f" {self.version}" if self.version else ""

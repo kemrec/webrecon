@@ -19,6 +19,7 @@ import ssl
 
 from .config import ScanConfig
 from .models import Service
+from .nmap_engine import is_coyote_misattrib, _COYOTE_CPE_PRODUCTS
 from webrecon import utils
 
 
@@ -292,6 +293,57 @@ async def _probe_app_version(http, host: str, port: int, tls: bool,
         return ""
     m = rx.search(r.text or "")
     return m.group(1) if m else ""
+
+
+# Tomcat prints its real version in the default error-page footer
+# ("<h3>Apache Tomcat/5.5.26</h3>") and in RELEASE-NOTES.txt ("Apache Tomcat
+# Version 5.5.26"). We require major >= 3 so the Coyote protocol version "1.1"
+# (or any 1.x/2.x noise) can never be mistaken for a server version.
+_TOMCAT_FOOTER_RX = re.compile(r"Apache Tomcat/([0-9][0-9.]+)", re.I)
+_TOMCAT_RELNOTES_RX = re.compile(r"Apache Tomcat\s+Version\s+([0-9][0-9.]+)", re.I)
+
+
+def _valid_tomcat_version(ver: str) -> str:
+    """Accept only a plausible Tomcat server version (major >= 3); '' otherwise.
+    Rejects the Coyote connector protocol version (1.1) outright."""
+    ver = (ver or "").strip().rstrip(".")
+    m = re.match(r"(\d+)", ver)
+    if not m or int(m.group(1)) < 3:
+        return ""
+    return ver
+
+
+async def _probe_tomcat_version(http, host: str, port: int, tls: bool) -> str:
+    """Recover the true Apache Tomcat version from the server itself.
+
+    nmap only gives us the Coyote connector protocol version, so we ask Tomcat
+    directly: a random path trips the default error page (whose footer carries
+    the version), with RELEASE-NOTES.txt as a fallback. Returns '' when the
+    version is not disclosed -- the caller then suppresses CVE correlation
+    rather than guess.
+    """
+    import random
+    scheme = "https" if tls else "http"
+    rand = f"/webrecon-probe-{random.randint(100000, 999999)}"
+    attempts = [(rand, _TOMCAT_FOOTER_RX),
+                ("/RELEASE-NOTES.txt", _TOMCAT_RELNOTES_RX)]
+    for path, rx in attempts:
+        try:
+            r = await http.fetch(f"{scheme}://{host}:{port}{path}",
+                                 method="GET", read_body=True)
+        except Exception:  # noqa: BLE001
+            continue
+        body = getattr(r, "text", "") or ""     # error pages are 404/500 -> no
+        if not body:                            # status gate; the body is what
+            continue                            # carries the version
+        # try the path's own regex, then the generic footer regex as a backstop
+        for candidate in (rx, _TOMCAT_FOOTER_RX):
+            m = candidate.search(body)
+            if m:
+                ver = _valid_tomcat_version(m.group(1))
+                if ver:
+                    return ver
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +680,39 @@ async def fingerprint_service(cfg: ScanConfig, http, host: str,
                           "attack surface (CVE-2020-1938: file read / JSP source "
                           "disclosure and potential inclusion via AJP). Confirm "
                           "exposure and the Tomcat version separately."})
+
+    # 1c) Tomcat/Coyote misattribution fixup. nmap reports the Coyote connector
+    #     product + its protocol version ("1.1"), which correlates to an empty
+    #     NVD product (zero CVEs) while hiding a real, often ancient Tomcat.
+    #     Recover the true version from the server; only then correlate. If the
+    #     version is not disclosed, keep the (correct) product label but set
+    #     cve_skip so correlate() does NOT dump every Tomcat CVE -- correlating
+    #     against the protocol version, or version-less, would be false positives.
+    if is_coyote_misattrib(svc):
+        realver = await _probe_tomcat_version(host=host, port=svc.port,
+                                              http=http, tls=is_tls)
+        # drop nmap's misleading coyote_* CPE and its protocol "version"
+        svc.cpe = [c for c in svc.cpe
+                   if not any(p in (c or "").lower()
+                              for p in _COYOTE_CPE_PRODUCTS)]
+        svc.product = "Apache Tomcat"      # catalog maps this to apache:tomcat
+        if "fingerprint" not in svc.sources:
+            svc.sources.append("fingerprint")
+        if realver:
+            svc.version = realver
+            svc.cve_skip = False
+            svc.confidence = "high"
+            svc.scripts.append({"id": "tomcat-version", "output":
+                f"Apache Tomcat {realver} (nmap reported the Coyote connector "
+                f"protocol version '1.1', not the server version)."})
+        else:
+            svc.version = ""
+            svc.cve_skip = True            # identified but version undisclosed
+            svc.scripts.append({"id": "tomcat-version", "output":
+                "Apache Tomcat detected but the server version is not disclosed "
+                "(nmap's '1.1' is the Coyote connector protocol version). CVE "
+                "correlation suppressed to avoid version-less false positives; "
+                "determine the Tomcat version to assess exposure."})
 
     # 2) TLS cert
     if is_tls:

@@ -156,10 +156,38 @@ def parse_nmap_xml(xml: str) -> list[Host]:
     return hosts
 
 
+# nmap fingerprints a Tomcat HTTP connector as the Coyote engine and reports the
+# connector's *protocol* version, not the Tomcat server version, e.g.
+#   product="Apache Tomcat/Coyote JSP engine" version="1.1"
+#   cpe=cpe:/a:apache:coyote_http_connector:1.1
+# That "1.1" is the Coyote/HTTP connector version; the real Tomcat version is a
+# wholly different, often very old number. Worse, coyote_http_connector is an
+# all-but-empty NVD product, so correlating it yields zero CVEs while silently
+# discarding a genuinely vulnerable Tomcat. We must recover the true version
+# (and never correlate against "1.1", which — being far below every Tomcat
+# version bound — would match nearly every Tomcat CVE => false positives).
+_COYOTE_CPE_PRODUCTS = ("coyote_http_connector", "coyote_jsp_engine")
+
+
+def is_coyote_misattrib(svc: Service) -> bool:
+    """True if nmap labelled this service as the Coyote connector (so its
+    product is really Tomcat and its reported version is the protocol version,
+    not the server version)."""
+    pl = (svc.product or "").lower()
+    if "tomcat" in pl and "coyote" in pl:
+        return True
+    return any(p in (c or "").lower()
+               for c in svc.cpe for p in _COYOTE_CPE_PRODUCTS)
+
+
 def needs_fingerprint(svc: Service) -> bool:
-    """True if nmap left this service under-identified (no product or version)."""
+    """True if nmap left this service under-identified (no product or version),
+    or mis-attributed it as the Coyote connector (product+version both set, but
+    the version is the connector protocol version, not Tomcat's)."""
     if not svc.product:
         return True
     if not svc.version:
+        return True
+    if is_coyote_misattrib(svc):
         return True
     return False
