@@ -146,6 +146,41 @@ def detect_shell(banner: str) -> bool:
                 or _ID_OUTPUT.search(b))
 
 
+# ---------------------------------------------------------------------------
+# AJP13 (Apache JServ Protocol) detection
+# The Tomcat/JBoss AJP connector (classically port 8009) is a binary protocol
+# that stays silent on a plain connect, so banner grabbing leaves it 'unknown'.
+# A single CPing control packet elicits a CPong, whose 'AB' magic is a
+# definitive, non-destructive identification (no request is processed).
+# ---------------------------------------------------------------------------
+_AJP_CPING = b"\x12\x34\x00\x01\x0a"   # magic 0x1234 | len 1 | prefix 0x0a (CPing)
+_AJP_MAGIC = b"\x41\x42"               # 'AB' = server->container packet prefix
+
+
+async def ajp_probe(host: str, port: int, timeout: float) -> bool:
+    """True if the port speaks AJP13 (answers a CPing with a CPong)."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return False
+    data = b""
+    try:
+        writer.write(_AJP_CPING)
+        await writer.drain()
+        try:
+            data = await asyncio.wait_for(reader.read(16), timeout=timeout)
+        except asyncio.TimeoutError:
+            data = b""
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+    return data[:2] == _AJP_MAGIC
+
+
 async def irc_probe(host: str, port: int, timeout: float) -> str:
     """IRC servers greet on connect but withhold the version; a VERSION command
     elicits the ISUPPORT/351 numerics that identify (Unreal)IRCd. Returns the
@@ -411,6 +446,26 @@ async def fingerprint_service(cfg: ScanConfig, http, host: str,
             # if the banner looks like HTTP, flag for an HTTP probe below
             if banner[:5].upper().startswith(("HTTP/", "HTTP ")):
                 is_http = True
+
+    # 1b) AJP13 connector (silent binary protocol -> banner grab yields nothing).
+    #     Confirm with CPing/CPong on the canonical port or anything nmap tagged
+    #     ajp*. Definitive and non-destructive (no AJP request is processed).
+    if (not is_http and svc.name != "shell"
+            and ("ajp" in name or svc.port == 8009)):
+        if await ajp_probe(host, svc.port, cfg.timeout):
+            svc.name = "ajp13"
+            if not svc.product:
+                svc.product = "Apache JServ Protocol (AJP13)"
+            svc.confidence = "high"
+            if "ajp" not in svc.sources:
+                svc.sources.append("ajp")
+            svc.scripts.append({
+                "id": "ajp13-detect",
+                "output": "AJP13 connector confirmed via CPing/CPong. If reachable "
+                          "from an untrusted network this exposes the Ghostcat "
+                          "attack surface (CVE-2020-1938: file read / JSP source "
+                          "disclosure and potential inclusion via AJP). Confirm "
+                          "exposure and the Tomcat version separately."})
 
     # 2) TLS cert
     if is_tls:
