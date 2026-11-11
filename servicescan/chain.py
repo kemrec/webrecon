@@ -84,11 +84,26 @@ async def run_web_chain(cfg: ScanConfig, result: ScanResult) -> None:
         utils.info("web chain: no HTTP(S) ports found, nothing to hand off")
         return
     multi = len([h for h in result.hosts if h.services]) > 1
+    all_urls: set[str] = set()
     for h in web_hosts:
-        await _chain_host(cfg, h, multi)
+        await _chain_host(cfg, h, multi, all_urls)
+
+    # one consolidated, deduped URL list across every host/port -- both
+    # parameterized and plain URLs -- ready to feed into Burp (Target -> Site
+    # map -> Load / Add to scope), ffuf, nuclei, sqlmap, etc.
+    if all_urls:
+        try:
+            import os
+            path = os.path.join(cfg.outdir, "urls-all.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(sorted(all_urls)) + "\n")
+            utils.good(f"web chain: wrote {len(all_urls)} unique URL(s) to {path}")
+        except Exception as e:  # noqa: BLE001
+            utils.debug(f"urls-all.txt write failed: {type(e).__name__}: {e}")
 
 
-async def _chain_host(cfg: ScanConfig, host: Host, multi: bool) -> None:
+async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
+                      all_urls: set[str] | None = None) -> None:
     ip = host.ip or ""
     # use the hostname form if we have one, else the IP.
     target_host = host.hostname or ip
@@ -172,6 +187,11 @@ async def _chain_host(cfg: ScanConfig, host: Host, multi: bool) -> None:
             web_report.write_all(wcfg.outdir, data)
         except Exception as e:  # noqa: BLE001
             utils.debug(f"web chain report {url}: {e}")
+
+        # feed the full absolute-URL set (parameterized + plain) into the
+        # scan-wide rollup; svc.web keeps only the compact counts below
+        if all_urls is not None:
+            all_urls.update(u for u in data.get("urls", []) if u)
 
         svc.web = {
             "url": url,
