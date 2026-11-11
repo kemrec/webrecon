@@ -85,15 +85,15 @@ async def run_web_chain(cfg: ScanConfig, result: ScanResult) -> None:
         return
     multi = len([h for h in result.hosts if h.services]) > 1
     all_urls: set[str] = set()
+    all_params: dict[str, set[str]] = {}
     for h in web_hosts:
-        await _chain_host(cfg, h, multi, all_urls)
+        await _chain_host(cfg, h, multi, all_urls, all_params)
 
     # one consolidated, deduped URL list across every host/port -- both
     # parameterized and plain URLs -- ready to feed into Burp (Target -> Site
     # map -> Load / Add to scope), ffuf, nuclei, sqlmap, etc.
     if all_urls:
         try:
-            import os
             path = os.path.join(cfg.outdir, "urls-all.txt")
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write("\n".join(sorted(all_urls)) + "\n")
@@ -101,9 +101,33 @@ async def run_web_chain(cfg: ScanConfig, result: ScanResult) -> None:
         except Exception as e:  # noqa: BLE001
             utils.debug(f"urls-all.txt write failed: {type(e).__name__}: {e}")
 
+    # attack-ready parameter templates: every endpoint that takes parameters,
+    # expanded to a full URL with each param set to FUZZ -- including param NAMES
+    # the crawler only learned from forms/JS and never saw as a live URL. This is
+    # the real active-scan surface for Burp / sqlmap / ffuf, beyond what plain
+    # crawling observed.
+    if all_params:
+        try:
+            lines = []
+            for ep in sorted(all_params):
+                names = sorted(all_params[ep])
+                if not names:
+                    continue
+                qs = "&".join(f"{n}=FUZZ" for n in names)
+                sep = "&" if "?" in ep else "?"
+                lines.append(f"{ep}{sep}{qs}")
+            path = os.path.join(cfg.outdir, "params-all.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+            utils.good(f"web chain: wrote {len(lines)} parameterized endpoint(s) "
+                       f"to {path}")
+        except Exception as e:  # noqa: BLE001
+            utils.debug(f"params-all.txt write failed: {type(e).__name__}: {e}")
+
 
 async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
-                      all_urls: set[str] | None = None) -> None:
+                      all_urls: set[str] | None = None,
+                      all_params: dict[str, set[str]] | None = None) -> None:
     ip = host.ip or ""
     # use the hostname form if we have one, else the IP.
     target_host = host.hostname or ip
@@ -192,6 +216,19 @@ async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
         # scan-wide rollup; svc.web keeps only the compact counts below
         if all_urls is not None:
             all_urls.update(u for u in data.get("urls", []) if u)
+
+        # scan-wide parameter map: the endpoint->param-names the crawler built,
+        # plus every form's fields (incl. POST forms, whose params a plain URL
+        # list would miss). Merged so params-all.txt covers the full surface.
+        if all_params is not None:
+            for ep, names in (data.get("params", {}) or {}).items():
+                if ep:
+                    all_params.setdefault(ep, set()).update(names or [])
+            for form in (data.get("forms", []) or []):
+                action = form.get("url", "")
+                fields = form.get("params", []) or []
+                if action and fields:
+                    all_params.setdefault(action, set()).update(fields)
 
         svc.web = {
             "url": url,
