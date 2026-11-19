@@ -213,6 +213,77 @@ async def irc_probe(host: str, port: int, timeout: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# distcc (distributed C/C++ compiler daemon)
+# distccd (classically TCP 3632) speaks a silent binary token protocol, so a
+# banner grab returns nothing and nmap commonly leaves the port 'unknown'. When
+# started without an --allow ACL and reachable from an untrusted network the
+# daemon compiles -- i.e. executes -- jobs from any client, which is remote
+# command execution (CVE-2004-2687).
+#
+# A distccd only ever emits bytes after it has run a compile job, so the one
+# "definitive" reply is also the one we must never trigger: confirming the
+# service by its protocol response would mean executing a command on the
+# target. Instead we identify it by a strictly read-only behavioural signature
+# that runs NOTHING on the host:
+#   1. distccd is silent on connect and holds the socket open waiting for a
+#      request (a service that greets, or closes at once, is not distccd); and
+#   2. given a DIST header carrying an UNSUPPORTED protocol version, distccd
+#      reads the DIST token, rejects the version, and closes the connection
+#      immediately with no data -- before any job is read or any compiler is
+#      forked. (Verified against distccd 2.x: the bad-version path never spawns
+#      a compiler.)
+# This is a heuristic, not a protocol handshake, so it reports at medium
+# confidence; it is gated to the canonical port / nmap's distcc tag so it
+# cannot mislabel unrelated silent services elsewhere.
+# ---------------------------------------------------------------------------
+# A DIST token is a 4-char tag + 8 ASCII-hex chars (a 32-bit value). 0xffffffff
+# is not a real distcc protocol version, so the daemon bails at the version
+# check and never proceeds to read (let alone run) a job.
+_DISTCC_BADVER = b"DISTffffffff"
+
+
+async def distcc_probe(host: str, port: int, timeout: float) -> bool:
+    """True if the port behaves like a distcc daemon (read-only heuristic).
+
+    Confirms the two distccd-specific behaviours (silent-and-open on connect,
+    prompt data-less close after a bad-version DIST header) without ever
+    submitting a job. No command is supplied to or executed on the target.
+    """
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        # 1) distccd never greets and never closes on connect: it waits for a
+        #    request. The only distcc-consistent outcome is a read timeout
+        #    (silent, still open). Any bytes (a banner) or an immediate EOF
+        #    (closed on connect) rules it out.
+        try:
+            await asyncio.wait_for(reader.read(16), timeout=min(1.5, timeout))
+            return False
+        except asyncio.TimeoutError:
+            pass
+        # 2) a bad-version DIST header -> distccd rejects it and closes with no
+        #    data. EOF (b"") = distcc-consistent; a timeout or any bytes is not.
+        writer.write(_DISTCC_BADVER)
+        await writer.drain()
+        try:
+            resp = await asyncio.wait_for(reader.read(16), timeout=timeout)
+        except asyncio.TimeoutError:
+            return False
+        return resp == b""
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # HTTP fingerprint
 # ---------------------------------------------------------------------------
 _HTTP_BODY_SIGS = [
@@ -680,6 +751,35 @@ async def fingerprint_service(cfg: ScanConfig, http, host: str,
                           "attack surface (CVE-2020-1938: file read / JSP source "
                           "disclosure and potential inclusion via AJP). Confirm "
                           "exposure and the Tomcat version separately."})
+
+    # 1d) distcc compile daemon (silent binary protocol -> no banner). A
+    #     read-only behavioural probe on the canonical port / nmap's distcc tag;
+    #     it submits no job, so nothing is executed on the target.
+    if (not is_http and svc.name != "shell"
+            and ("distcc" in name or svc.port == 3632)):
+        if await distcc_probe(host, svc.port, cfg.timeout):
+            svc.name = "distccd"
+            if not svc.product:
+                svc.product = "distcc distributed compiler daemon (likely)"
+            # heuristic (no protocol handshake / no job submitted) -> medium
+            if svc.confidence != "high":
+                svc.confidence = "medium"
+            if "distcc" not in svc.sources:
+                svc.sources.append("distcc")
+            svc.scripts.append({
+                "id": "distcc-detect",
+                "output": "behaviour consistent with a distcc daemon (distccd) "
+                          "on the canonical port 3632 (silent on connect; a "
+                          "bad-version DIST header is rejected with an immediate "
+                          "data-less close). No job was submitted, so this is a "
+                          "heuristic, not a protocol confirmation -- verify the "
+                          "daemon and version directly. If distccd is confirmed, "
+                          "started without an --allow ACL and reachable from an "
+                          "untrusted network, any client can execute arbitrary "
+                          "commands (CVE-2004-2687, remote command execution; "
+                          "Metasploit unix/misc/distcc_exec). Restrict with "
+                          "--allow and a firewall; never expose 3632 to "
+                          "untrusted networks."})
 
     # 1c) Tomcat/Coyote misattribution fixup. nmap reports the Coyote connector
     #     product + its protocol version ("1.1"), which correlates to an empty
