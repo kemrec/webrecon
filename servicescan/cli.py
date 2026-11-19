@@ -111,7 +111,12 @@ def build_parser() -> argparse.ArgumentParser:
     net.add_argument("-t", "--timeout", type=float, default=8.0)
 
     o = p.add_argument_group("output")
-    o.add_argument("-o", "--outdir", default="servicescan-out")
+    o.add_argument("-o", "--outdir", default="servicescan-out",
+                   help="base output directory. Results are filed under "
+                        "<outdir>/<target>/<timestamp>/ with a 'latest' symlink, "
+                        "so re-scans never overwrite.")
+    o.add_argument("--flat", action="store_true",
+                   help="write straight into --outdir (no per-target/run subdirs)")
     o.add_argument("-q", "--quiet", action="store_true")
     o.add_argument("-v", "--verbose", action="store_true")
     return p
@@ -181,9 +186,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("no targets given (positional target(s) or -iL FILE)")
     utils.set_log_levels(cfg.quiet, cfg.verbose)
 
+    slug_target = (cfg.targets[0] if len(cfg.targets) == 1
+                   else f"{cfg.targets[0]}_+{len(cfg.targets) - 1}")
+    cfg.outdir = utils.run_dir(args.outdir, slug_target, flat=args.flat)
+
     ntxt = (f"{len(cfg.targets)} target spec(s)" if len(cfg.targets) > 1
             else cfg.target)
     utils.info(f"servicescan starting against {ntxt}")
+    utils.info(f"output -> {cfg.outdir}/")
     try:
         result = asyncio.run(orchestrator.run(cfg))
     except KeyboardInterrupt:

@@ -1,8 +1,10 @@
 """Shared helpers: logging, URL normalization, scope checks."""
 from __future__ import annotations
 
+import os
 import sys
 import re
+from datetime import datetime
 from urllib.parse import urlparse, urljoin, urldefrag, parse_qsl, urlencode, urlunparse
 
 
@@ -39,6 +41,42 @@ def hit(msg: str) -> None:    _emit("[>]", C.MAG, msg)
 def debug(msg: str) -> None:
     if _VERBOSE and not _QUIET:
         _emit("[d]", C.GRY, msg)
+
+
+class Progress:
+    """A single-line, in-place progress bar on stderr. Silent when quiet, when
+    stderr is not a TTY (piped/redirected), or in verbose mode (where the
+    per-item debug log is the progress view instead)."""
+    _WIDTH = 24
+
+    def __init__(self, label: str):
+        try:
+            tty = sys.stderr.isatty()
+        except Exception:
+            tty = False
+        self.enabled = tty and not _QUIET and not _VERBOSE
+        self.label = label
+
+    def update(self, done: int, total: int, suffix: str = "") -> None:
+        if not self.enabled:
+            return
+        total = max(int(total), 1)
+        frac = min(max(done / total, 0.0), 1.0)
+        filled = int(frac * self._WIDTH)
+        bar = "=" * filled + (">" if filled < self._WIDTH else "") \
+            + " " * (self._WIDTH - filled - 1)
+        line = (f"\r{C.CYN}[*]{C.R} {self.label} "
+                f"{C.GRY}[{C.GRN}{bar}{C.GRY}]{C.R} {done}/{total}")
+        if suffix:
+            line += f" {C.GRY}{suffix}{C.R}"
+        sys.stderr.write(line + "\033[K")   # \033[K clears to end of line
+        sys.stderr.flush()
+
+    def finish(self) -> None:
+        if not self.enabled:
+            return
+        sys.stderr.write("\r\033[K")        # clear the bar line
+        sys.stderr.flush()
 
 
 # ---- URL helpers ----
@@ -150,3 +188,54 @@ JS_URL_RE = re.compile(r"""\.js(\?[^"'\s]*)?$""", re.I)
 def looks_like_js(url: str) -> bool:
     path = urlparse(url).path
     return bool(JS_URL_RE.search(path)) or path.endswith(".mjs")
+
+
+# ---------------------------------------------------------------------------
+# Output filing: a professional per-target / per-run directory layout.
+# ---------------------------------------------------------------------------
+def target_slug(target: str) -> str:
+    """Filesystem-safe segment for a target. URLs reduce to host[:port]; bare
+    hosts / CIDRs keep their shape (slashes -> underscores): e.g.
+      http://10.0.0.5:8080/app  -> 10.0.0.5_8080
+      10.0.0.0/24               -> 10.0.0.0_24
+      scanme.nmap.org           -> scanme.nmap.org
+    """
+    t = (target or "scan").strip()
+    m = re.match(r"^\w+://", t)
+    if m:                                   # URL: keep only the netloc
+        t = t[m.end():].split("/", 1)[0]
+    t = t.rstrip("/")
+    t = re.sub(r"[^A-Za-z0-9._-]", "_", t)
+    t = re.sub(r"_+", "_", t).strip("_")
+    return t or "scan"
+
+
+def run_dir(base: str, target: str, flat: bool = False) -> str:
+    """Create and return the directory this run writes into.
+
+    Default (professional) layout keeps every target and every run separate so
+    re-scanning never overwrites a prior result:
+        <base>/<target-slug>/<YYYYmmdd-HHMMSS>/
+    and refreshes a '<base>/<target-slug>/latest' symlink to the newest run.
+    flat=True restores the legacy behaviour (write straight into <base>).
+    """
+    if flat:
+        os.makedirs(base, exist_ok=True)
+        return base
+    seg = target_slug(target)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(base, seg, ts)
+    # avoid collision if two runs start in the same second
+    n = 1
+    while os.path.exists(path):
+        path = os.path.join(base, seg, f"{ts}-{n}")
+        n += 1
+    os.makedirs(path, exist_ok=True)
+    link = os.path.join(base, seg, "latest")
+    try:
+        if os.path.islink(link) or os.path.exists(link):
+            os.unlink(link)
+        os.symlink(os.path.basename(path), link)   # relative -> sibling run
+    except OSError:
+        pass                                        # symlinks optional (e.g. Windows)
+    return path

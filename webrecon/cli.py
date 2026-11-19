@@ -83,7 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
     # output
     o = p.add_argument_group("output")
     o.add_argument("-o", "--outdir", default="webrecon-out",
-                   help="output directory (default webrecon-out)")
+                   help="base output directory (default webrecon-out). Results "
+                        "are filed under <outdir>/<target>/<timestamp>/ with a "
+                        "'latest' symlink, so re-scans never overwrite.")
+    o.add_argument("--flat", action="store_true",
+                   help="write straight into --outdir (no per-target/run subdirs)")
     o.add_argument("-q", "--quiet", action="store_true", help="suppress progress logs")
     o.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return p
@@ -156,7 +160,9 @@ def main(argv: list[str] | None = None) -> int:
         utils.err(f"invalid target: {args.target}")
         return 2
 
+    cfg.outdir = utils.run_dir(args.outdir, cfg.target, flat=args.flat)
     utils.info(f"webrecon starting against {cfg.target}")
+    utils.info(f"output -> {cfg.outdir}/")
     try:
         data = asyncio.run(orchestrator.run(cfg))
     except KeyboardInterrupt:

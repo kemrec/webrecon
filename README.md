@@ -156,17 +156,32 @@ On a constrained box, `--render-workers 1` (or `--no-render`) is the safe dial.
 
 ## Output — webrecon
 
-Written to `-o` (default `webrecon-out/`):
+Each run is filed under its own target + timestamp directory, so re-scanning a
+target or scanning a new one never overwrites a prior result:
+
+```
+webrecon-out/
+  example.com/
+    20261119-071500/    # one run
+      report.json  urls.txt  endpoints.txt  params.txt  ...
+    20261119-073012/    # a later run
+    latest -> 20261119-073012
+```
+
+`-o/--outdir` sets the base directory; `--flat` writes straight into it (legacy
+single-directory behaviour). Files in each run directory:
 
 - `report.json` — complete machine-readable results
-- `urls.txt`, `js_files.txt`, `endpoints.txt`
+- `urls.txt`, `js_files.txt`, `endpoints.txt` — scope-confined attack surface
+- `external.txt` — off-scope references seen on target pages (intel, not probed)
 - `params.txt` — `endpoint<TAB>param1,param2`
 - `subdomains.txt`, `alive.txt`, `vhosts.txt`
-- `secrets.txt` — `[SEVERITY] type  preview  source:line`
+- `secrets.txt` — `[SEVERITY] type  value  source:line` (full value, not redacted)
 - `tech.txt` — detected technologies (server, framework, CMS, JS libs)
 - `forms.txt` — `METHOD<TAB>action-url<TAB>field1,field2` for every HTML form
 
-A colored summary and the top secret findings are printed to the console.
+A live progress bar (TTY only), a colored summary, and the top secret findings
+are printed to the console.
 
 ---
 
@@ -371,16 +386,19 @@ mirrors the same mapping via Chromium's `--host-resolver-rules`.
 
 ### Output — servicescan
 
-Written to `-o` (default `servicescan-out/`):
+Each run is filed under `<outdir>/<target>/<timestamp>/` with a `latest`
+symlink (so re-scans never overwrite); `--flat` writes straight into `-o`
+(default base `servicescan-out/`). Per run:
 
 - `scan.json` — full results (services, versions, provenance, CVEs incl.
   `epss`, `epss_pct` and `kev` fields per CVE)
 - `services.txt` — `port/proto  state  name  product version  [conf]  (sources)`
 - `cves.txt` — `score  severity  CVE-ID  port/ident  epss=  KEV  source  url`
   (score-sorted)
-- with `--web`: per-port webrecon output under `web/<port>-<scheme>/`
-  (`report.json`, `urls.txt`, `secrets.txt`, `vhosts.txt`, …); each service in
-  `scan.json` also carries a compact `web` summary
+- with `--web`: a consolidated, scope-confined `urls-all.txt` / `params-all.txt`
+  across every web port, plus per-port webrecon output under
+  `web/<port>-<scheme>/` (`report.json`, `urls.txt`, `secrets.txt`, …); each
+  service in `scan.json` also carries a compact `web` summary
 
 The console prints each service with its merged version, provenance
 (`nmap+http+banner`), and the top CVEs colored by severity — with an `EPSS %`
