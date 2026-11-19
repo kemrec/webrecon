@@ -25,18 +25,10 @@ _WEB_NAMES = ("http", "https", "http-alt", "http-proxy", "https-alt")
 _HOSTS_MARK = "# servicescan --web (cert SANs)"
 
 
-def _is_web(svc: Service) -> bool:
-    name = (svc.name or "").lower()
-    return (any(n in name for n in ("http",))
-            or bool(svc.http)
-            or svc.port in fingerprint._HTTP_PORTS
-            or svc.port in fingerprint._TLS_PORTS)
-
-
-def _is_tls(svc: Service) -> bool:
-    name = (svc.name or "").lower()
-    return ("https" in name or "ssl" in name
-            or bool(svc.tls) or svc.port in fingerprint._TLS_PORTS)
+# shared with report.py (nuclei target list): one definition of "is this web /
+# is this TLS" so the --web chain and the emitted target list never diverge.
+_is_web = fingerprint.is_web_service
+_is_tls = fingerprint.is_tls_service
 
 
 def _clean_host(name: str) -> str:

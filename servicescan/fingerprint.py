@@ -685,6 +685,22 @@ _HTTP_PORTS = {80, 8080, 8000, 8888, 591, 8008, 8081, 3000, 5000, 9000}
 _TLS_PORTS = {443, 8443, 9443, 4443}
 
 
+def is_web_service(svc) -> bool:
+    """True if this open port speaks HTTP(S): by nmap/our name, an HTTP
+    fingerprint, or a canonical web/TLS port."""
+    name = (svc.name or "").lower()
+    return ("http" in name or bool(svc.http)
+            or svc.port in _HTTP_PORTS or svc.port in _TLS_PORTS)
+
+
+def is_tls_service(svc) -> bool:
+    """True if this web port is TLS-wrapped (https/ssl name, a grabbed cert, or
+    a canonical TLS port)."""
+    name = (svc.name or "").lower()
+    return ("https" in name or "ssl" in name
+            or bool(svc.tls) or svc.port in _TLS_PORTS)
+
+
 async def fingerprint_service(cfg: ScanConfig, http, host: str,
                               svc: Service) -> None:
     """Run the probe set appropriate for this port and merge findings.

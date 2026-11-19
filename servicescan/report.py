@@ -7,6 +7,7 @@ import os
 from webrecon import utils
 from webrecon.utils import C
 from .models import ScanResult
+from . import fingerprint
 
 
 def _sev_color(sev: str, score) -> str:
@@ -68,6 +69,12 @@ def write_all(outdir: str, result: ScanResult) -> None:
     if nlines:
         _w(os.path.join(outdir, "scripts.txt"), nlines)
 
+    # nuclei-targets.txt  (one scheme://host:port per open web service, ready
+    # for `nuclei -l nuclei-targets.txt`; also fine for httpx/katana/feroxbuster)
+    nuclei = _web_targets(result)
+    if nuclei:
+        _w(os.path.join(outdir, "nuclei-targets.txt"), nuclei)
+
     # extra machine/human formats: CSV, JSONL, standalone HTML report
     try:
         from . import formats
@@ -76,8 +83,25 @@ def write_all(outdir: str, result: ScanResult) -> None:
         utils.debug(f"extra formats: {e}")
 
     extra = " + scripts.txt" if nlines else ""
+    extra += " + nuclei-targets.txt" if nuclei else ""
     utils.good(f"output written to {outdir}/ (scan.json + services.txt + "
                f"cves.txt{extra} + CSV + JSONL + report.html)")
+
+
+def _web_targets(result: ScanResult) -> list[str]:
+    """Every open HTTP(S) service as a deduped, sorted scheme://host:port list.
+    Prefers the hostname (vhost-correct) over the IP; TLS -> https."""
+    out: set[str] = set()
+    for h in result.hosts:
+        host = h.hostname or h.ip or h.target
+        if not host:
+            continue
+        for s in h.services:
+            if s.state != "open" or not fingerprint.is_web_service(s):
+                continue
+            scheme = "https" if fingerprint.is_tls_service(s) else "http"
+            out.add(f"{scheme}://{utils.with_port(host, s.port)}")
+    return sorted(out)
 
 
 def _w(path: str, lines) -> None:

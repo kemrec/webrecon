@@ -333,9 +333,11 @@ Key flags: `-iL/--target-file`, `-p/--ports`, `--top-ports`, `--rate` (nmap `--m
 `-t/--timeout`, `-o/--outdir`. Full list: `servicescan -h`.
 
 Every scan writes, alongside `scan.json`: `services.txt`, `cves.txt`,
-`services.csv`, `cves.csv`, `scan.jsonl` (one service per line), and a
-standalone `report.html` (summary cards + per-host service/CVE tables with
-CVSS colouring and KEV/exploit badges). `scripts.txt` is added when `--nse` ran.
+`services.csv`, `cves.csv`, `scan.jsonl` (one service per line), a
+`nuclei-targets.txt` web-target list (`scheme://host:port` per line, for
+`nuclei -l`), and a standalone `report.html` (summary cards + per-host
+service/CVE tables with CVSS colouring and KEV/exploit badges). `scripts.txt`
+is added when `--nse` ran.
 
 ### Web chain (`--web`): scan, then crawl every web port
 
@@ -400,6 +402,10 @@ symlink (so re-scans never overwrite); `--flat` writes straight into `-o`
 - `services.txt` — `port/proto  state  name  product version  [conf]  (sources)`
 - `cves.txt` — `score  severity  CVE-ID  port/ident  epss=  KEV  source  url`
   (score-sorted)
+- `nuclei-targets.txt` — every open HTTP(S) service as one `scheme://host:port`
+  per line (hostname preferred over IP, TLS detected by name/cert/port), ready
+  for `nuclei -l nuclei-targets.txt` (also fine for httpx / katana / feroxbuster).
+  Written on every scan, no `--web` needed.
 - with `--web`: a consolidated, scope-confined `urls-all.txt` / `params-all.txt`
   across every web port, plus per-port webrecon output under
   `web/<port>-<scheme>/` (`report.json`, `urls.txt`, `secrets.txt`, …); each
