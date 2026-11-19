@@ -54,6 +54,27 @@ class CVE:
     epss_pct: float | None = None       # EPSS percentile among all CVEs (0..1)
     kev: bool = False                   # listed in CISA KEV (known exploited)
     exploits: list = field(default_factory=list)  # [{source,title,url}] public PoCs
+    # environmental demotion: when a CVE's preconditions are absent in THIS
+    # deployment (e.g. ALPACA/CVE-2021-3618 needs TLS on the FTP service, so it
+    # is inapplicable to a plaintext-only FTP server) we keep the canonical
+    # cvss/severity untouched for intel, but drive display (color, severity
+    # label, sort order, crit/high counts) off these effective values so the
+    # finding stops reading as a live HIGH. env_note records why.
+    effective_cvss: float | None = None   # display/sort score override (None = use cvss)
+    effective_severity: str = ""          # display severity override ("" = use severity)
+    env_note: str = ""                    # environmental caveat shown with the summary
+
+    def disp_cvss(self):
+        """Score used for display, color, sort and counts (effective if set)."""
+        return self.effective_cvss if self.effective_cvss is not None else self.cvss
+
+    def disp_severity(self) -> str:
+        """Severity label used for display (effective override if set)."""
+        return self.effective_severity or self.severity
+
+    def disp_summary(self) -> str:
+        """Summary with the environmental caveat prefixed, when present."""
+        return f"{self.env_note} {self.summary}".strip() if self.env_note else self.summary
 
     def to_dict(self) -> dict:
         return asdict(self)

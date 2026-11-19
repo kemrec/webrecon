@@ -183,6 +183,67 @@ async def ajp_probe(host: str, port: int, timeout: float) -> bool:
     return data[:2] == _AJP_MAGIC
 
 
+# ---------------------------------------------------------------------------
+# FTP explicit-TLS (AUTH TLS/SSL, RFC 4217) probe
+# ALPACA (CVE-2021-3618) is a TLS cross-protocol attack: it is only meaningful
+# when the FTP service actually speaks TLS (explicit AUTH TLS/SSL, or implicit
+# FTPS on 990). This strictly read-only probe asks the server whether it offers
+# AUTH TLS so CVE refinement can demote ALPACA on plaintext-only FTP (where it
+# cannot apply) WITHOUT deleting the finding. It never starts a TLS handshake:
+# it reads the 220 greeting, inspects FEAT output, and as a fallback inspects
+# the AUTH reply code, then closes.
+# ---------------------------------------------------------------------------
+_FTP_AUTH_TLS_RX = re.compile(rb"AUTH[ \t]+(?:TLS|SSL)", re.I)
+
+
+async def ftp_tls_probe(host: str, port: int, timeout: float) -> bool:
+    """True if the FTP service offers explicit TLS (AUTH TLS/SSL).
+
+    Read-only: reads the 220 greeting, sends FEAT and scans the reply for an
+    AUTH TLS/SSL feature line; if FEAT does not advertise it, sends `AUTH TLS`
+    and treats a 234 reply (server ready to negotiate) as support. The TLS
+    handshake itself is never begun.
+    """
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        # 220 greeting (consume it so FEAT's reply is read cleanly)
+        try:
+            await asyncio.wait_for(reader.read(512), timeout=min(3.0, timeout))
+        except asyncio.TimeoutError:
+            pass
+        # compliant servers advertise the capability in FEAT
+        writer.write(b"FEAT\r\n")
+        await writer.drain()
+        feat = b""
+        try:
+            feat = await asyncio.wait_for(reader.read(2048), timeout=timeout)
+        except asyncio.TimeoutError:
+            feat = b""
+        if _FTP_AUTH_TLS_RX.search(feat):
+            return True
+        # fallback: ask directly. 234 = "ready to start TLS"; we stop there and
+        # never send the ClientHello, so nothing is encrypted or negotiated.
+        writer.write(b"AUTH TLS\r\n")
+        await writer.drain()
+        try:
+            resp = await asyncio.wait_for(reader.read(256), timeout=timeout)
+        except asyncio.TimeoutError:
+            resp = b""
+        return resp.lstrip()[:3] == b"234"
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+
+
 async def irc_probe(host: str, port: int, timeout: float) -> str:
     """IRC servers greet on connect but withhold the version; a VERSION command
     elicits the ISUPPORT/351 numerics that identify (Unreal)IRCd. Returns the

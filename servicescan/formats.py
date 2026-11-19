@@ -34,11 +34,14 @@ def write_csv(outdir: str, result) -> None:
               encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["host", "port", "service", "cve", "cvss", "severity",
+                    "eff_cvss", "eff_severity", "env_note",
                     "epss", "kev", "exploits", "source", "url"])
         for hid, _hn, s in _rows(result):
             for c in s.cves:
                 w.writerow([hid, s.port, s.ident(), c.id,
                             "" if c.cvss is None else c.cvss, c.severity,
+                            "" if c.effective_cvss is None else c.effective_cvss,
+                            c.effective_severity, c.env_note,
                             "" if c.epss is None else c.epss,
                             int(bool(c.kev)), len(getattr(c, "exploits", []) or []),
                             c.source, c.url])
@@ -80,12 +83,18 @@ a{color:#7fd1ff;text-decoration:none} a:hover{text-decoration:underline}
 
 
 def _sev_class(sev, score):
+    # a textual severity is authoritative (an environmentally demoted CVE keeps
+    # its canonical score but must render in its demoted class); the numeric
+    # band is only the fallback when no severity label is present.
     s = (sev or "").upper()
-    if s == "CRITICAL" or (score or 0) >= 9:
+    if s in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE"):
+        return {"CRITICAL": "crit", "HIGH": "high",
+                "MEDIUM": "med"}.get(s, "low")
+    if (score or 0) >= 9:
         return "crit"
-    if s == "HIGH" or (score or 0) >= 7:
+    if (score or 0) >= 7:
         return "high"
-    if s == "MEDIUM" or (score or 0) >= 4:
+    if (score or 0) >= 4:
         return "med"
     return "low"
 
@@ -94,7 +103,7 @@ def write_html(outdir: str, result) -> None:
     e = html.escape
     svcs = result.services
     total_cve = sum(len(s.cves) for s in svcs)
-    crit = sum(1 for s in svcs for c in s.cves if (c.cvss or 0) >= 9)
+    crit = sum(1 for s in svcs for c in s.cves if (c.disp_cvss() or 0) >= 9)
     kev = sum(1 for s in svcs for c in s.cves if c.kev)
     exp = sum(1 for s in svcs for c in s.cves if getattr(c, "exploits", None))
     live = [h for h in result.hosts if h.services]
@@ -128,7 +137,7 @@ def write_html(outdir: str, result) -> None:
                 portcell = (f"<td class='mono'>{s.port}/{s.proto}</td>"
                             f"<td class='svc'>{e(s.name)}</td>") if i == 0 else \
                            "<td></td><td></td>"
-                cls = _sev_class(c.severity, c.cvss)
+                cls = _sev_class(c.disp_severity(), c.disp_cvss())
                 score = "" if c.cvss is None else f"{c.cvss:.1f}"
                 epss = "" if c.epss is None else f"{c.epss*100:.1f}%"
                 flags = ""
@@ -143,7 +152,7 @@ def write_html(outdir: str, result) -> None:
                     f"<tr>{portcell}"
                     f"<td class='mono'><a href='{e(c.url)}' target='_blank'>{e(c.id)}</a></td>"
                     f"<td class='{cls}'>{score}</td><td>{epss}</td>"
-                    f"<td>{flags}</td><td>{e(c.summary[:120])}</td></tr>")
+                    f"<td>{flags}</td><td>{e(c.disp_summary()[:160])}</td></tr>")
         parts.append("</table></div>")
 
     parts.append("</div></body></html>")

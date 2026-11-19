@@ -66,6 +66,10 @@ async def run(cfg: ScanConfig) -> ScanResult:
             if cfg.cve:
                 utils.info(f"correlating CVEs (NVD / OSV) for {h.label()}")
                 await cve.correlate(cfg, http, h.services)
+                # environmental refinement: demote ALPACA (CVE-2021-3618) on
+                # FTP services that do not actually offer TLS (probes only the
+                # services carrying that CVE).
+                await cve.refine_ftp_alpaca(cfg, conn_host, h.services)
     finally:
         await http.close()
 

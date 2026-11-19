@@ -16,12 +16,23 @@ _ALERT_IDS = {"bindshell-detect", "redis-unauth", "memcached-unauth",
 
 
 def _sev_color(sev: str, score) -> str:
+    # a textual severity is authoritative (so an environmentally demoted CVE
+    # that keeps its canonical score still renders in its demoted color); the
+    # numeric band is only a fallback when no severity label is present.
     s = (sev or "").upper()
-    if s == "CRITICAL" or (score or 0) >= 9:
+    if s in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE"):
+        if s == "CRITICAL":
+            return C.RED + C.B
+        if s == "HIGH":
+            return C.RED
+        if s == "MEDIUM":
+            return C.YEL
+        return C.GRY
+    if (score or 0) >= 9:
         return C.RED + C.B
-    if s == "HIGH" or (score or 0) >= 7:
+    if (score or 0) >= 7:
         return C.RED
-    if s == "MEDIUM" or (score or 0) >= 4:
+    if (score or 0) >= 4:
         return C.YEL
     return C.GRY
 
@@ -52,15 +63,17 @@ def write_all(outdir: str, result: ScanResult) -> None:
         for s in h.services:
             for c in s.cves:
                 flat.append((hid, s, c))
-    flat.sort(key=lambda hsc: -(hsc[2].cvss or 0))
+    flat.sort(key=lambda hsc: -(hsc[2].disp_cvss() or 0))
     for hid, s, c in flat:
-        score = f"{c.cvss:.1f}" if c.cvss is not None else "  ?"
+        dcvss = c.disp_cvss()
+        score = f"{dcvss:.1f}" if dcvss is not None else "  ?"
         epss = f"{c.epss*100:.1f}%" if c.epss is not None else "-"
         kev = "KEV" if c.kev else "-"
         exp = f"EXP:{len(c.exploits)}" if getattr(c, "exploits", None) else "-"
-        clines.append(f"{score}\t{c.severity or '?':8}\t{c.id}\t"
+        note = f"\t{c.env_note}" if c.env_note else ""
+        clines.append(f"{score}\t{c.disp_severity() or '?':8}\t{c.id}\t"
                       f"{hid}\t{s.port}/{s.ident()}\tepss={epss}\t{kev}\t{exp}"
-                      f"\t{c.source}\t{c.url}")
+                      f"\t{c.source}\t{c.url}{note}")
     _w(os.path.join(outdir, "cves.txt"), clines)
 
     # scripts.txt  (NSE output, if any)
@@ -155,8 +168,8 @@ def console_summary(result: ScanResult, outdir: str | None = None) -> None:
         print(f"  {C.YEL}note{C.R}: nmap not used (fallback mode — limited coverage)")
 
     total_cve = sum(len(s.cves) for s in all_svcs)
-    crit = sum(1 for s in all_svcs for c in s.cves if (c.cvss or 0) >= 9)
-    high = sum(1 for s in all_svcs for c in s.cves if 7 <= (c.cvss or 0) < 9)
+    crit = sum(1 for s in all_svcs for c in s.cves if (c.disp_cvss() or 0) >= 9)
+    high = sum(1 for s in all_svcs for c in s.cves if 7 <= (c.disp_cvss() or 0) < 9)
     kev = sum(1 for s in all_svcs for c in s.cves if c.kev)
     print(f"  hosts up      : {len(live_hosts)}")
     print(f"  open services : {len(all_svcs)}")
@@ -214,15 +227,17 @@ def _print_service(s) -> None:
         else:
             print(f"        {C.YEL}chk {sid}{C.R}: {C.GRY}{first[:80]}{C.R}")
     for c in s.cves[:6]:
-        col = _sev_color(c.severity, c.cvss)
+        col = _sev_color(c.disp_severity(), c.disp_cvss())
+        # show the canonical base score, but the (possibly demoted) severity
+        # label + color and the environmental note make the demotion explicit.
         score = f"{c.cvss:.1f}" if c.cvss is not None else "?"
         kev = f"  {C.RED}{C.B}[KEV]{C.R}" if c.kev else ""
         epss = (f"  {C.GRY}EPSS {c.epss*100:.1f}%{C.R}"
                 if c.epss is not None else "")
         exp = (f"  {C.RED}{C.B}[EXPLOIT x{len(c.exploits)}]{C.R}"
                if getattr(c, "exploits", None) else "")
-        print(f"        {col}{c.id}  CVSS {score}  {c.severity}{C.R}{kev}{exp}{epss}  "
-              f"{C.GRY}{c.summary[:60]}{C.R}")
+        print(f"        {col}{c.id}  CVSS {score}  {c.disp_severity()}{C.R}{kev}{exp}{epss}  "
+              f"{C.GRY}{c.disp_summary()[:80]}{C.R}")
     if len(s.cves) > 6:
         print(f"        {C.GRY}... +{len(s.cves)-6} more (see cves.txt){C.R}")
     if s.web:

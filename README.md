@@ -310,6 +310,16 @@ NVD_API_KEY=xxxx servicescan host         # raise NVD rate limit (recommended)
   disables it; `--cache-ttl SECONDS` tunes freshness. Keyword-search NVD
   results are additionally filtered by **CPE version range**, so a CVE whose
   fixed/affected range excludes the detected version is dropped.
+- **Environmental refinement.** A CVE can match the version correctly yet be
+  inapplicable to *this* deployment. ALPACA (`CVE-2021-3618`) is a cross
+  protocol TLS attack, so it only has meaning when the FTP service actually
+  offers TLS. When the correlated version carries it, servicescan runs a
+  strictly read-only `AUTH TLS` probe (inspect `FEAT`, else read the `AUTH`
+  reply code; the TLS handshake is never started) against only that FTP
+  service, and on a plaintext-only server it demotes the finding to a `LOW`
+  display with an explanatory note. The canonical CVSS and the fact that the
+  version is affected are preserved in `scan.json` / `cves.csv`
+  (`eff_cvss`, `eff_severity`, `env_note` columns), so no intel is lost.
 
 #### Targets: one host, many hosts, a range, or a file
 

@@ -659,3 +659,66 @@ async def correlate(cfg: ScanConfig, http, services: list[Service],
     if getattr(cfg, "exploits", False):
         from . import exploits as exploit_mod
         await exploit_mod.enrich_exploits(cfg, http, services, cache=cache)
+
+
+# ---------------------------------------------------------------------------
+# Environmental refinement: ALPACA (CVE-2021-3618) on FTP
+# ---------------------------------------------------------------------------
+# CVE-2021-3618 (ALPACA) is a cross-protocol TLS attack: an attacker who can
+# MITM a victim and shares a TLS certificate across services redirects a TLS
+# session from one protocol to another. It is only exploitable when the FTP
+# service itself speaks TLS (explicit AUTH TLS/SSL, or implicit FTPS on 990).
+# NVD lists vsftpd <= 3.0.4 as affected, so the CPE match is CORRECT -- the
+# demotion here is purely ENVIRONMENTAL: on a plaintext-only FTP server the
+# attack has no TLS session to redirect, so we drop it from HIGH to a LOW
+# display with an explanatory note, WITHOUT deleting it (the canonical CVSS and
+# the fact that the version is affected are preserved for intel).
+_ALPACA_CVE = "CVE-2021-3618"
+_ALPACA_NOTE = ("[CEVRESEL: bu FTP serviste AUTH TLS yok; "
+                "ALPACA cross-protocol TLS saldirisi uygulanamaz]")
+
+
+def _ftp_tls_known(svc: Service):
+    """Decide if the FTP service's TLS posture is already known without probing.
+
+    Returns True (TLS present: implicit FTPS 990, an ftps/ssl name, or a TLS
+    cert we already grabbed), False (no indication), or None when it must be
+    probed on the wire. We only return True here; absence of a static signal
+    is 'unknown' (None), never a definitive 'no'."""
+    name = (svc.name or "").lower()
+    if svc.port == 990 or "ftps" in name or "ssl" in name:
+        return True
+    if svc.tls:                       # a TLS cert was grabbed -> TLS is spoken
+        return True
+    return None
+
+
+async def refine_ftp_alpaca(cfg: ScanConfig, host: str,
+                            services: list[Service]) -> None:
+    """Demote ALPACA (CVE-2021-3618) on FTP services that do not offer TLS.
+
+    Probes ONLY the FTP services that actually carry the CVE (minimal extra
+    network), and only when TLS cannot already be inferred statically. A
+    plaintext-only FTP server cannot be ALPACA-attacked, so the finding is
+    demoted for display/sort while its canonical score is preserved."""
+    from . import fingerprint
+    for svc in services:
+        if svc.state != "open":
+            continue
+        alpaca = next((c for c in svc.cves if c.id == _ALPACA_CVE), None)
+        if alpaca is None:
+            continue
+        name = (svc.name or "").lower()
+        if "ftp" not in name and svc.port not in (21, 990):
+            continue                   # scope this refinement to FTP only
+        tls = _ftp_tls_known(svc)
+        if tls is None:
+            tls = await fingerprint.ftp_tls_probe(host, svc.port, cfg.timeout)
+        if tls:
+            continue                   # TLS present -> ALPACA applies, leave it
+        # no TLS -> environmental demotion (display only; canonical preserved)
+        alpaca.effective_cvss = 0.0
+        alpaca.effective_severity = "LOW"
+        alpaca.env_note = _ALPACA_NOTE
+        utils.debug(f":{svc.port} ALPACA {_ALPACA_CVE} demoted "
+                    f"(no AUTH TLS on this FTP service)")
