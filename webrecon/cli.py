@@ -71,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
     dsc = p.add_argument_group("discovery")
     dsc.add_argument("--subdomain-wordlist", default=None)
     dsc.add_argument("--vhost-wordlist", default=None)
+    dsc.add_argument("--aggressive", action="store_true",
+                     help="secrets: also flag secret-shaped high-entropy strings "
+                          "whose variable name isn't a known keyword (gitleaks "
+                          "generic-api-key). Finds more but noisier (content "
+                          "hashes, build IDs); all such hits are rated low.")
 
     # phase selection
     sel = p.add_argument_group("phases")
@@ -122,6 +127,7 @@ def cfg_from_args(a: argparse.Namespace) -> Config:
         block_resources=(set() if a.no_block_resources
                          else {"image", "media", "font"}),
         max_js_bytes=a.max_js_bytes,
+        secrets_aggressive=a.aggressive,
         include_subdomains=not a.no_subs_scope,
         concurrency=a.concurrency,
         timeout=a.timeout,

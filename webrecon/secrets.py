@@ -124,6 +124,18 @@ _USERNAME_HINT = re.compile(
     r"""(?i)\b(?:user(?:name)?|login|email|e-mail)\b\s*[:=]\s*['"`]([^'"`\s]{3,80})['"`]"""
 )
 
+# Aggressive (opt-in) entropy sweep: any quoted string literal that *looks*
+# like a secret by shape + entropy, regardless of the left-hand key name -- the
+# gitleaks "generic-api-key" idea. This catches keys assigned to oddly-named
+# variables the keyword list misses, at the cost of noise (content hashes,
+# minified identifiers, nonces, build IDs), so it is off by default and only
+# ever rated low. Candidate literals are 20-100 base64 / hex / url-safe chars.
+_ENTROPY_LITERAL = re.compile(r"""['"`]([A-Za-z0-9][A-Za-z0-9+/=_\-]{19,99})['"`]""")
+# pure hex of a common digest length -> almost always an integrity/content
+# hash, an etag or a build fingerprint, not a credential.
+_HEX_DIGEST = re.compile(r"(?i)\A(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}|[0-9a-f]{128})\Z")
+_ENTROPY_MIN = 4.0
+
 _PLACEHOLDER_VALUES = {
     "password", "changeme", "example", "your_password", "yourpassword",
     "xxxxxxxx", "null", "none", "true", "false", "undefined", "test",
@@ -157,18 +169,25 @@ def _snippet(text: str, start: int, end: int) -> str:
     return frag[:200]
 
 
-def scan(text: str, source: str) -> list[Finding]:
-    """Scan one blob of text; return list of Findings."""
+def scan(text: str, source: str, aggressive: bool = False) -> list[Finding]:
+    """Scan one blob of text; return list of Findings.
+
+    With aggressive=True, additionally run an entropy-first sweep for
+    secret-shaped string literals whose surrounding key name is not one we
+    recognise (gitleaks "generic-api-key"). Noisy and low-severity: opt-in.
+    """
     if not text:
         return []
     findings: list[Finding] = []
     seen: set[tuple[str, str]] = set()
+    values_seen: set[str] = set()            # values already reported (any type)
 
     def add(ftype, sev, value, start, end):
         key = (ftype, value[:60])
         if key in seen:
             return
         seen.add(key)
+        values_seen.add(value[:60])
         findings.append(Finding(
             type=ftype, severity=sev,
             match_preview=value,                 # full value, not redacted
@@ -211,5 +230,28 @@ def scan(text: str, source: str) -> list[Finding]:
         if value.lower() in _PLACEHOLDER_VALUES:
             continue
         add("Username/Email hint", "low", value, m.start(), m.end())
+
+    # aggressive entropy sweep (opt-in): secret-shaped literals the keyword
+    # passes above did not already catch. Deliberately conservative to keep the
+    # noise bounded: needs mixed letters+digits, real character variety, high
+    # Shannon entropy, and must not be a plain content-hash digest.
+    if aggressive:
+        for m in _ENTROPY_LITERAL.finditer(text):
+            value = m.group(1)
+            if value[:60] in values_seen:                 # already reported
+                continue
+            if value.lower() in _PLACEHOLDER_VALUES:
+                continue
+            if _HEX_DIGEST.match(value):                   # md5/sha/etag hash
+                continue
+            if not (any(c.isdigit() for c in value)
+                    and any(c.isalpha() for c in value)):  # need both classes
+                continue
+            if len(set(value)) < max(10, len(value) // 2):  # too repetitive
+                continue
+            if _shannon_entropy(value) < _ENTROPY_MIN:
+                continue
+            add("High-entropy string (aggressive)", "low",
+                value, m.start(1), m.end(1))
 
     return findings

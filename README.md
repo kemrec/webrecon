@@ -33,7 +33,7 @@ This repo ships **two CLIs** that share one async core:
 | **Liveness check** | Probes discovered URLs and hosts; reports status, final URL, title, and `Server` header. |
 | **Subdomain enumeration** | Passive enum via crt.sh (Certificate Transparency) + optional wordlist. |
 | **Cert → vhost discovery** | Reads `subjectAltName` DNS names from the target's TLS certificate, then fuzzes the `Host:` header against the shared IP to surface hidden virtual hosts (baseline-divergence detection). |
-| **Secret scanning** | 50+ provider rules (gitleaks / truffleHog family): AWS / Azure / GCP / DigitalOcean / Vault / GitHub / GitLab / Atlassian / Slack / Discord / Telegram / Twilio / SendGrid / Stripe / Square / PayPal / npm / PyPI / OpenAI / Anthropic / HuggingFace / Shopify / Datadog / New Relic / Postman / Databricks / Notion / Grafana / Mapbox / Dropbox keys, JWTs, private-key blocks, DB connection strings, basic-auth-in-URL, and generic `password=/token=/secret=/apikey=/username=` assignments — with entropy + placeholder filtering. Findings carry the full value (operator tool, not redacted), severity-tagged, with source + line. |
+| **Secret scanning** | 50+ provider rules (gitleaks / truffleHog family): AWS / Azure / GCP / DigitalOcean / Vault / GitHub / GitLab / Atlassian / Slack / Discord / Telegram / Twilio / SendGrid / Stripe / Square / PayPal / npm / PyPI / OpenAI / Anthropic / HuggingFace / Shopify / Datadog / New Relic / Postman / Databricks / Notion / Grafana / Mapbox / Dropbox keys, JWTs, private-key blocks, DB connection strings, basic-auth-in-URL, and generic `password=/token=/secret=/apikey=/username=` assignments — with entropy + placeholder filtering. `--aggressive` adds an opt-in entropy sweep for secret-shaped strings under unrecognised key names (gitleaks `generic-api-key`; noisier, rated low). Findings carry the full value (operator tool, not redacted), severity-tagged, with source + line. |
 | **Clean output** | Full `report.json` plus greppable `*.txt` lists, and a colored console summary. |
 
 ---
@@ -117,6 +117,7 @@ webrecon example.com -H "Cookie: sid=abc" -H "X-Api-Key: k" \
 | `--render-workers` | `3` | max concurrent browser tabs in render mode |
 | `--no-block-resources` | off | also load images/media/fonts (default: aborted) |
 | `--max-js-bytes` | `20000000` | skip parsing JS bundles bigger than this |
+| `--aggressive` | off | secrets: also flag secret-shaped high-entropy strings under unknown key names (noisier, all rated low) |
 | `-c, --concurrency` | `40` | async concurrency |
 | `-t, --timeout` | `12` | per-request timeout (s) |
 | `-H, --header` | — | extra header, repeatable (`K:V`) |
@@ -227,7 +228,11 @@ nmap's result and, for every under-identified port, adds:
 - **banner grab** (with protocol-appropriate nudges for SSH/FTP/SMTP/Redis/…),
 - **HTTP fingerprint** (`Server` / `X-Powered-By` headers, `generator` meta,
   body signatures for common apps + their versions),
-- **TLS certificate** (subject/issuer/SAN, often naming the host/app).
+- **TLS certificate** (subject/issuer/SAN, often naming the host/app),
+- **silent binary-protocol probes** for services that never send a banner:
+  AJP13 (CPing/CPong, Ghostcat surface), distcc on 3632 (read-only behavioural
+  probe, CVE-2004-2687 unrestricted-exec exposure), plus unauthenticated
+  bindshell detection.
 
 Evidence is merged by confidence, so nmap's good answers are kept and only the
 gaps get filled. The result is strictly **≥ nmap** on version coverage — not a

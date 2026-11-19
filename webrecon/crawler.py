@@ -153,7 +153,8 @@ class Crawler:
             if self._in_scope(u):
                 self.result.hosts.add(utils.host_of(u))
         if self.cfg.do_secrets:
-            self.result.secret_findings.extend(secrets.scan(r.text, js_url))
+            self.result.secret_findings.extend(
+                secrets.scan(r.text, js_url, self.cfg.secrets_aggressive))
 
     async def _process_page(self, url: str, depth: int, queue: asyncio.Queue,
                             visited: set[str]) -> None:
@@ -189,7 +190,8 @@ class Crawler:
 
         # secrets in HTML / inline scripts
         if self.cfg.do_secrets:
-            self.result.secret_findings.extend(secrets.scan(html, url))
+            self.result.secret_findings.extend(
+                secrets.scan(html, url, self.cfg.secrets_aggressive))
 
         # gather raw links
         raw_links = extract.extract_html_links(html)

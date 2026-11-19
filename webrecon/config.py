@@ -33,6 +33,7 @@ class Config:
     block_resources: set[str] = field(
         default_factory=lambda: {"image", "media", "font"})
     max_js_bytes: int = 20_000_000        # skip parsing JS bundles bigger than this
+    secrets_aggressive: bool = False      # opt-in entropy sweep for generic secrets
 
     # networking
     concurrency: int = 40                 # async concurrency for probes/fetches
