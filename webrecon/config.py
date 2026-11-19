@@ -32,7 +32,7 @@ class Config:
     # cost. Loading them is what makes a headless crawl spike CPU/memory.
     block_resources: set[str] = field(
         default_factory=lambda: {"image", "media", "font"})
-    max_js_bytes: int = 4_000_000         # skip parsing JS bundles bigger than this
+    max_js_bytes: int = 20_000_000        # skip parsing JS bundles bigger than this
 
     # networking
     concurrency: int = 40                 # async concurrency for probes/fetches

@@ -43,8 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-block-resources", action="store_true",
                    help="load images/media/fonts too (default: aborted to "
                         "save CPU/memory; does not affect link/JS discovery)")
-    g.add_argument("--max-js-bytes", type=int, default=4_000_000,
-                   help="skip parsing JS bundles larger than this (default 4MB)")
+    g.add_argument("--max-js-bytes", type=int, default=20_000_000,
+                   help="skip parsing JS bundles larger than this (default 20MB)")
     g.add_argument("--no-subs-scope", action="store_true",
                    help="do NOT treat subdomains as in-scope for crawling")
 
