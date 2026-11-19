@@ -9,7 +9,11 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "cryptography>=42.0",
     "dnspython>=2.4",
+    "packaging>=23.0",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
 
 [project.scripts]
 webrecon = "webrecon.cli:main"
@@ -24,3 +28,7 @@ packages = ["webrecon", "servicescan"]
 
 [tool.setuptools.package-data]
 servicescan = ["data/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
