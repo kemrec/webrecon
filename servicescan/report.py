@@ -69,11 +69,17 @@ def write_all(outdir: str, result: ScanResult) -> None:
     if nlines:
         _w(os.path.join(outdir, "scripts.txt"), nlines)
 
-    # nuclei-targets.txt  (one scheme://host:port per open web service, ready
-    # for `nuclei -l nuclei-targets.txt`; also fine for httpx/katana/feroxbuster)
+    # nuclei target lists, split by what nuclei's two template families expect:
+    #   nuclei-targets.txt      web -> scheme://host:port  (http templates;
+    #                           also fine for httpx/katana/feroxbuster)
+    #   nuclei-targets-net.txt  non-web -> host:port       (network/ssl/javascript
+    #                           protocol templates: ssh, redis, mysql, jmx, ...)
     nuclei = _web_targets(result)
     if nuclei:
         _w(os.path.join(outdir, "nuclei-targets.txt"), nuclei)
+    nuclei_net = _network_targets(result)
+    if nuclei_net:
+        _w(os.path.join(outdir, "nuclei-targets-net.txt"), nuclei_net)
 
     # extra machine/human formats: CSV, JSONL, standalone HTML report
     try:
@@ -84,16 +90,22 @@ def write_all(outdir: str, result: ScanResult) -> None:
 
     extra = " + scripts.txt" if nlines else ""
     extra += " + nuclei-targets.txt" if nuclei else ""
+    extra += " + nuclei-targets-net.txt" if nuclei_net else ""
     utils.good(f"output written to {outdir}/ (scan.json + services.txt + "
                f"cves.txt{extra} + CSV + JSONL + report.html)")
 
 
+def _host_of(h) -> str:
+    """Target host for a nuclei line: hostname (vhost-correct) over IP."""
+    return h.hostname or h.ip or h.target
+
+
 def _web_targets(result: ScanResult) -> list[str]:
-    """Every open HTTP(S) service as a deduped, sorted scheme://host:port list.
-    Prefers the hostname (vhost-correct) over the IP; TLS -> https."""
+    """Every open HTTP(S) service as a deduped, sorted scheme://host:port list,
+    for nuclei's http templates. TLS -> https."""
     out: set[str] = set()
     for h in result.hosts:
-        host = h.hostname or h.ip or h.target
+        host = _host_of(h)
         if not host:
             continue
         for s in h.services:
@@ -101,6 +113,23 @@ def _web_targets(result: ScanResult) -> list[str]:
                 continue
             scheme = "https" if fingerprint.is_tls_service(s) else "http"
             out.add(f"{scheme}://{utils.with_port(host, s.port)}")
+    return sorted(out)
+
+
+def _network_targets(result: ScanResult) -> list[str]:
+    """Every open NON-web service as a deduped, sorted host:port list (no
+    scheme), the form nuclei's network / ssl / javascript protocol templates
+    expect (ssh, ftp, redis, mysql, jmx, smtp, ...). IPv6 literals are
+    bracketed so host:port stays unambiguous."""
+    out: set[str] = set()
+    for h in result.hosts:
+        host = _host_of(h)
+        if not host:
+            continue
+        for s in h.services:
+            if s.state != "open" or fingerprint.is_web_service(s):
+                continue
+            out.add(utils.with_port(host, s.port))
     return sorted(out)
 
 
