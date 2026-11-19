@@ -10,6 +10,11 @@ from .models import ScanResult
 from . import fingerprint
 
 
+# script ids that are security findings, not informational -> red in console
+_ALERT_IDS = {"bindshell-detect", "redis-unauth", "memcached-unauth",
+              "mongodb-unauth"}
+
+
 def _sev_color(sev: str, score) -> str:
     s = (sev or "").upper()
     if s == "CRITICAL" or (score or 0) >= 9:
@@ -202,8 +207,12 @@ def _print_service(s) -> None:
     if s.http.get("title"):
         print(f"        {C.GRY}title: {s.http['title']}{C.R}")
     for sc in getattr(s, "scripts", []):
+        sid = sc.get("id", "")
         first = (sc.get("output", "").splitlines() or [""])[0].strip()
-        print(f"        {C.YEL}nse {sc.get('id','')}{C.R}: {C.GRY}{first[:80]}{C.R}")
+        if sid in _ALERT_IDS:
+            print(f"        {C.RED}{C.B}! {sid}{C.R}: {C.RED}{first[:110]}{C.R}")
+        else:
+            print(f"        {C.YEL}chk {sid}{C.R}: {C.GRY}{first[:80]}{C.R}")
     for c in s.cves[:6]:
         col = _sev_color(c.severity, c.cvss)
         score = f"{c.cvss:.1f}" if c.cvss is not None else "?"

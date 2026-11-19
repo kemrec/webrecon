@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import re
 import ssl
+import struct
 
 from .config import ScanConfig
 from .models import Service
@@ -281,6 +282,192 @@ async def distcc_probe(host: str, port: int, timeout: float) -> bool:
             await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Unauthenticated-exposure checks (read-only)
+# A data store reachable without credentials is a critical finding on its own,
+# and one nmap reports only as a plain service. These probes send strictly
+# read-only, non-mutating commands and never write or delete anything: Redis
+# INFO, memcached version, MongoDB listDatabases. Each returns ("open", version)
+# when unauthenticated access works, ("auth", "") when the service is present
+# but demands credentials, or None when it is not that service.
+# ---------------------------------------------------------------------------
+_REDIS_VER = re.compile(rb"redis_version:([0-9][0-9.]+)")
+_MEMC_VER = re.compile(rb"VERSION ([0-9][0-9A-Za-z._-]+)")
+
+
+async def _read_once(host: int, port: int, payload: bytes, timeout: float,
+                     nbytes: int = 4096) -> bytes:
+    """Open, send payload, read one response, close. b'' on any failure."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return b""
+    data = b""
+    try:
+        writer.write(payload)
+        await writer.drain()
+        try:
+            data = await asyncio.wait_for(reader.read(nbytes), timeout=timeout)
+        except asyncio.TimeoutError:
+            data = b""
+    except Exception:  # noqa: BLE001
+        data = b""
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+    return data
+
+
+async def redis_probe(host: str, port: int, timeout: float):
+    """Redis INFO (read-only). ('open', version) / ('auth', '') / None."""
+    data = await _read_once(host, port, b"INFO\r\n", timeout)
+    if not data:
+        return None
+    if b"redis_version:" in data:
+        m = _REDIS_VER.search(data)
+        return ("open", m.group(1).decode() if m else "")
+    low = data.lower()
+    if data[:1] == b"-" and (b"noauth" in low or b"auth" in low
+                             or b"protected mode" in low or b"wrongpass" in low):
+        return ("auth", "")        # present, but password / protected mode
+    return None
+
+
+async def memcached_probe(host: str, port: int, timeout: float):
+    """memcached version (read-only). ('open', version) / ('auth', '') / None."""
+    data = await _read_once(host, port, b"version\r\n", timeout)
+    if not data:
+        return None
+    if data[:8] == b"VERSION ":
+        m = _MEMC_VER.search(data)
+        return ("open", m.group(1).decode() if m else "")
+    if b"ERROR" in data[:32]:       # SASL-enabled instances refuse the text cmd
+        return ("auth", "")
+    return None
+
+
+def _mongo_listdb_msg() -> bytes:
+    """An OP_MSG for { listDatabases: 1, nameOnly: true, $db: "admin" } -- a
+    read-only command that lists database names (and fails with an auth error
+    when authorization is enabled)."""
+    el = b""
+    el += b"\x10" + b"listDatabases\x00" + struct.pack("<i", 1)   # int32 = 1
+    el += b"\x08" + b"nameOnly\x00" + b"\x01"                      # bool true
+    el += b"\x02" + b"$db\x00" + struct.pack("<i", 6) + b"admin\x00"  # string
+    doc = struct.pack("<i", len(el) + 5) + el + b"\x00"           # BSON document
+    body = struct.pack("<I", 0) + b"\x00" + doc        # flagBits=0, section 0
+    header = struct.pack("<iiii", 16 + len(body), 1, 0, 2013)     # OP_MSG=2013
+    return header + body
+
+
+async def mongodb_probe(host: str, port: int, timeout: float):
+    """MongoDB listDatabases (read-only). ('open', '') / ('auth', '') / None."""
+    data = await _read_once(host, port, _mongo_listdb_msg(), timeout, nbytes=8192)
+    if len(data) < 16:
+        return None
+    low = data.lower()
+    if b"databases" in low:
+        return ("open", "")         # listing succeeded without credentials
+    if (b"not authorized" in low or b"requires authentication" in low
+            or b"unauthorized" in low or b"authentication" in low):
+        return ("auth", "")
+    return None
+
+
+_REDIS_PORTS = {6379, 6380}
+_MEMCACHED_PORTS = {11211}
+_MONGO_PORTS = {27017, 27018, 27019}
+
+
+def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
+    if not svc.name:
+        svc.name = name
+    if not svc.product:
+        svc.product = product
+    if version and not svc.version:
+        svc.version = version
+        svc.cve_skip = False
+    if "exposure" not in svc.sources:
+        svc.sources.append("exposure")
+    if kind == "open":
+        svc.confidence = "high"
+        svc.extrainfo = "UNAUTHENTICATED access"
+        svc.scripts.append({"id": script_id, "output": crit_output})
+    else:
+        svc.scripts.append({"id": script_id.replace("-unauth", "-auth"),
+                            "output": f"{product} detected; authentication is "
+                                      "enforced (the read-only probe was refused "
+                                      "without credentials)."})
+
+
+async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
+    """Run the read-only unauth check that matches this service, if any."""
+    name = (svc.name or "").lower()
+    port = svc.port
+
+    if "redis" in name or port in _REDIS_PORTS:
+        res = await redis_probe(host, port, cfg.timeout)
+        if res:
+            _mark_exposure(svc, "redis", "Redis", res[0], res[1], "redis-unauth",
+                f"Redis reachable WITHOUT authentication (INFO succeeded). An "
+                f"unauthenticated client can read and overwrite every key and, "
+                f"on common deployments, gain code execution (CONFIG SET dir + "
+                f"module load / cron / webshell write) = full host compromise. "
+                f"Set requirepass or ACLs, bind to localhost, firewall {port}.")
+        return
+
+    if "memcache" in name or port in _MEMCACHED_PORTS:
+        res = await memcached_probe(host, port, cfg.timeout)
+        if res:
+            _mark_exposure(svc, "memcached", "Memcached", res[0], res[1],
+                "memcached-unauth",
+                f"memcached reachable WITHOUT authentication (answered version). "
+                f"Any client can read and poison cached data, and the UDP/stats "
+                f"surface enables large reflection DDoS. Enable SASL, bind to "
+                f"localhost, disable UDP, firewall {port}.")
+        return
+
+    if "mongo" in name or port in _MONGO_PORTS:
+        res = await mongodb_probe(host, port, cfg.timeout)
+        if res:
+            _mark_exposure(svc, "mongodb", "MongoDB", res[0], res[1],
+                "mongodb-unauth",
+                f"MongoDB reachable WITHOUT authentication (listDatabases "
+                f"succeeded). An unauthenticated client can read and modify every "
+                f"database. Enable authorization, bind to localhost, firewall "
+                f"{port}.")
+        return
+
+
+async def run_exposure_checks(cfg: ScanConfig, host: str,
+                              services: list[Service]) -> None:
+    """Read-only unauth-access checks over EVERY open service, not just the
+    under-identified ones: a service nmap named perfectly can still be exposed."""
+    open_svcs = [s for s in services if s.state == "open"]
+    if not open_svcs:
+        return
+    sem = asyncio.Semaphore(cfg.concurrency)
+
+    async def one(svc: Service):
+        async with sem:
+            try:
+                await check_exposure(cfg, host, svc)
+            except Exception as e:  # noqa: BLE001
+                utils.debug(f"exposure :{svc.port} err {e}")
+
+    await asyncio.gather(*(one(s) for s in open_svcs))
+    hits = [s for s in open_svcs
+            if any(sc.get("id", "").endswith("-unauth") for sc in s.scripts)]
+    if hits:
+        utils.warn(f"UNAUTHENTICATED exposure on "
+                   f"{', '.join(str(s.port) for s in hits)} "
+                   f"(see scripts.txt / scan.json)")
 
 
 # ---------------------------------------------------------------------------

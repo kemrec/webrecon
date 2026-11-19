@@ -232,7 +232,13 @@ nmap's result and, for every under-identified port, adds:
 - **silent binary-protocol probes** for services that never send a banner:
   AJP13 (CPing/CPong, Ghostcat surface), distcc on 3632 (read-only behavioural
   probe, CVE-2004-2687 unrestricted-exec exposure), plus unauthenticated
-  bindshell detection.
+  bindshell detection,
+- **unauthenticated-exposure checks** (read-only, run on every open port, not
+  just the under-identified ones): Redis `INFO`, memcached `version`, MongoDB
+  `listDatabases` confirm whether a data store answers without credentials. An
+  open one is flagged as a critical finding (and the probe also recovers the
+  version); a password-protected one is reported as such. The probes send only
+  non-mutating commands and never write or delete.
 
 Evidence is merged by confidence, so nmap's good answers are kept and only the
 gaps get filled. The result is strictly **≥ nmap** on version coverage — not a

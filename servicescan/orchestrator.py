@@ -62,6 +62,7 @@ async def run(cfg: ScanConfig) -> ScanResult:
                 utils.info(f"host {h.label()}: {len(h.services)} open service(s)")
             if cfg.fingerprint:
                 await fingerprint.run_fingerprint(cfg, http, conn_host, h.services)
+                await fingerprint.run_exposure_checks(cfg, conn_host, h.services)
             if cfg.cve:
                 utils.info(f"correlating CVEs (NVD / OSV) for {h.label()}")
                 await cve.correlate(cfg, http, h.services)
