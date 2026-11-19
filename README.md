@@ -30,6 +30,7 @@ This repo ships **two CLIs** that share one async core:
 | **JS-aware crawl** | Headless/headed Chromium (Playwright). Catches links injected by JS and URLs hit via `fetch`/`axios`/XHR, not just static HTML. `--no-render` falls back to fast HTTP-only. |
 | **Endpoint & URL extraction** | Pulls paths, endpoints and full URLs from external + inline JavaScript (LinkFinder-style regex + API-call detection). |
 | **Parameter mapping** | Separates parameterized vs. parameterless endpoints and records observed parameter names per endpoint. |
+| **OpenAPI / Swagger discovery** | Probes well-known spec locations (`/openapi.json`, `/swagger.json`, `/v3/api-docs`, …) on the target and discovered hosts, parses any spec (OpenAPI 3 + Swagger 2, JSON; YAML when PyYAML is present), and folds every route + query parameter into the endpoint/param/URL surface — including endpoints the crawler can't reach. Read-only GETs only. |
 | **Liveness check** | Probes discovered URLs and hosts; reports status, final URL, title, and `Server` header. |
 | **Subdomain enumeration** | Passive enum via crt.sh (Certificate Transparency) + optional wordlist. |
 | **Cert → vhost discovery** | Reads `subjectAltName` DNS names from the target's TLS certificate, then fuzzes the `Host:` header against the shared IP to surface hidden virtual hosts (baseline-divergence detection). |
@@ -105,6 +106,7 @@ webrecon example.com -H "Cookie: sid=abc" -H "X-Api-Key: k" \
 | `subs`    | subdomain enumeration (crt.sh + wordlist) |
 | `vhost`   | cert SAN + Host-header vhost fuzzing |
 | `alive`   | liveness probing |
+| `openapi` | OpenAPI/Swagger spec discovery + route extraction |
 
 ### Common options
 
@@ -180,6 +182,7 @@ single-directory behaviour). Files in each run directory:
 - `secrets.txt` — `[SEVERITY] type  value  source:line` (full value, not redacted)
 - `tech.txt` — detected technologies (server, framework, CMS, JS libs)
 - `forms.txt` — `METHOD<TAB>action-url<TAB>field1,field2` for every HTML form
+- `openapi.txt` — any OpenAPI/Swagger spec found (`spec-url<TAB>title vN<TAB>N paths<TAB>N endpoints`); its routes also merge into `endpoints.txt` / `params.txt` / `urls.txt`
 
 A live progress bar (TTY only), a colored summary, and the top secret findings
 are printed to the console.

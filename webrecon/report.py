@@ -61,6 +61,13 @@ def write_all(outdir: str, data: dict) -> None:
                       f"{','.join(f.get('params', []))}")
     _w(os.path.join(outdir, "forms.txt"), flines)
 
+    specs = data.get("openapi", [])
+    if specs:
+        olines = [f"{s.get('url','')}\t{s.get('title','')} "
+                  f"v{s.get('version','')}\t{s.get('paths',0)} paths\t"
+                  f"{s.get('endpoints',0)} endpoints" for s in specs]
+        _w(os.path.join(outdir, "openapi.txt"), olines)
+
     utils.good(f"output written to {outdir}/ (report.json + *.txt)")
 
 
@@ -86,6 +93,10 @@ def console_summary(data: dict) -> None:
     print(f"  {C.CYN}js files{C.R}          : {len(s.get('js_files', []))}")
     print(f"  {C.CYN}endpoints (raw){C.R}   : {len(s.get('endpoints', []))}")
     print(f"  {C.CYN}params'd endpoints{C.R}: {len(s.get('params', {}))}")
+    specs = s.get("openapi", [])
+    if specs:
+        print(f"  {C.CYN}openapi specs{C.R}      : {len(specs)} "
+              f"({sum(x.get('paths', 0) for x in specs)} paths)")
     print(f"  {C.CYN}html forms{C.R}        : {len(s.get('forms', []))}")
     print(f"  {C.CYN}subdomains{C.R}        : {len(s.get('subdomains', []))}")
     print(f"  {C.CYN}vhosts found{C.R}      : {len(s.get('vhosts', []))}")

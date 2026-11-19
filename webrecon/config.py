@@ -59,6 +59,7 @@ class Config:
     do_subdomains: bool = True
     do_vhost: bool = True
     do_alive: bool = True
+    do_openapi: bool = True               # probe for OpenAPI/Swagger specs
 
     # wordlists / sources
     vhost_wordlist: str | None = None

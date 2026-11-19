@@ -68,6 +68,35 @@ async def run(cfg: Config) -> dict:
                 r3 = await c2.run(seeds)
             _merge(agg, r3)
 
+        # ---- phase 3b: OpenAPI / Swagger spec discovery ----
+        # The spec enumerates the whole API surface (routes + params) including
+        # endpoints the crawler can't reach. Probe the target and any discovered
+        # hosts, then fold the parsed paths into the attack surface.
+        openapi_specs: list = []
+        if cfg.do_openapi:
+            from . import openapi
+            from urllib.parse import urlsplit
+            sp = urlsplit(cfg.target)
+            bases = {f"{sp.scheme}://{sp.netloc}"}
+            scheme = "https" if cfg.target.startswith("https") else "http"
+            _, tgt_port = utils.hostport_of(cfg.target)
+            for h in new_hosts:
+                bases.add(f"{scheme}://{utils.with_port(h, tgt_port)}")
+            try:
+                utils.info("phase 3b: probing for OpenAPI / Swagger specs")
+                specs, o_eps, o_params, o_urls = await openapi.discover(
+                    cfg, http, sorted(bases))
+                openapi_specs = specs
+                agg.endpoints |= o_eps
+                for k, v in o_params.items():
+                    agg.params.setdefault(k, set()).update(v)
+                agg.urls |= o_urls
+                if specs:
+                    utils.good(f"openapi: {len(specs)} spec(s), "
+                               f"{len(o_eps)} endpoints merged into the surface")
+            except Exception as e:  # noqa: BLE001
+                utils.warn(f"openapi discovery failed ({e}); continuing")
+
         # ---- phase 4: alive probing ----
         alive_urls, alive_hosts = [], []
         if cfg.do_alive:
@@ -122,6 +151,7 @@ async def run(cfg: Config) -> dict:
             "secrets": [f.to_dict() for f in agg.secret_findings],
             "tech": sorted(agg.tech),
             "forms": in_forms,
+            "openapi": openapi_specs,
         }
         return data
     finally:
