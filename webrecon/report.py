@@ -22,10 +22,14 @@ def write_all(outdir: str, data: dict) -> None:
     with open(os.path.join(outdir, "report.json"), "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, ensure_ascii=False, default=_json_default)
 
-    # greppable plaintext lists
+    # greppable plaintext lists (urls/endpoints/params are scope-confined --
+    # the attack surface). Off-scope references go to external.txt as intel.
     _w(os.path.join(outdir, "urls.txt"), sorted(data.get("urls", [])))
     _w(os.path.join(outdir, "js_files.txt"), sorted(data.get("js_files", [])))
     _w(os.path.join(outdir, "endpoints.txt"), sorted(data.get("endpoints", [])))
+    ext = sorted(data.get("external_urls", []))
+    if ext:
+        _w(os.path.join(outdir, "external.txt"), ext)
 
     params = data.get("params", {})
     plines = []

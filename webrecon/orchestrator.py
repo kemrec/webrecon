@@ -91,13 +91,28 @@ async def run(cfg: Config) -> dict:
         if disco:
             all_subs |= set(disco.crtsh_subs) | set(disco.cert_sans) | set(disco.resolved)
 
+        # Scope-confine the ATTACK-SURFACE outputs. The crawler records off-scope
+        # references (third-party / CDN / public URLs seen on target pages) in
+        # agg.urls as intel, but it never fetches them -- and they must NOT leak
+        # into urls.txt / endpoints.txt / params.txt / forms.txt, which feed
+        # Burp / ffuf / sqlmap. Actively fuzzing a public host you were not
+        # scoped to is both noise and an authorization problem. Keep only
+        # in-scope entries here; preserve the off-scope ones under
+        # "external_urls" so the intel is not lost.
+        in_urls = sorted(u for u in agg.urls if _out_scope(u, cfg))
+        ext_urls = sorted(u for u in agg.urls if not _out_scope(u, cfg))
+        in_endpoints = sorted(e for e in agg.endpoints if _out_scope(e, cfg))
+        in_params = {k: sorted(v) for k, v in agg.params.items() if _out_scope(k, cfg)}
+        in_forms = [f for f in agg.forms if _out_scope(f.get("url", ""), cfg)]
+
         data = {
             "target": cfg.target,
             "pages": agg.pages,
-            "urls": sorted(agg.urls),
+            "urls": in_urls,
+            "external_urls": ext_urls,
             "js_files": sorted(agg.js_files),
-            "endpoints": sorted(agg.endpoints),
-            "params": {k: sorted(v) for k, v in agg.params.items()},
+            "endpoints": in_endpoints,
+            "params": in_params,
             "subdomains": sorted(all_subs),
             "resolved": disco.resolved if disco else {},
             "cert_sans": disco.cert_sans if disco else [],
@@ -106,11 +121,23 @@ async def run(cfg: Config) -> dict:
             "alive_hosts": alive_hosts,
             "secrets": [f.to_dict() for f in agg.secret_findings],
             "tech": sorted(agg.tech),
-            "forms": agg.forms,
+            "forms": in_forms,
         }
         return data
     finally:
         await http.close()
+
+
+def _out_scope(u: str, cfg: Config) -> bool:
+    """True if a URL / endpoint belongs in the scope-confined attack-surface
+    output. Hostless (relative) endpoints like '/api/x' belong to the target
+    and are always kept. An absolute URL is kept only when its host is in scope.
+    With same_scope_only off, everything is kept."""
+    if not cfg.same_scope_only:
+        return True
+    if not utils.host_of(u):
+        return True   # relative / hostless endpoint -> belongs to the target
+    return utils.in_scope(u, cfg.scope_hosts, cfg.include_subdomains)
 
 
 def _merge(dst: CrawlResult, src: CrawlResult) -> None:
