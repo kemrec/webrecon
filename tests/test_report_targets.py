@@ -1,3 +1,5 @@
+import os
+
 from servicescan import report
 from servicescan.models import ScanResult, Host, Service
 
@@ -119,3 +121,31 @@ def test_web_and_network_partition_no_overlap():
     web_ports = {t.rsplit(":", 1)[1] for t in web}
     net_ports = {t.rsplit(":", 1)[1] for t in net}
     assert web_ports.isdisjoint(net_ports)
+
+
+# --- nuclei command hint in console summary --------------------------------
+def _result_with_both():
+    r = ScanResult(target="lab")
+    r.hosts = [Host(target="10.0.0.5", ip="10.0.0.5", services=[
+        Service(port=80, name="http", state="open"),
+        Service(port=22, name="ssh", state="open"),
+    ])]
+    return r
+
+
+def test_nuclei_hint_uses_absolute_paths(tmp_path, capsys):
+    r = _result_with_both()
+    out = str(tmp_path)
+    report.write_all(out, r)                     # writes both target files
+    report.console_summary(r, out)
+    printed = capsys.readouterr().out
+    abs_web = os.path.join(os.path.abspath(out), "nuclei-targets.txt")
+    abs_net = os.path.join(os.path.abspath(out), "nuclei-targets-net.txt")
+    assert abs_web in printed and abs_net in printed
+    assert os.path.isabs(abs_web)                # full path, runs from anywhere
+    assert "nuclei -l " in printed
+
+
+def test_nuclei_hint_absent_without_outdir(capsys):
+    report.console_summary(_result_with_both())  # no outdir -> no hint
+    assert "nuclei -l " not in capsys.readouterr().out

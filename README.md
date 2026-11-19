@@ -418,7 +418,10 @@ symlink (so re-scans never overwrite); `--flat` writes straight into `-o`
 The console prints each service with its merged version, provenance
 (`nmap+http+banner`), and the top CVEs colored by severity — with an `EPSS %`
 figure and a red `[KEV]` badge on anything in the CISA Known Exploited
-Vulnerabilities catalog. Per service, KEV-listed CVEs are ranked first.
+Vulnerabilities catalog. Per service, KEV-listed CVEs are ranked first. It
+closes with copy-pasteable `nuclei` commands for the web and non-web target
+lists, written with absolute paths (and `2>/dev/null` to drop the Go
+`net/http` idle-channel noise) so they run from any directory.
 
 ---
 

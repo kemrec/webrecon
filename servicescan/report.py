@@ -139,7 +139,7 @@ def _w(path: str, lines) -> None:
             fh.write(str(ln) + "\n")
 
 
-def console_summary(result: ScanResult) -> None:
+def console_summary(result: ScanResult, outdir: str | None = None) -> None:
     live_hosts = [h for h in result.hosts if h.services]
     all_svcs = result.services
 
@@ -165,7 +165,33 @@ def console_summary(result: ScanResult) -> None:
               f"({len(h.services)} open){C.R}")
         for s in h.services:
             _print_service(s)
+    _print_nuclei_hint(outdir)
     print(f"{C.B}{'='*66}{C.R}")
+
+
+def _print_nuclei_hint(outdir: str | None) -> None:
+    """Show copy-pasteable nuclei commands for the target lists we wrote, using
+    ABSOLUTE paths so they run from any directory. 2>/dev/null drops the Go
+    net/http 'Unsolicited response' stderr noise; findings go to -o."""
+    if not outdir:
+        return
+    base = os.path.abspath(outdir)
+    lists = [("nuclei-targets.txt", "nuclei-web.txt", "http templates"),
+             ("nuclei-targets-net.txt", "nuclei-net.txt", "network/ssl templates")]
+    cmds = []
+    for src, out, label in lists:
+        src_abs = os.path.join(base, src)
+        if os.path.exists(src_abs):
+            out_abs = os.path.join(base, out)
+            cmds.append((f"nuclei -l {src_abs} -silent -o {out_abs} 2>/dev/null",
+                         label))
+    if not cmds:
+        return
+    print(f"{C.B}{'-'*66}{C.R}")
+    print(f"  {C.B}next: scan the discovered services with nuclei{C.R}")
+    for cmd, label in cmds:
+        print(f"  {C.GRY}# {label}{C.R}")
+        print(f"  {cmd}")
 
 
 def _print_service(s) -> None:

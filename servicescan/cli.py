@@ -202,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
 
     report.write_all(cfg.outdir, result)
     if not cfg.quiet:
-        report.console_summary(result)
+        report.console_summary(result, cfg.outdir)
     return 0
 
 
