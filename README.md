@@ -33,7 +33,7 @@ This repo ships **two CLIs** that share one async core:
 | **Liveness check** | Probes discovered URLs and hosts; reports status, final URL, title, and `Server` header. |
 | **Subdomain enumeration** | Passive enum via crt.sh (Certificate Transparency) + optional wordlist. |
 | **Cert → vhost discovery** | Reads `subjectAltName` DNS names from the target's TLS certificate, then fuzzes the `Host:` header against the shared IP to surface hidden virtual hosts (baseline-divergence detection). |
-| **Secret scanning** | AWS / GCP / GitHub / GitLab / Slack / Stripe / OpenAI / Anthropic keys, JWTs, private-key blocks, DB connection strings, basic-auth-in-URL, and generic `password=/token=/secret=/apikey=/username=` assignments — with entropy + placeholder filtering. Findings are redacted, severity-tagged, with source + line. |
+| **Secret scanning** | 50+ provider rules (gitleaks / truffleHog family): AWS / Azure / GCP / DigitalOcean / Vault / GitHub / GitLab / Atlassian / Slack / Discord / Telegram / Twilio / SendGrid / Stripe / Square / PayPal / npm / PyPI / OpenAI / Anthropic / HuggingFace / Shopify / Datadog / New Relic / Postman / Databricks / Notion / Grafana / Mapbox / Dropbox keys, JWTs, private-key blocks, DB connection strings, basic-auth-in-URL, and generic `password=/token=/secret=/apikey=/username=` assignments — with entropy + placeholder filtering. Findings carry the full value (operator tool, not redacted), severity-tagged, with source + line. |
 | **Clean output** | Full `report.json` plus greppable `*.txt` lists, and a colored console summary. |
 
 ---
@@ -116,7 +116,7 @@ webrecon example.com -H "Cookie: sid=abc" -H "X-Api-Key: k" \
 | `--headful` | off | run browser headed (debug) |
 | `--render-workers` | `3` | max concurrent browser tabs in render mode |
 | `--no-block-resources` | off | also load images/media/fonts (default: aborted) |
-| `--max-js-bytes` | `4000000` | skip parsing JS bundles bigger than this |
+| `--max-js-bytes` | `20000000` | skip parsing JS bundles bigger than this |
 | `-c, --concurrency` | `40` | async concurrency |
 | `-t, --timeout` | `12` | per-request timeout (s) |
 | `-H, --header` | — | extra header, repeatable (`K:V`) |
