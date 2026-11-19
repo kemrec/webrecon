@@ -755,14 +755,21 @@ async def run_fingerprint(cfg: ScanConfig, http, host: str,
         return
     utils.info(f"fingerprinting {len(targets)} service(s)")
     sem = asyncio.Semaphore(cfg.concurrency)
+    progress = utils.Progress("fingerprint")
+    done = 0
 
     async def one(svc: Service):
+        nonlocal done
         async with sem:
             try:
                 await fingerprint_service(cfg, http, host, svc)
             except Exception as e:  # noqa: BLE001
                 utils.debug(f"fingerprint :{svc.port} err {e}")
+            finally:
+                done += 1
+                progress.update(done, len(targets), f":{svc.port}")
 
     await asyncio.gather(*(one(s) for s in targets))
+    progress.finish()
     improved = sum(1 for s in targets if s.version)
     utils.good(f"fingerprint done ({improved}/{len(targets)} now have a version)")

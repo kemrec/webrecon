@@ -236,6 +236,7 @@ class Crawler:
     async def run(self, seeds: list[str]) -> CrawlResult:
         queue: asyncio.Queue = asyncio.Queue()
         visited: set[str] = set()
+        progress = utils.Progress("crawl")
         for s in seeds:
             await queue.put((s, 0))
 
@@ -249,7 +250,8 @@ class Crawler:
                     if url in visited or len(visited) >= self.cfg.max_pages:
                         continue
                     visited.add(url)
-                    utils.info(f"crawl d{depth} [{len(visited)}/{self.cfg.max_pages}] {url}")
+                    progress.update(len(visited), self.cfg.max_pages, f"d{depth}")
+                    utils.debug(f"crawl d{depth} [{len(visited)}/{self.cfg.max_pages}] {url}")
                     await self._process_page(url, depth, queue, visited)
                 except Exception as e:  # noqa: BLE001
                     utils.debug(f"page error {url}: {e}")
@@ -263,6 +265,7 @@ class Crawler:
         workers = [asyncio.create_task(worker()) for _ in range(n_workers)]
         await asyncio.gather(*workers)
 
+        progress.finish()
         utils.good(f"crawl done: {len(self.result.pages)} pages, "
                    f"{len(self.result.urls)} urls, {len(self.result.js_files)} JS files")
         return self.result
