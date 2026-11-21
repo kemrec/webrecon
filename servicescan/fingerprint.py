@@ -1323,17 +1323,21 @@ async def wsdiscovery_probe(host: str, port: int, timeout: float) -> dict | None
 # over TLS we offer ALPN and check for a negotiated "h2"; cleartext we send the
 # HTTP/2 connection preface and look for a SETTINGS frame (h2c). The real prize
 # is server reflection -- an unauthenticated client can enumerate every service
-# and method (the gRPC analogue of an open Swagger). Reflection/health enum uses
-# grpcurl (if on PATH) or grpcio (lazy import) when available; otherwise we still
-# report the HTTP/2 detection and say which tool to install. Scoped to common
-# gRPC ports / `grpc`-named services so HTTPS/2 web ports are never mislabelled.
+# and method (the gRPC analogue of an open Swagger). Reflection list_services is
+# done NATIVELY with no dependency: the service names ride in the response DATA
+# frame (protobuf), not the HPACK headers, so we only need HPACK *encoding*
+# (literals, no Huffman) for the request plus a tiny protobuf reader -- no HPACK
+# decode, no grpc library. grpcurl / grpcio are used only as an optional fallback
+# when the native client can't complete the exchange. Scoped to common gRPC ports
+# / `grpc`-named services so HTTPS/2 web ports are never mislabelled.
 # ---------------------------------------------------------------------------
 _GRPC_PORTS = {50051, 6565, 9090, 8980, 9000, 7070}
 _H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 
-def _h2_frame(ftype: int, stream: int, payload: bytes = b"") -> bytes:
-    return (len(payload).to_bytes(3, "big") + bytes([ftype]) + b"\x00"
+def _h2_frame(ftype: int, stream: int, payload: bytes = b"",
+              flags: int = 0) -> bytes:
+    return (len(payload).to_bytes(3, "big") + bytes([ftype, flags])
             + (stream & 0x7FFFFFFF).to_bytes(4, "big") + payload)
 
 
@@ -1404,6 +1408,211 @@ async def grpc_probe(host: str, port: int, timeout: float,
         host, port, timeout) else None
 
 
+# --- native reflection (dependency-free) ---------------------------------
+_REFLECT_PATHS = (
+    "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo",
+    "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+)
+# gRPC-framed ServerReflectionRequest{ list_services: "*" }: flag(0) + len(3) +
+# protobuf field 7 (list_services, wiretype 2) len 1 "*"
+_GRPC_REFLECT_MSG = b"\x00\x00\x00\x00\x03\x3a\x01\x2a"
+
+
+def _hpack_int(value: int, prefix_bits: int) -> bytes:
+    cap = (1 << prefix_bits) - 1
+    if value < cap:
+        return bytes([value])
+    out = bytearray([cap])
+    value -= cap
+    while value >= 128:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _hpack_literal(name: str, val: str) -> bytes:
+    """One header as 'literal without indexing, new name' (0x00), no Huffman."""
+    n, v = name.encode(), val.encode()
+    return (b"\x00" + _hpack_int(len(n), 7) + n
+            + _hpack_int(len(v), 7) + v)
+
+
+def _hpack_request(host: str, port: int, path: str, tls: bool) -> bytes:
+    hdrs = [(":method", "POST"), (":scheme", "https" if tls else "http"),
+            (":path", path), (":authority", f"{host}:{port}"),
+            ("te", "trailers"), ("content-type", "application/grpc"),
+            ("user-agent", "servicescan"), ("grpc-accept-encoding", "identity")]
+    return b"".join(_hpack_literal(k, v) for k, v in hdrs)
+
+
+def _varint(buf: bytes, i: int):
+    shift = result = 0
+    while i < len(buf):
+        b = buf[i]
+        i += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            break
+        shift += 7
+    return result, i
+
+
+def _pb_fields(buf: bytes):
+    """Yield (field_number, wiretype, value) for a protobuf message. value is an
+    int for varint/fixed, bytes for length-delimited."""
+    i, n = 0, len(buf)
+    while i < n:
+        tag, i = _varint(buf, i)
+        fn, wt = tag >> 3, tag & 7
+        if wt == 0:
+            v, i = _varint(buf, i)
+            yield fn, wt, v
+        elif wt == 2:
+            ln, i = _varint(buf, i)
+            yield fn, wt, buf[i:i + ln]
+            i += ln
+        elif wt == 5:
+            yield fn, wt, buf[i:i + 4]
+            i += 4
+        elif wt == 1:
+            yield fn, wt, buf[i:i + 8]
+            i += 8
+        else:
+            break
+
+
+def _reflection_names(msg: bytes) -> list[str]:
+    """ServerReflectionResponse(6=ListServiceResponse) -> repeated 1=ServiceResponse
+    -> 1=name (string)."""
+    names = []
+    for fn, wt, val in _pb_fields(msg):
+        if fn == 6 and wt == 2:
+            for fn2, wt2, val2 in _pb_fields(val):
+                if fn2 == 1 and wt2 == 2:
+                    for fn3, wt3, val3 in _pb_fields(val2):
+                        if fn3 == 1 and wt3 == 2:
+                            names.append(val3.decode("utf-8", "replace"))
+    return names
+
+
+def _parse_reflection_services(data: bytes) -> list[str]:
+    """Strip the gRPC length-prefix(es) off the DATA stream and pull the service
+    names out of the protobuf message(s)."""
+    names, i = [], 0
+    while i + 5 <= len(data):
+        mlen = int.from_bytes(data[i + 1:i + 5], "big")
+        msg = data[i + 5:i + 5 + mlen]
+        if len(msg) < mlen:
+            break
+        names += _reflection_names(msg)
+        i += 5 + mlen
+    # de-dup, keep order
+    seen, out = set(), []
+    for nm in names:
+        if nm and nm not in seen:
+            seen.add(nm)
+            out.append(nm)
+    return out
+
+
+async def _reflect_once(host: str, port: int, timeout: float, tls: bool,
+                        path: str):
+    """One HTTP/2 reflection exchange on a fresh connection. Returns
+    (spoke_grpc, services)."""
+    ctx = None
+    if tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.set_alpn_protocols(["h2"])
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return False, []
+
+    def _safe_write(b):
+        try:
+            writer.write(b)
+        except Exception:  # noqa: BLE001
+            pass
+
+    spoke = False
+    data_payload = b""
+    try:
+        _safe_write(_H2_PREFACE + _h2_frame(0x04, 0))              # preface+SETTINGS
+        _safe_write(_h2_frame(0x01, 1, _hpack_request(host, port, path, tls),
+                              flags=0x04))                          # HEADERS END_HEADERS
+        _safe_write(_h2_frame(0x00, 1, _GRPC_REFLECT_MSG, flags=0x01))  # DATA END_STREAM
+        try:
+            await writer.drain()
+        except Exception:  # noqa: BLE001
+            pass
+        buf = b""
+        while True:
+            try:
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=timeout)
+            except asyncio.TimeoutError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while len(buf) >= 9:
+                flen = int.from_bytes(buf[0:3], "big")
+                if len(buf) < 9 + flen:
+                    break
+                ftype, fflags = buf[3], buf[4]
+                fstream = int.from_bytes(buf[5:9], "big") & 0x7FFFFFFF
+                payload = buf[9:9 + flen]
+                buf = buf[9 + flen:]
+                if ftype == 0x04 and not (fflags & 0x01):          # SETTINGS -> ACK
+                    _safe_write(_h2_frame(0x04, 0, flags=0x01))
+                elif ftype == 0x06 and not (fflags & 0x01):        # PING -> ACK
+                    _safe_write(_h2_frame(0x06, 0, payload, flags=0x01))
+                elif ftype == 0x00 and fstream == 1:               # DATA
+                    spoke = True
+                    data_payload += payload
+                    if fflags & 0x01:                              # END_STREAM
+                        return True, _parse_reflection_services(data_payload)
+                elif ftype == 0x01 and fstream == 1:               # HEADERS / trailers
+                    spoke = True
+                    if fflags & 0x01:
+                        return True, _parse_reflection_services(data_payload)
+                elif ftype == 0x07:                                # GOAWAY
+                    return spoke, _parse_reflection_services(data_payload)
+            try:
+                await writer.drain()
+            except Exception:  # noqa: BLE001
+                pass
+        return spoke, _parse_reflection_services(data_payload)
+    except Exception:  # noqa: BLE001
+        return spoke, _parse_reflection_services(data_payload)
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+
+
+async def grpc_reflect_native(host: str, port: int, timeout: float,
+                              tls: bool):
+    """Native gRPC server-reflection list_services. Returns (spoke_grpc,
+    services). spoke_grpc=False => the port did not complete a gRPC reflection
+    exchange; (True, []) => reflection is disabled/auth-gated."""
+    spoke_any = False
+    for path in _REFLECT_PATHS:
+        spoke, svcs = await _reflect_once(host, port, timeout, tls, path)
+        if spoke and svcs:
+            return True, svcs
+        spoke_any = spoke_any or spoke
+    return spoke_any, []
+
+
 def _parse_grpcurl_list(text: str) -> list[str]:
     """Service names from `grpcurl ... list` stdout (one dotted name per line)."""
     out = []
@@ -1439,9 +1648,15 @@ async def _grpc_list_via_grpcio(host: str, port: int, timeout: float,
 
 async def grpc_list_services(host: str, port: int, timeout: float,
                              tls: bool) -> dict | None:
-    """Enumerate gRPC services via reflection. Returns {tool, services} when a
-    tool is available (services empty = reflection off/auth), or None when
-    neither grpcurl nor grpcio is installed. Read-only (list only)."""
+    """Enumerate gRPC services via reflection. Native first (no dependency); if
+    the native client completed a gRPC exchange its answer is authoritative
+    ({tool: native, services}, services empty = reflection off/auth). Only when
+    the native client could not speak gRPC at all do we fall back to grpcurl /
+    grpcio, returning None if neither is installed. Read-only (list only)."""
+    spoke, svcs = await grpc_reflect_native(host, port, timeout, tls)
+    if spoke:
+        return {"tool": "native", "services": svcs}
+
     import shutil
     gc = shutil.which("grpcurl")
     if gc:

@@ -192,3 +192,114 @@ def test_grpc_branch_skipped_on_non_grpc_port(monkeypatch):
                      refl={"tool": "grpcurl", "services": ["x.Y"]},
                      port=8080, name="http")
     assert not any(i.startswith("grpc") for i in _ids(svc))
+
+
+# --- native (dependency-free) reflection --------------------------------------
+def _uvarint(n):
+    out = b""
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out += bytes([b | 0x80]) if n else bytes([b])
+        if not n:
+            return out
+
+
+def _ld(field, data):
+    return bytes([(field << 3) | 2]) + _uvarint(len(data)) + data
+
+
+def _refl_response_bytes(services):
+    # ServerReflectionResponse(6) -> repeated ServiceResponse(1) -> name(1)
+    inner = b"".join(_ld(1, _ld(1, s.encode())) for s in services)
+    resp = _ld(6, inner)
+    return b"\x00" + len(resp).to_bytes(4, "big") + resp
+
+
+def _make_h2_server(mode, services=()):
+    async def handler(reader, writer):
+        try:
+            await asyncio.wait_for(reader.read(2048), timeout=2.0)
+        except Exception:
+            pass
+        try:
+            writer.write(fp._h2_frame(0x04, 0))                       # SETTINGS
+            if mode == "services":
+                writer.write(fp._h2_frame(0x01, 1, b"", flags=0x04))  # HEADERS
+                writer.write(fp._h2_frame(0x00, 1, _refl_response_bytes(services),
+                                          flags=0x01))                 # DATA END_STREAM
+            elif mode == "refloff":
+                writer.write(fp._h2_frame(0x01, 1, b"", flags=0x05))  # trailers-only
+            await writer.drain()
+        except Exception:
+            pass
+        writer.close()
+    return handler
+
+
+def test_hpack_literal_and_protobuf_helpers():
+    assert fp._hpack_literal(":path", "/x") == b"\x00\x05:path\x02/x"
+    assert fp._varint(bytes([0x96, 0x01]), 0) == (150, 2)
+    resp = _refl_response_bytes(["svc.One", "svc.Two"])
+    assert fp._parse_reflection_services(resp) == ["svc.One", "svc.Two"]
+
+
+def test_grpc_reflect_native_lists_services():
+    async def run():
+        srv = await asyncio.start_server(
+            _make_h2_server("services",
+                            ["grpc.health.v1.Health", "myapp.v1.OrderService"]),
+            "127.0.0.1", 0)
+        port = srv.sockets[0].getsockname()[1]
+        try:
+            return await fp.grpc_reflect_native("127.0.0.1", port, 2.0, tls=False)
+        finally:
+            srv.close()
+            await srv.wait_closed()
+
+    spoke, svcs = asyncio.run(run())
+    assert spoke is True
+    assert svcs == ["grpc.health.v1.Health", "myapp.v1.OrderService"]
+
+
+def test_grpc_reflect_native_reflection_off():
+    async def run():
+        srv = await asyncio.start_server(_make_h2_server("refloff"),
+                                         "127.0.0.1", 0)
+        port = srv.sockets[0].getsockname()[1]
+        try:
+            return await fp.grpc_reflect_native("127.0.0.1", port, 2.0, tls=False)
+        finally:
+            srv.close()
+            await srv.wait_closed()
+
+    spoke, svcs = asyncio.run(run())
+    assert spoke is True and svcs == []
+
+
+def test_grpc_reflect_native_not_grpc():
+    spoke, svcs = asyncio.run(
+        fp.grpc_reflect_native("127.0.0.1", 59998, 0.3, tls=False))
+    assert spoke is False and svcs == []
+
+
+def test_grpc_native_integration_reflection_exposed():
+    # full check_exposure path, no monkeypatch: native detection + native enum
+    async def run():
+        srv = await asyncio.start_server(
+            _make_h2_server("services", ["a.Svc", "b.Svc"]), "127.0.0.1", 0)
+        port = srv.sockets[0].getsockname()[1]
+        svc = Service(port=port, name="grpc", state="open")
+        cfg = ScanConfig(target="x", timeout=2.0, concurrency=5)
+        try:
+            await fp.check_exposure(cfg, "127.0.0.1", svc)
+        finally:
+            srv.close()
+            await srv.wait_closed()
+        return svc
+
+    svc = asyncio.run(run())
+    out = {s["id"]: s["output"] for s in svc.scripts}
+    assert "grpc-reflection-exposed" in out
+    assert "via native" in out["grpc-reflection-exposed"]
+    assert "a.Svc" in out["grpc-reflection-exposed"]

@@ -304,12 +304,14 @@ nmap's result and, for every under-identified port, adds:
 - **gRPC / HTTP2** (dedicated gRPC ports — 50051/6565/9090/… — or a `grpc`-named
   service): dependency-free detection (TLS ALPN `h2`, or the cleartext h2c
   preface → SETTINGS frame). The real finding is **server reflection enabled
-  without authentication**, which lets anyone enumerate every service and method
-  (the gRPC analogue of an open Swagger) — reported as critical with the service
-  list. Reflection/health enumeration uses `grpcurl` (if on `PATH`) or `grpcio`
-  (lazy import) when present; otherwise the HTTP/2 detection is still reported
-  with a note on which tool to install. Scoped to gRPC ports so HTTPS/2 web ports
-  are never mislabelled. Read-only (list only).
+  without authentication**, which lets anyone enumerate every service (the gRPC
+  analogue of an open Swagger) — reported as critical with the service list. The
+  reflection `list_services` call is done **natively, with no dependency**: the
+  service names come back in the response DATA frame (protobuf), not the HPACK
+  headers, so only HPACK *encoding* (literals, no Huffman) plus a tiny protobuf
+  reader are needed — no gRPC library. `grpcurl`/`grpcio` are used only as an
+  optional fallback if the native client can't complete the exchange. Scoped to
+  gRPC ports so HTTPS/2 web ports are never mislabelled. Read-only (list only).
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully
