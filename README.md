@@ -292,6 +292,15 @@ nmap's result and, for every under-identified port, adds:
   its Types, Scopes (`onvif://…/name|hardware|location`) and the `device_service`
   XAddr. Run once per host (one datagram, unicast only), so it surfaces cameras a
   default TCP scan misses.
+- **Vendor camera CGI** (camera-signalled web port): the HTTP management API that
+  Hikvision (`/ISAPI/System/deviceInfo`), Dahua (`/cgi-bin/magicBox.cgi`) and Axis
+  (`/axis-cgi/param.cgi`) cameras expose beside RTSP/ONVIF. A read-only `GET` that
+  returns device info **without credentials** is a **critical** misconfiguration
+  (the CVE-2017-7921 ISAPI class); a `401` is probed with a tiny default-credential
+  list over HTTP Basic/Digest, and an accepted default (model + firmware recovered,
+  fed to CVE correlation) is **critical**. The cred test is self-limiting — a path
+  the device doesn't implement `404`s, so defaults are only tried against the API
+  the device actually speaks — and is governed by the same `--no-cam-creds` switch.
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully

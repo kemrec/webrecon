@@ -444,9 +444,12 @@ async def mongodb_probe(host: str, port: int, timeout: float):
 # --- HTTP(S)-based stores: Elasticsearch / CouchDB / Docker API / etcd / kubelet
 # All read-only GETs (no POST/PUT/DELETE), no redirects followed.
 async def _http_get_once(host: str, port: int, path: str, timeout: float,
-                         tls: bool = False, nbytes: int = 16384):
+                         tls: bool = False, extra_headers: dict | None = None,
+                         nbytes: int = 16384):
     """Raw HTTP/1.0 GET. Returns (status:int, headers:dict, body:bytes) or None.
-    Strictly read-only; follows no redirects; TLS cert never verified."""
+    Strictly read-only; follows no redirects; TLS cert never verified.
+    extra_headers adds request headers (e.g. Authorization for a default-cred
+    test)."""
     ctx = None
     if tls:
         ctx = ssl.create_default_context()
@@ -459,9 +462,11 @@ async def _http_get_once(host: str, port: int, path: str, timeout: float,
         return None
     raw = b""
     try:
+        extra = "".join(f"{k}: {v}\r\n"
+                        for k, v in (extra_headers or {}).items())
         req = (f"GET {path} HTTP/1.0\r\nHost: {host}\r\n"
                f"User-Agent: servicescan\r\nAccept: */*\r\n"
-               f"Connection: close\r\n\r\n")
+               f"{extra}Connection: close\r\n\r\n")
         writer.write(req.encode())
         await writer.drain()
         try:
@@ -1178,6 +1183,76 @@ async def camera_snapshot_probe(host: str, port: int, timeout: float,
 
 
 # ---------------------------------------------------------------------------
+# Vendor camera CGI: the HTTP management API Hikvision/Dahua/Axis cameras expose
+# BESIDE RTSP/ONVIF. An unauthenticated GET that returns device info is a
+# misconfiguration (e.g. the CVE-2017-7921 ISAPI class); a 401 is probed with a
+# tiny default-credential list over HTTP Basic/Digest (reusing the RTSP auth
+# builder with method GET). The cred-spray is self-limiting: a vendor path a
+# device doesn't implement 404s, so defaults are only tried against the one API
+# the device actually speaks. Read-only GETs; gated to a camera signal.
+# ---------------------------------------------------------------------------
+# camera HTTP defaults = the RTSP set + a couple of vendor-specific ones
+_CAM_HTTP_CREDS = _RTSP_DEFAULT_CREDS + [("admin", "12345"), ("root", "pass")]
+_VENDOR_CGI = [
+    {"vendor": "Hikvision", "path": "/ISAPI/System/deviceInfo",
+     "ok": re.compile(r"<DeviceInfo|<deviceName|<firmwareVersion", re.I),
+     "model": re.compile(r"<model>([^<]+)<", re.I),
+     "fw": re.compile(r"<firmwareVersion>([^<]+)<", re.I)},
+    {"vendor": "Dahua", "path": "/cgi-bin/magicBox.cgi?action=getSystemInfo",
+     "ok": re.compile(r"deviceType=|serialNumber=|hardwareVersion=", re.I),
+     "model": re.compile(r"deviceType=([^\r\n]+)", re.I),
+     "fw": re.compile(r"(?:software|firmware)Version=([^\r\n]+)", re.I)},
+    {"vendor": "Axis", "path": "/axis-cgi/param.cgi?action=list&group=Brand",
+     "ok": re.compile(r"root\.Brand|Brand\.Prod", re.I),
+     "model": re.compile(r"Brand\.ProdNbr=([^\r\n]+)", re.I),
+     "fw": re.compile(r"Properties\.Firmware\.Version=([^\r\n]+)", re.I)},
+]
+
+
+def _grab(rx, text: str) -> str:
+    m = rx.search(text)
+    return m.group(1).strip() if m else ""
+
+
+async def vendor_cgi_probe(host: str, port: int, timeout: float,
+                           tls: bool, try_creds: bool) -> list[dict]:
+    """Probe vendor camera CGIs. Returns a list of findings, each
+    {vendor, path, creds(None=unauth), model, fw}. Read-only."""
+    out = []
+    for v in _VENDOR_CGI:
+        path = v["path"]
+        r = await _http_get_once(host, port, path, timeout, tls)
+        if r is None:
+            continue
+        status, headers, body = r
+        text = body.decode("latin-1", "replace")
+        if status == 200 and v["ok"].search(text):
+            out.append({"vendor": v["vendor"], "path": path, "creds": None,
+                        "model": _grab(v["model"], text),
+                        "fw": _grab(v["fw"], text)})
+            continue
+        if status == 401 and try_creds:
+            sc, realm, nonce, qop = _parse_www_auth(
+                headers.get("www-authenticate", ""))
+            for user, pw in _CAM_HTTP_CREDS:
+                hdr = _rtsp_auth_header(sc, realm, nonce, qop, user, pw,
+                                        "GET", path)
+                if not hdr:
+                    continue
+                r2 = await _http_get_once(host, port, path, timeout, tls,
+                                          {"Authorization": hdr})
+                if r2 and r2[0] == 200:
+                    t2 = r2[2].decode("latin-1", "replace")
+                    if v["ok"].search(t2):
+                        out.append({"vendor": v["vendor"], "path": path,
+                                    "creds": f"{user}:{pw or '<blank>'}",
+                                    "model": _grab(v["model"], t2),
+                                    "fw": _grab(v["fw"], t2)})
+                        break
+    return out
+
+
+# ---------------------------------------------------------------------------
 # WS-Discovery (ONVIF device discovery, UDP 3702). A unicast Probe for the ONVIF
 # NetworkVideoTransmitter type makes a camera/NVR answer with a ProbeMatch that
 # names its Types, Scopes (onvif:// name / hardware / location) and the XAddrs of
@@ -1248,7 +1323,8 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "docker-api-unauth", "etcd-unauth", "kubelet-anon",
                       "rtsp-unauth", "rtsp-default-creds",
                       "onvif-unauth", "onvif-default-creds",
-                      "camera-snapshot-unauth"}
+                      "camera-snapshot-unauth",
+                      "cam-cgi-unauth", "cam-cgi-default-creds"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -1481,8 +1557,8 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 svc.scripts.append({"id": "onvif-info", "output":
                     "ONVIF device_service detected (GetSystemDateAndTime "
                     "answered); device-info access undetermined."})
-        # unauth JPEG snapshot -- ONVIF present, or any camera signal on this
-        # web port (catches standalone HTTP cameras with no ONVIF).
+        # camera HTTP surface -- ONVIF present, or any camera signal on this web
+        # port (catches standalone HTTP cameras with no ONVIF).
         if info is not None or _looks_like_camera(svc):
             snap = await camera_snapshot_probe(host, port, cfg.timeout, otls)
             if snap:
@@ -1496,6 +1572,45 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                     f"GET {snap} returned a JPEG of the current view. Anyone who "
                     f"can reach {port} can watch stills of the feed. Require "
                     f"authentication and restrict {port} to trusted networks."})
+            for f in await vendor_cgi_probe(host, port, cfg.timeout, otls,
+                                            getattr(cfg, "cam_creds", True)):
+                svc.confidence = "high"
+                if "exposure" not in svc.sources:
+                    svc.sources.append("exposure")
+                if f["model"]:
+                    cur = (svc.product or "").strip().lower()
+                    # upgrade a bare vendor banner / generic placeholder to the
+                    # precise "Vendor Model"; don't clobber a real product string
+                    if (not cur or cur == f["vendor"].lower()
+                            or cur in ("rtsp", "rtsps", "onvif", "ip camera",
+                                       "ipcam", "camera")):
+                        svc.product = f"{f['vendor']} {f['model']}".strip()
+                elif not svc.product:
+                    svc.product = f["vendor"]
+                if f["fw"] and not svc.version:
+                    # camera fw often has a 'V' prefix (V5.5.800); drop the
+                    # leading non-digits so _norm_ver can anchor on the number
+                    nv = _norm_ver(re.sub(r"^[^\d]*", "", f["fw"]))
+                    if nv:
+                        svc.version = nv
+                        svc.cve_skip = False
+                detail = (f"{f['vendor']} {f['model']}".strip()
+                          + (f" fw {f['fw']}" if f["fw"] else ""))
+                if f["creds"] is None:
+                    if not svc.extrainfo:
+                        svc.extrainfo = "UNAUTHENTICATED camera CGI"
+                    svc.scripts.append({"id": "cam-cgi-unauth", "output":
+                        f"{f['vendor']} management CGI {f['path']} returned device "
+                        f"info WITHOUT authentication ({detail or 'device'}). The "
+                        f"HTTP admin API is reachable unauthenticated; require "
+                        f"credentials and restrict {port}."})
+                else:
+                    svc.extrainfo = f"DEFAULT CREDENTIALS ({f['creds']})"
+                    svc.scripts.append({"id": "cam-cgi-default-creds", "output":
+                        f"{f['vendor']} management CGI {f['path']} accepts DEFAULT "
+                        f"credentials {f['creds']} ({detail or 'device'}): an "
+                        f"attacker gains the camera admin API with well-known "
+                        f"credentials. Change the password immediately."})
         return
 
 
