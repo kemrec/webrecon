@@ -505,6 +505,15 @@ nmap's result and, for every under-identified port, adds:
   credentials would then be cleartext). The **SQL Server Browser** on UDP 1434
   (MC-SQLR) answers a single datagram with every instance's name, version and TCP
   port (`mssql-browser`). Informational; no login is ever sent.
+- **RDP** (TCP `3389`): an X.224 Connection Request with an RDP Negotiation
+  Request (`PROTOCOL_SSL|PROTOCOL_HYBRID`) makes the server reveal its negotiated
+  security without authenticating. `HYBRID`/`HYBRID_EX` (or an
+  `HYBRID_REQUIRED_BY_SERVER` failure) means **NLA/CredSSP is enforced** — good
+  posture; `SSL`-only, standard RDP security, or a legacy no-negotiation reply
+  means **NLA is not enforced**, which is flagged (`rdp-nla`, informational): the
+  server accepts pre-authentication connections, widening exposure to
+  credential-capture and BlueKeep-class pre-auth RCE. Dependency-free per
+  MS-RDPBCGR; no credentials are sent.
 - **Kerberos KDC** (TCP `88`): dependency-free ASN.1/DER per RFC 4120. For a
   small built-in set of default principals an **AS-REQ with no pre-authentication**
   is sent; the KDC's reply classifies each account without ever sending a

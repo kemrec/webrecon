@@ -651,6 +651,42 @@ async def mssql_browser_probe(host: str, port: int, timeout: float):
     return instances or None
 
 
+# RDP (TCP 3389). An X.224 Connection Request carrying an RDP Negotiation
+# Request (requestedProtocols = PROTOCOL_SSL|PROTOCOL_HYBRID) makes the server
+# reveal its negotiated security WITHOUT any authentication: the Connection
+# Confirm carries an RDP_NEG_RSP naming the selected protocol (HYBRID/HYBRID_EX
+# = NLA/CredSSP in use = good; SSL = TLS but NLA not selected; standard RDP =
+# no TLS), or an RDP_NEG_FAILURE (HYBRID_REQUIRED_BY_SERVER = NLA mandatory =
+# best posture). A plain Confirm with no negotiation means a legacy server that
+# only speaks standard RDP security. NLA-not-enforced is a hardening gap
+# (pre-auth connections, credential-capture, BlueKeep-class exposure) reported
+# informationally, not an unauthenticated breach. Wire format per MS-RDPBCGR
+# 2.2.1.1/2.2.1.2 (TPKT + X.224 class-0; CC code 0xD0; neg struct at offset 11).
+_RDP_NEG_REQ = (b"\x03\x00\x00\x13"                 # TPKT, total length 19
+                b"\x0e\xe0\x00\x00\x00\x00\x00"      # X.224 CR, LI=14
+                b"\x01\x00\x08\x00\x03\x00\x00\x00")  # RDP_NEG_REQ: SSL|HYBRID
+_RDP_PROTO = {0: "standard RDP security (no TLS)", 1: "TLS (PROTOCOL_SSL)",
+              2: "CredSSP/NLA (PROTOCOL_HYBRID)", 4: "RDSTLS",
+              8: "CredSSP/NLA (PROTOCOL_HYBRID_EX)"}
+_RDP_FAIL = {1: "SSL_REQUIRED_BY_SERVER", 2: "SSL_NOT_ALLOWED_BY_SERVER",
+             3: "SSL_CERT_NOT_ON_SERVER", 4: "INCONSISTENT_FLAGS",
+             5: "HYBRID_REQUIRED_BY_SERVER",
+             6: "SSL_WITH_USER_AUTH_REQUIRED_BY_SERVER"}
+
+
+async def rdp_probe(host: str, port: int, timeout: float):
+    """RDP security negotiation (no authentication). Returns
+    {kind: 'rsp'|'failure'|'none', protocol|code} or None."""
+    data = await _read_once(host, port, _RDP_NEG_REQ, timeout, nbytes=1024)
+    if len(data) < 11 or data[0] != 0x03 or data[5] != 0xD0:   # TPKT + X.224 CC
+        return None
+    if len(data) >= 19 and data[11] in (0x02, 0x03):
+        val = int.from_bytes(data[15:19], "little")
+        return ({"kind": "rsp", "protocol": val} if data[11] == 0x02
+                else {"kind": "failure", "code": val})
+    return {"kind": "none"}                 # legacy: standard RDP security only
+
+
 # --- HTTP(S)-based stores: Elasticsearch / CouchDB / Docker API / etcd / kubelet
 # All read-only GETs (no POST/PUT/DELETE), no redirects followed.
 async def _http_get_once(host: str, port: int, path: str, timeout: float,
@@ -1247,6 +1283,7 @@ _MONGO_PORTS = {27017, 27018, 27019}
 _POSTGRES_PORTS = {5432, 5433}
 _MYSQL_PORTS = {3306}
 _MSSQL_PORTS = {1433, 1434}
+_RDP_PORTS = {3389}
 _ES_PORTS = {9200, 9201}
 _COUCHDB_PORTS = {5984, 6984}
 _DOCKER_PORTS = {2375, 2376}
@@ -4081,6 +4118,51 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                     + (f" version {res['version']}" if res.get("version") else "")
                     + (f"; encryption {enc}" if enc else "") + "."
                     + encnote + " Read without authenticating (no login sent)."})
+        return
+
+    if port in _RDP_PORTS or "ms-wbt" in name or name == "rdp":
+        res = await rdp_probe(host, port, cfg.timeout)
+        if res:
+            if not svc.name:
+                svc.name = "ms-wbt-server"
+            if not svc.product:
+                svc.product = "Microsoft Terminal Services"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            kind = res["kind"]
+            if kind == "rsp":
+                proto = res["protocol"]
+                desc = _RDP_PROTO.get(proto, f"0x{proto:x}")
+                if proto in (2, 8):
+                    svc.scripts.append({"id": "rdp-nla", "output":
+                        f"RDP negotiated {desc}: Network Level Authentication "
+                        f"(CredSSP) is in use -- good posture."})
+                else:
+                    svc.scripts.append({"id": "rdp-nla", "output":
+                        f"RDP negotiated {desc}: Network Level Authentication "
+                        f"(CredSSP) is NOT enforced. The server accepts a "
+                        f"pre-authentication connection, widening exposure to "
+                        f"credential-capture and unpatched pre-auth RCE "
+                        f"(BlueKeep-class) attacks"
+                        + ("; standard RDP security also means no server "
+                           "authentication or strong transport encryption"
+                           if proto == 0 else "")
+                        + ". Require NLA (Group Policy / RDP-Tcp settings)."})
+            elif kind == "failure":
+                code = res["code"]
+                if code == 5:               # HYBRID_REQUIRED_BY_SERVER
+                    svc.scripts.append({"id": "rdp-nla", "output":
+                        "RDP requires Network Level Authentication "
+                        "(HYBRID_REQUIRED_BY_SERVER) -- good posture."})
+                else:
+                    svc.scripts.append({"id": "rdp-nla", "output":
+                        "RDP security negotiation returned "
+                        + _RDP_FAIL.get(code, f"failure 0x{code:x}") + "."})
+            else:                           # no negotiation offered
+                svc.scripts.append({"id": "rdp-nla", "output":
+                    "RDP did not offer enhanced security (TLS/CredSSP) -- legacy "
+                    "standard RDP security only, so Network Level Authentication "
+                    "is unavailable. Enable NLA / update the host."})
         return
 
     if "rtsp" in name or port in _RTSP_PORTS or port in _RTSPS_PORTS:
