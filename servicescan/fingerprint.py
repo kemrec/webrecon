@@ -1729,6 +1729,149 @@ async def hikvision_sdk_probe(host: str, port: int, timeout: float) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Camera WebSocket video preview (Hikvision ws 7681 / wss 7682, and other camera
+# ports). The plugin-free web live-view ships H.264/proprietary video over a
+# WebSocket; by design the connection is session/token authenticated, so the
+# finding we care about is a device that streams WITHOUT credentials. We do a
+# standard RFC6455 upgrade with NO auth and then only READ what the device
+# volunteers: if it pushes binary (video) frames unauthenticated, that is an
+# anonymous live feed (critical). We never send a PLAY/start command or any
+# exploit -- strictly connect + read, like an RTSP DESCRIBE or a snapshot GET.
+# ---------------------------------------------------------------------------
+_WS_CAM_PORTS = {7681, 7682}
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _ws_accept(key_b64: str) -> str:
+    import base64
+    import hashlib
+    return base64.b64encode(
+        hashlib.sha1((key_b64 + _WS_GUID).encode()).digest()).decode()
+
+
+def _ws_decode_frames(buf: bytes) -> list:
+    """Decode server->client WebSocket frames from `buf` -> [(opcode, payload)].
+    Server frames are unmasked per RFC6455; a mask is handled defensively. A
+    partial trailing frame is ignored."""
+    out, i, n = [], 0, len(buf)
+    while i + 2 <= n:
+        b1 = buf[i + 1]
+        opcode = buf[i] & 0x0F
+        masked = b1 & 0x80
+        ln = b1 & 0x7F
+        j = i + 2
+        if ln == 126:
+            if j + 2 > n:
+                break
+            ln = int.from_bytes(buf[j:j + 2], "big")
+            j += 2
+        elif ln == 127:
+            if j + 8 > n:
+                break
+            ln = int.from_bytes(buf[j:j + 8], "big")
+            j += 8
+        mask = b""
+        if masked:
+            if j + 4 > n:
+                break
+            mask = buf[j:j + 4]
+            j += 4
+        if j + ln > n:
+            break
+        payload = buf[j:j + ln]
+        if masked and mask:
+            payload = bytes(c ^ mask[k % 4] for k, c in enumerate(payload))
+        out.append((opcode, payload))
+        i = j + ln
+    return out
+
+
+async def ws_stream_probe(host: str, port: int, timeout: float, tls: bool,
+                          path: str = "/"):
+    """Unauthenticated RFC6455 upgrade, then read what the device volunteers.
+    Returns a dict:
+      {status, upgraded, accept_ok, auth, binary, video_bytes, text}
+    or None when the port does not speak WebSocket (no 101/upgrade)."""
+    import base64
+    import os
+    ctx = None
+    if tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+               f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+               f"Origin: http://{host}:{port}\r\nUser-Agent: servicescan\r\n\r\n")
+        writer.write(req.encode())
+        await writer.drain()
+        raw = b""
+        while b"\r\n\r\n" not in raw and len(raw) < 8192:
+            try:
+                chunk = await asyncio.wait_for(reader.read(4096), timeout)
+            except asyncio.TimeoutError:
+                break
+            if not chunk:
+                break
+            raw += chunk
+        if not raw.startswith(b"HTTP/"):
+            return None
+        head, _, rest = raw.partition(b"\r\n\r\n")
+        lines = head.split(b"\r\n")
+        try:
+            status = int(lines[0].split(b" ")[1])
+        except (IndexError, ValueError):
+            return None
+        hdrs = {}
+        for ln in lines[1:]:
+            k, _, v = ln.partition(b":")
+            if k:
+                hdrs[k.strip().lower().decode("latin-1", "replace")] = \
+                    v.strip().decode("latin-1", "replace")
+        if status in (401, 403):
+            return {"status": status, "upgraded": False, "auth": True,
+                    "accept_ok": False, "binary": False, "video_bytes": 0,
+                    "text": ""}
+        if status != 101 or "websocket" not in hdrs.get("upgrade", "").lower():
+            return None
+        accept_ok = hdrs.get("sec-websocket-accept", "") == _ws_accept(key)
+        buf = rest
+        try:
+            for _ in range(4):
+                chunk = await asyncio.wait_for(reader.read(16384),
+                                               min(timeout, 2.0))
+                if not chunk:
+                    break
+                buf += chunk
+                if any(op == 0x2 and pl for op, pl in _ws_decode_frames(buf)):
+                    break
+        except asyncio.TimeoutError:
+            pass
+        frames = _ws_decode_frames(buf)
+        video = sum(len(pl) for op, pl in frames if op == 0x2)
+        text = next((pl[:120].decode("latin-1", "replace")
+                     for op, pl in frames if op == 0x1), "")
+        return {"status": 101, "upgraded": True, "auth": False,
+                "accept_ok": accept_ok, "binary": video > 0,
+                "video_bytes": video, "text": text}
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # WS-Discovery (ONVIF device discovery, UDP 3702). A unicast Probe for the ONVIF
 # NetworkVideoTransmitter type makes a camera/NVR answer with a ProbeMatch that
 # names its Types, Scopes (onvif:// name / hardware / location) and the XAddrs of
@@ -2256,7 +2399,8 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "grpc-reflection-exposed", "snmp-unauth",
                       "ipmi-cipher-zero",
                       "prometheus-unauth", "consul-unauth", "rabbitmq-unauth",
-                      "minio-unauth", "portainer-unauth", "zookeeper-unauth"}
+                      "minio-unauth", "portainer-unauth", "zookeeper-unauth",
+                      "camera-ws-stream-unauth"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -2649,6 +2793,52 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 f"devices. It should never be internet-facing; restrict {port} to "
                 f"a management network."})
             return
+
+    # Camera WebSocket video preview (Hikvision ws 7681 / wss 7682, or any
+    # camera-signalled port -- it can sit on 81 etc.). Unauthenticated upgrade +
+    # read-only observation of what the device volunteers.
+    if (port in _WS_CAM_PORTS or "hikvision" in name
+            or (is_web_service(svc) and _looks_like_camera(svc))):
+        ws_tls = (port == 7682 or is_tls_service(svc) or "wss" in name)
+        ws = await ws_stream_probe(host, port, cfg.timeout, ws_tls)
+        if ws is not None:
+            scheme = "wss" if ws_tls else "ws"
+            if not svc.name:
+                svc.name = scheme
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            if ws["binary"]:
+                svc.confidence = "high"
+                svc.extrainfo = "UNAUTHENTICATED camera WebSocket stream"
+                svc.scripts.append({"id": "camera-ws-stream-unauth", "output":
+                    f"Camera WebSocket video preview streams WITHOUT "
+                    f"authentication on {port} ({scheme}): an unauthenticated "
+                    f"RFC6455 upgrade was accepted and the device pushed "
+                    f"{ws['video_bytes']} bytes of binary video frames with no "
+                    f"session token. Anyone who can reach {port} can watch the "
+                    f"live feed in a browser. Require the session/token auth on "
+                    f"the WebSocket preview and restrict {port} to trusted "
+                    f"networks."})
+            elif ws["upgraded"]:
+                svc.scripts.append({"id": "camera-ws-preview", "output":
+                    f"Camera WebSocket video-preview endpoint reachable on {port} "
+                    f"({scheme}) and accepted an UNAUTHENTICATED upgrade"
+                    + (" (valid Sec-WebSocket-Accept)" if ws["accept_ok"] else "")
+                    + ". No video frames were volunteered without an explicit "
+                      "start, so anonymous playback is not confirmed -- a device "
+                      "that requires an in-band session token or a start message "
+                      "will not stream here. Verify the preview enforces its "
+                      f"token and restrict {port} to trusted networks."
+                    + (f" First text frame: {ws['text']}" if ws["text"] else "")})
+            elif ws.get("auth"):
+                svc.scripts.append({"id": "camera-ws-auth", "output":
+                    f"Camera WebSocket preview endpoint detected on {port} "
+                    f"({scheme}); the unauthenticated upgrade was refused "
+                    f"({ws['status']}) -- authentication is enforced."})
+            # dedicated WS ports (7681/7682) or a confirmed stream: done. On a
+            # dual-purpose web port with no stream, fall through to ONVIF/web.
+            if port in _WS_CAM_PORTS or ws["binary"]:
+                return
 
     # ONVIF rides HTTP (no dedicated port of its own in most deployments), so it
     # is checked on any web service or a known ONVIF-only port. A single SOAP

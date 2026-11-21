@@ -323,6 +323,19 @@ nmap's result and, for every under-identified port, adds:
   — e.g. the CVE-2021-33044/33045 and CVE-2017-7921 classes), not an
   unauthenticated-access alert. 8000 is shared with HTTP/ONVIF, so a non-SDK
   service there falls through to the ONVIF/web checks.
+- **Camera WebSocket video preview** (Hikvision `ws` 7681 / `wss` 7682, and any
+  camera-signalled port — it can sit on 81 etc.): the plugin-free web live-view
+  ships video over a WebSocket that is *meant* to be session/token
+  authenticated, so the finding is a device that streams **without** credentials.
+  The probe does a standard RFC6455 upgrade with **no auth** and then only
+  **reads what the device volunteers** — no `PLAY`/start command, no exploit. If
+  the device pushes **binary video frames unauthenticated**, that is an anonymous
+  live feed anyone can watch in a browser (**critical**, `camera-ws-stream-unauth`).
+  If the upgrade is accepted but no frames arrive without an explicit start, the
+  endpoint is reported informationally (reachable, upgrade unauthenticated;
+  anonymous playback *not* claimed — a device needing an in-band token won't
+  stream here); a refused upgrade (401/403) is noted as auth-enforced. The alert
+  fires only on observed unauthenticated video bytes, never on a guessed stream.
 - **gRPC / HTTP2** (dedicated gRPC ports — 50051/6565/9090/… — or a `grpc`-named
   service): dependency-free detection (TLS ALPN `h2`, or the cleartext h2c
   preface → SETTINGS frame). The real finding is **server reflection enabled
