@@ -888,22 +888,27 @@ async def _probe_tomcat_version(http, host: str, port: int, tls: bool) -> str:
 # the app discloses it). Each label must match a cve._CPE_MAP key so a versioned
 # hit CVE-correlates. Product-agnostic: add an app by adding a row.
 # ---------------------------------------------------------------------------
+# Each row: (label, token, attempts). `label` must match a cve._CPE_MAP key.
+# `token` is a distinctive substring of the app: when a probe confirms the app
+# but can't read a version, and nmap already put a version on this very service
+# under a differently-worded product that carries `token`, we adopt that version
+# so the correctly-named aux product still CVE-correlates.
 _DISCOVERY_PROBES = [
     # Apache Solr: the admin system endpoint returns JSON with the exact version
-    ("Solr", [
+    ("Solr", "solr", [
         ("/solr/admin/info/system?wt=json",
          re.compile(r'"(?:solr-spec-version|lucene)"', re.I),
          re.compile(r'"solr-spec-version"\s*:\s*"([0-9][0-9.]+)"')),
     ]),
     # Oracle WebLogic: the admin console login page names the product. WebLogic
-    # does not disclose its version over unauthenticated HTTP, so presence only
-    # (version-less -> recorded, not CVE-correlated: no wildcard guess).
-    ("Oracle WebLogic Server", [
+    # does not disclose its version over unauthenticated HTTP, so the probe is
+    # presence-only; the version (when known) is inherited from nmap via `token`.
+    ("Oracle WebLogic Server", "weblogic", [
         ("/console/login/LoginForm.jsp",
          re.compile(r"WebLogic", re.I), None),
     ]),
     # Appwrite: the health endpoint returns a bare {"version":"x.y.z"} object.
-    ("Appwrite", [
+    ("Appwrite", "appwrite", [
         ("/v1/health/version",
          re.compile(r'^\s*\{\s*"version"\s*:\s*"[0-9]'),
          re.compile(r'"version"\s*:\s*"([0-9][0-9.]+)"')),
@@ -946,7 +951,7 @@ async def run_discovery_probes(cfg: ScanConfig, http, host: str,
 
     async def one(svc: Service):
         tls = is_tls_service(svc)
-        for label, attempts in _DISCOVERY_PROBES:
+        for label, token, attempts in _DISCOVERY_PROBES:
             async with sem:
                 try:
                     hit = await _discover_app(http, host, svc.port, tls,
@@ -957,6 +962,12 @@ async def run_discovery_probes(cfg: ScanConfig, http, host: str,
             if not hit:
                 continue
             name, ver = hit
+            # the probe confirmed the app but read no version: adopt nmap's
+            # version for this service when its product/name is the same app
+            # (so the correctly-named aux product can still CVE-correlate).
+            if not ver and svc.version and token in \
+                    f"{svc.product} {svc.name}".lower():
+                ver = _norm_ver(svc.version)
             same = next((p for p in svc.aux if p[0].lower() == name.lower()), None)
             if same is None:
                 svc.aux.append([name, ver])

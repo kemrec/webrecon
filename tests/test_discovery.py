@@ -59,6 +59,28 @@ def test_appwrite_discovered_with_version():
     assert aux.get("Appwrite") == "1.5.7"
 
 
+def test_weblogic_inherits_nmap_version_for_cve():
+    # nmap identified the service as WebLogic with a version but under a product
+    # string we don't map; the probe's correctly-named aux inherits that version
+    # so it can CVE-correlate.
+    svc = Service(port=7001, name="http", state="open",
+                  product="Oracle WebLogic admin httpd", version="12.2.1.3")
+    body = "<title>Oracle WebLogic Server Administration Console</title>"
+    _run({"/console/login/LoginForm.jsp": _Resp(200, body)}, svc)
+    aux = {p[0]: p[1] for p in svc.aux}
+    assert aux.get("Oracle WebLogic Server") == "12.2.1.3"
+
+
+def test_weblogic_no_inherit_when_token_absent():
+    # a version on an unrelated product must NOT be adopted
+    svc = Service(port=7001, name="http", state="open",
+                  product="nginx", version="1.25.0")
+    body = "<title>Oracle WebLogic Server Administration Console</title>"
+    _run({"/console/login/LoginForm.jsp": _Resp(200, body)}, svc)
+    aux = {p[0]: p[1] for p in svc.aux}
+    assert aux.get("Oracle WebLogic Server") == ""
+
+
 def test_generic_version_json_is_not_appwrite():
     # a different API that also returns {"version":...} but not the bare Appwrite
     # shape must NOT be mislabelled Appwrite
