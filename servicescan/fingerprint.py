@@ -962,12 +962,20 @@ async def run_discovery_probes(cfg: ScanConfig, http, host: str,
             if not hit:
                 continue
             name, ver = hit
+            same_primary = token in f"{svc.product} {svc.name}".lower()
             # the probe confirmed the app but read no version: adopt nmap's
             # version for this service when its product/name is the same app
             # (so the correctly-named aux product can still CVE-correlate).
-            if not ver and svc.version and token in \
-                    f"{svc.product} {svc.name}".lower():
+            if not ver and svc.version and same_primary:
                 ver = _norm_ver(svc.version)
+            # conversely, when the probe read a version and this service IS that
+            # app, promote it onto svc.version. Otherwise the primary product
+            # (e.g. nmap's "Apache Solr" with no version) would CVE-correlate as
+            # a wildcard CPE and pull EVERY CVE for the product, including ones
+            # that do not apply to this version.
+            if ver and not svc.version and same_primary:
+                svc.version = ver
+                svc.cve_skip = False
             same = next((p for p in svc.aux if p[0].lower() == name.lower()), None)
             if same is None:
                 svc.aux.append([name, ver])

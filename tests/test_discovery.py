@@ -59,6 +59,27 @@ def test_appwrite_discovered_with_version():
     assert aux.get("Appwrite") == "1.5.7"
 
 
+def test_solr_version_promoted_to_primary_product():
+    # nmap named the primary product "Apache Solr" with no version; the probe's
+    # version must be promoted onto svc.version so the primary CVE lookup is
+    # version-scoped (not a wildcard that pulls every Solr CVE).
+    svc = Service(port=8983, name="http", state="open", product="Apache Solr")
+    body = '{"lucene":{"solr-spec-version":"8.11.4"}}'
+    _run({"/solr/admin/info/system": _Resp(200, body)}, svc)
+    assert svc.version == "8.11.4"
+    assert svc.cve_skip is False
+
+
+def test_version_not_promoted_when_not_primary_product():
+    # Solr behind a different primary product: aux gets it, svc.version does not
+    svc = Service(port=8983, name="http", state="open", product="nginx",
+                  version="1.25.0")
+    body = '{"lucene":{"solr-spec-version":"8.11.4"}}'
+    _run({"/solr/admin/info/system": _Resp(200, body)}, svc)
+    assert svc.version == "1.25.0"              # unchanged
+    assert ["Solr", "8.11.4"] in svc.aux        # recorded as aux instead
+
+
 def test_weblogic_inherits_nmap_version_for_cve():
     # nmap identified the service as WebLogic with a version but under a product
     # string we don't map; the probe's correctly-named aux inherits that version
