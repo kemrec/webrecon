@@ -590,6 +590,7 @@ _DOCKER_PORTS = {2375, 2376}
 _ETCD_PORTS = {2379, 4001}
 _KUBELET_PORTS = {10250, 10255}
 _RTSP_PORTS = {554, 8554, 7447, 10554, 1554, 555}
+_RTSPS_PORTS = {322}                             # RTSP over TLS (RTSPS, IANA 322)
 # ports that always speak TLS (the plaintext peer, when one exists, is elsewhere)
 _TLS_EXPOSURE_PORTS = {2376, 6984, 10250}
 
@@ -607,7 +608,11 @@ _RTSP_DESCRIBE_PATHS = [
     "/Streaming/Channels/101",                  # Hikvision
     "/cam/realmonitor?channel=1&subtype=0",     # Dahua
     "/axis-media/media.amp",                    # Axis
-    "/live.sdp", "/live/ch0", "/11", "/stream1",  # generic / cheap-OEM
+    "/h264Preview_01_main",                     # Reolink
+    "/videoMain",                               # Foscam
+    "/profile1",                                # Hanwha / Samsung WiseNet
+    "/live.sdp", "/live/ch0", "/live/main",     # generic / cheap-OEM
+    "/11", "/stream1", "/video1", "/ch01.264",  # generic / DVR
 ]
 # factory defaults only; tiny list to avoid lockouts / noise ("" = blank password)
 _RTSP_DEFAULT_CREDS = [("admin", "admin"), ("admin", ""), ("root", "root"),
@@ -633,12 +638,19 @@ def _parse_rtsp(data: bytes) -> dict | None:
 
 
 async def _rtsp_request(host: str, port: int, timeout: float, method: str,
-                        path: str, headers: dict | None = None) -> dict | None:
+                        path: str, headers: dict | None = None,
+                        tls: bool = False) -> dict | None:
     """Send one RTSP request on a fresh connection (CSeq 1) and parse the reply.
-    Read-only: only OPTIONS / DESCRIBE are ever issued by callers here."""
+    Read-only: only OPTIONS / DESCRIBE are ever issued by callers here. With
+    tls=True the connection is TLS-wrapped (RTSPS); the RTSP layer is identical."""
+    ctx = None
+    if tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout)
+            asyncio.open_connection(host, port, ssl=ctx), timeout=timeout)
     except Exception:  # noqa: BLE001
         return None
     url = f"rtsp://{host}:{port}{path}"
@@ -710,12 +722,14 @@ def _rtsp_auth_header(scheme: str, realm: str, nonce: str, qop: str,
     return ""
 
 
-async def rtsp_probe(host: str, port: int, timeout: float) -> dict | None:
+async def rtsp_probe(host: str, port: int, timeout: float,
+                     tls: bool = False) -> dict | None:
     """Read-only RTSP recon. Returns None if the port is not RTSP, else a dict:
     {server, public, unauth(bool), unauth_path, auth(scheme), realm, nonce, qop,
     auth_path}. OPTIONS gives presence+banner; an unauthenticated DESCRIBE over
-    common stream paths detects an open stream (200+SDP) or the auth scheme (401)."""
-    opt = await _rtsp_request(host, port, timeout, "OPTIONS", "/")
+    common stream paths detects an open stream (200+SDP) or the auth scheme (401).
+    tls=True probes RTSPS (RTSP over TLS, e.g. port 322)."""
+    opt = await _rtsp_request(host, port, timeout, "OPTIONS", "/", tls=tls)
     if opt is None:
         return None                              # not RTSP (or no response)
     info = {"server": opt["headers"].get("server", ""),
@@ -724,7 +738,7 @@ async def rtsp_probe(host: str, port: int, timeout: float) -> dict | None:
             "auth": "", "realm": "", "nonce": "", "qop": "", "auth_path": "/"}
     for path in _RTSP_DESCRIBE_PATHS:
         r = await _rtsp_request(host, port, timeout, "DESCRIBE", path,
-                                {"Accept": "application/sdp"})
+                                {"Accept": "application/sdp"}, tls=tls)
         if r is None:
             continue
         ctype = r["headers"].get("content-type", "").lower()
@@ -742,7 +756,7 @@ async def rtsp_probe(host: str, port: int, timeout: float) -> dict | None:
 
 
 async def rtsp_try_default_creds(host: str, port: int, timeout: float,
-                                 info: dict) -> str | None:
+                                 info: dict, tls: bool = False) -> str | None:
     """Try the tiny factory-default credential list against a gated stream via
     DESCRIBE. Returns 'user:pass' on the first 200, else None. Active step."""
     if not info.get("auth"):
@@ -755,7 +769,8 @@ async def rtsp_try_default_creds(host: str, port: int, timeout: float,
         if not hdr:
             continue
         r = await _rtsp_request(host, port, timeout, "DESCRIBE", path,
-                                {"Accept": "application/sdp", "Authorization": hdr})
+                                {"Accept": "application/sdp",
+                                 "Authorization": hdr}, tls=tls)
         if r and r["code"] == 200:
             return f"{user}:{pw or '<blank>'}"
     return None
@@ -772,6 +787,7 @@ async def rtsp_try_default_creds(host: str, port: int, timeout: float,
 _ONVIF_PATH = "/onvif/device_service"
 _ONVIF_PORTS = {8000, 8899, 2020, 8081, 10080}   # common ONVIF-only HTTP ports
 _ONVIF_DEV_NS = "http://www.onvif.org/ver10/device/wsdl"
+_ONVIF_MEDIA_NS = "http://www.onvif.org/ver10/media/wsdl"
 _ONVIF_DEVINFO_RX = {
     "manufacturer": re.compile(r"<[^>]*Manufacturer>([^<]+)<", re.I),
     "model": re.compile(r"<[^>]*Model>([^<]+)<", re.I),
@@ -925,7 +941,7 @@ async def onvif_probe(host: str, port: int, timeout: float,
 async def onvif_try_default_creds(host: str, port: int, timeout: float,
                                   info: dict, tls: bool = False):
     """Try the default-credential list with a WS-UsernameToken GetDeviceInformation.
-    Returns ('user:pass', device_dict) on success, else None. Active step."""
+    Returns (user, pw, device_dict) on the first success, else None. Active step."""
     created = info.get("created") or _utcnow_iso()
     for user, pw in _RTSP_DEFAULT_CREDS:
         env = _onvif_envelope(
@@ -935,8 +951,128 @@ async def onvif_try_default_creds(host: str, port: int, timeout: float,
         if r and r[0] == 200:
             dev = _parse_onvif_devinfo(r[2])
             if dev:
-                return f"{user}:{pw or '<blank>'}", dev
+                return user, pw, dev
     return None
+
+
+# ONVIF read-only enumeration, run once access is confirmed (unauth misconfig or
+# a working default credential). GetUsers lists the device's accounts and their
+# privilege level; GetProfiles lists the media profiles (stream name, resolution,
+# codec). Both are "Get" calls -- no configuration is changed. `mksec` is a
+# zero-arg factory returning a fresh WS-UsernameToken header (a new nonce per
+# request, so replay protection never rejects us) or None for the unauth path.
+def _parse_onvif_users(body: bytes) -> list[dict]:
+    text = body.decode("latin-1", "replace")
+    out = []
+    for blk in re.findall(r"<(?:\w+:)?User>(.*?)</(?:\w+:)?User>",
+                          text, re.I | re.S):
+        u = re.search(r"<(?:\w+:)?Username>([^<]+)<", blk, re.I)
+        lvl = re.search(r"<(?:\w+:)?UserLevel>([^<]+)<", blk, re.I)
+        if u:
+            out.append({"name": u.group(1).strip(),
+                        "level": lvl.group(1).strip() if lvl else ""})
+    return out
+
+
+def _parse_onvif_profiles(body: bytes) -> list[dict]:
+    text = body.decode("latin-1", "replace")
+    out = []
+    for m in re.finditer(r"<(?:\w+:)?Profiles\b([^>]*)>(.*?)</(?:\w+:)?Profiles>",
+                         text, re.I | re.S):
+        attrs, blk = m.group(1), m.group(2)
+        tok = re.search(r'token\s*=\s*"([^"]+)"', attrs, re.I)
+        name = re.search(r"<(?:\w+:)?Name>([^<]+)<", blk, re.I)
+        w = re.search(r"<(?:\w+:)?Width>\s*(\d+)\s*<", blk, re.I)
+        h = re.search(r"<(?:\w+:)?Height>\s*(\d+)\s*<", blk, re.I)
+        enc = re.search(r"<(?:\w+:)?Encoding>([^<]+)<", blk, re.I)
+        prof = {"token": tok.group(1).strip() if tok else "",
+                "name": name.group(1).strip() if name else ""}
+        if w and h:
+            prof["resolution"] = f"{w.group(1)}x{h.group(1)}"
+        if enc:
+            prof["encoding"] = enc.group(1).strip()
+        out.append(prof)
+    return out
+
+
+def _parse_xaddr(xaddr: str, default_port: int, default_tls: bool):
+    """(path, port, tls) from a service XAddr URL. We keep the scanned host and
+    only adopt the XAddr's path/port/scheme, so enumeration never pivots to a
+    LAN IP the device advertised. Falls back to the device_service endpoint."""
+    m = re.match(r"(https?)://[^/:]+(?::(\d+))?(/.*)?$", xaddr, re.I)
+    if not m:
+        return _ONVIF_PATH, default_port, default_tls
+    tls = m.group(1).lower() == "https"
+    port = int(m.group(2)) if m.group(2) else (443 if tls else 80)
+    return (m.group(3) or _ONVIF_PATH), port, tls
+
+
+async def onvif_get_users(host: str, port: int, timeout: float,
+                          tls: bool = False, mksec=None) -> list[dict]:
+    sec = mksec() if mksec else ""
+    r = await _http_post_once(host, port, _ONVIF_PATH,
+        _onvif_envelope(f'<GetUsers xmlns="{_ONVIF_DEV_NS}"/>', sec), timeout, tls)
+    return _parse_onvif_users(r[2]) if r and r[0] == 200 else []
+
+
+async def _onvif_media_endpoint(host: str, port: int, timeout: float,
+                                tls: bool, mksec=None):
+    """Discover the media-service endpoint via GetServices; fall back to the
+    device_service endpoint when it is absent."""
+    sec = mksec() if mksec else ""
+    r = await _http_post_once(host, port, _ONVIF_PATH,
+        _onvif_envelope(
+            f'<GetServices xmlns="{_ONVIF_DEV_NS}">'
+            f'<IncludeCapability>false</IncludeCapability></GetServices>', sec),
+        timeout, tls)
+    if r and r[0] == 200:
+        text = r[2].decode("latin-1", "replace")
+        for blk in re.findall(r"<(?:\w+:)?Service>(.*?)</(?:\w+:)?Service>",
+                              text, re.I | re.S):
+            if "ver10/media/wsdl" in blk:
+                xa = re.search(r"<(?:\w+:)?XAddr>([^<]+)<", blk, re.I)
+                if xa:
+                    return _parse_xaddr(xa.group(1).strip(), port, tls)
+    return _ONVIF_PATH, port, tls
+
+
+async def onvif_get_profiles(host: str, port: int, timeout: float,
+                             tls: bool = False, mksec=None) -> list[dict]:
+    path, mport, mtls = await _onvif_media_endpoint(host, port, timeout, tls, mksec)
+    body = _onvif_envelope(f'<GetProfiles xmlns="{_ONVIF_MEDIA_NS}"/>',
+                           mksec() if mksec else "")
+    r = await _http_post_once(host, mport, path, body, timeout, mtls)
+    if (not r or r[0] != 200) and (path, mport, mtls) != (_ONVIF_PATH, port, tls):
+        body = _onvif_envelope(f'<GetProfiles xmlns="{_ONVIF_MEDIA_NS}"/>',
+                               mksec() if mksec else "")
+        r = await _http_post_once(host, port, _ONVIF_PATH, body, timeout, tls)
+    return _parse_onvif_profiles(r[2]) if r and r[0] == 200 else []
+
+
+async def _onvif_enum_scripts(svc, host: str, port: int, timeout: float,
+                              tls: bool, mksec) -> None:
+    """Append onvif-users / onvif-media-profiles info scripts when the read-only
+    GetUsers / GetProfiles calls return data (best effort; silent on failure)."""
+    users = await onvif_get_users(host, port, timeout, tls, mksec)
+    if users:
+        svc.scripts.append({"id": "onvif-users", "output":
+            "ONVIF accounts exposed (GetUsers): " + ", ".join(
+                u["name"] + (f" [{u['level']}]" if u["level"] else "")
+                for u in users) + ". Enumerated user names narrow a credential "
+            "attack and confirm which accounts hold admin rights."})
+    profiles = await onvif_get_profiles(host, port, timeout, tls, mksec)
+    if profiles:
+        def fmt(p):
+            bits = [p.get("name") or p.get("token") or "?"]
+            if p.get("resolution"):
+                bits.append(p["resolution"])
+            if p.get("encoding"):
+                bits.append(p["encoding"])
+            return " ".join(bits)
+        svc.scripts.append({"id": "onvif-media-profiles", "output":
+            "ONVIF media profiles (GetProfiles): " +
+            "; ".join(fmt(p) for p in profiles) + ". Each profile maps to a live "
+            "stream the camera will serve to an authorized client."})
 
 
 def _utcnow_iso() -> str:
@@ -1013,34 +1149,38 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 f"{port}.")
         return
 
-    if "rtsp" in name or port in _RTSP_PORTS:
-        info = await rtsp_probe(host, port, cfg.timeout)
+    if "rtsp" in name or port in _RTSP_PORTS or port in _RTSPS_PORTS:
+        rtsp_tls = (bool(svc.tls) or "rtsps" in name or "ssl" in name
+                    or port in _RTSPS_PORTS)
+        info = await rtsp_probe(host, port, cfg.timeout, tls=rtsp_tls)
         if info is not None:
+            scheme = "rtsps" if rtsp_tls else "rtsp"
+            tlsnote = " over TLS (RTSPS)" if rtsp_tls else ""
             if not svc.name:
-                svc.name = "rtsp"
+                svc.name = scheme
             if not svc.product:
-                svc.product = info["server"] or "RTSP"
+                svc.product = info["server"] or scheme.upper()
             if "exposure" not in svc.sources:
                 svc.sources.append("exposure")
             banner = f" ({info['server']})" if info["server"] else ""
             if info["unauth"]:
                 svc.confidence = "high"
-                svc.extrainfo = "UNAUTHENTICATED RTSP stream"
+                svc.extrainfo = f"UNAUTHENTICATED {scheme.upper()} stream"
                 svc.scripts.append({"id": "rtsp-unauth", "output":
-                    f"RTSP stream accessible WITHOUT authentication{banner}: an "
-                    f"unauthenticated DESCRIBE of {info['unauth_path']} returned "
-                    f"SDP. Anyone who can reach {port} can pull the live video/"
-                    f"audio feed. Require credentials and restrict {port} to "
-                    f"trusted networks."})
+                    f"RTSP stream accessible WITHOUT authentication{banner}"
+                    f"{tlsnote}: an unauthenticated DESCRIBE of "
+                    f"{info['unauth_path']} returned SDP. Anyone who can reach "
+                    f"{port} can pull the live video/audio feed. Require "
+                    f"credentials and restrict {port} to trusted networks."})
             elif info["auth"]:
                 realm = f' realm="{info["realm"]}"' if info["realm"] else ""
                 svc.scripts.append({"id": "rtsp-auth", "output":
-                    f"RTSP detected{banner}; authentication enforced "
+                    f"RTSP detected{banner}{tlsnote}; authentication enforced "
                     f"({info['auth']}{realm}). Unauthenticated DESCRIBE was "
                     f"refused (401)."})
                 if getattr(cfg, "cam_creds", True):
                     hit = await rtsp_try_default_creds(host, port, cfg.timeout,
-                                                       info)
+                                                       info, tls=rtsp_tls)
                     if hit:
                         svc.confidence = "high"
                         svc.extrainfo = f"DEFAULT CREDENTIALS ({hit})"
@@ -1052,7 +1192,7 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                             f"credentials. Change the password immediately."})
             else:
                 svc.scripts.append({"id": "rtsp-info", "output":
-                    f"RTSP server detected{banner}. Methods: "
+                    f"RTSP server detected{banner}{tlsnote}. Methods: "
                     f"{info['public'] or 'n/a'}. No stream at common paths and no "
                     f"401, so the unauth status is undetermined."})
         return
@@ -1137,6 +1277,7 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 svc.version = _norm_ver(dev["firmware"]) or svc.version
             if "exposure" not in svc.sources:
                 svc.sources.append("exposure")
+            otls = is_tls_service(svc)
             if info["unauth"]:
                 svc.confidence = "high"
                 svc.extrainfo = "UNAUTHENTICATED ONVIF device info"
@@ -1145,15 +1286,17 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                     f"({label or 'device'}): make/model/firmware/serial are "
                     f"exposed and the camera's control surface is likely "
                     f"unauthenticated. Require WS-Security on {port}."})
+                await _onvif_enum_scripts(svc, host, port, cfg.timeout, otls, None)
             elif info["auth"]:
                 svc.scripts.append({"id": "onvif-auth", "output":
                     "ONVIF device detected; GetDeviceInformation requires "
                     "authentication (WS-UsernameToken)."})
                 if getattr(cfg, "cam_creds", True):
                     hit = await onvif_try_default_creds(
-                        host, port, cfg.timeout, info, tls=is_tls_service(svc))
+                        host, port, cfg.timeout, info, tls=otls)
                     if hit:
-                        creds, dev2 = hit
+                        user, pw, dev2 = hit
+                        creds = f"{user}:{pw or '<blank>'}"
                         lbl2 = " ".join(v for v in (dev2.get("manufacturer"),
                                                     dev2.get("model")) if v)
                         if lbl2 and (not svc.product or svc.product == "RTSP"):
@@ -1168,6 +1311,10 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                             f"device info ({lbl2 or 'device'}). An attacker gains "
                             f"the camera's management API (media URIs, users, "
                             f"PTZ). Change the password immediately."})
+                        created = info.get("created") or _utcnow_iso()
+                        await _onvif_enum_scripts(
+                            svc, host, port, cfg.timeout, otls,
+                            lambda: _onvif_ws_security(user, pw, created))
             else:
                 svc.scripts.append({"id": "onvif-info", "output":
                     "ONVIF device_service detected (GetSystemDateAndTime "

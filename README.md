@@ -259,14 +259,15 @@ nmap's result and, for every under-identified port, adds:
   is reported as such. The probes send only non-mutating GET/commands and
   never write or delete — e.g. etcd exposure is confirmed only when the v2
   keyspace is actually readable, not from the always-public `/version`.
-- **RTSP camera checks** (ports 554/8554/… or any `rtsp` service): a read-only
-  `OPTIONS` names the device and lists methods, and an unauthenticated
-  `DESCRIBE` over common stream paths (Hikvision/Dahua/Axis/generic) detects an
-  **open stream** (`200` + SDP → critical: anyone can view the feed) versus a
-  gated one (`401` → the auth scheme/realm is recorded). On a gated stream it
-  also tries a tiny list of factory-default credentials (`admin:admin`,
-  `root:root`, …) over Basic **and** Digest; an accepted default is a critical
-  finding. Nothing is ever `PLAY`ed or recorded.
+- **RTSP/RTSPS camera checks** (ports 554/8554/… or any `rtsp` service; RTSP
+  over TLS on 322 or an `rtsps`/`ssl` service): a read-only `OPTIONS` names the
+  device and lists methods, and an unauthenticated `DESCRIBE` over common stream
+  paths (Hikvision/Dahua/Axis/Reolink/Foscam/Hanwha/generic) detects an **open
+  stream** (`200` + SDP → critical: anyone can view the feed) versus a gated one
+  (`401` → the auth scheme/realm is recorded). On a gated stream it also tries a
+  tiny list of factory-default credentials (`admin:admin`, `root:root`, …) over
+  Basic **and** Digest; an accepted default is a critical finding. RTSPS runs the
+  identical recon over a TLS transport. Nothing is ever `PLAY`ed or recorded.
 - **ONVIF camera checks** (any web port or a common ONVIF port): a SOAP
   `GetSystemDateAndTime` (unauthenticated by spec) confirms an ONVIF
   `device_service` and reads the device clock; an unauthenticated
@@ -274,7 +275,10 @@ nmap's result and, for every under-identified port, adds:
   misconfiguration) or faults (gated). On a gated device it tries the same
   factory-default list via a WS-UsernameToken `PasswordDigest`; an accepted
   default exposes the camera's management API (media URIs, users, PTZ) and is
-  critical. Read-only SOAP calls only.
+  critical. Once access is confirmed (either way), read-only `GetUsers` lists the
+  device's accounts and privilege levels and `GetProfiles` lists the media
+  profiles (stream name, resolution, codec) — the media endpoint is discovered
+  via `GetServices`. Read-only SOAP calls only.
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully

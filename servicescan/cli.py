@@ -72,8 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "versions then land in the summary and CVE correlation")
     fp.add_argument("--no-cam-creds", "--no-rtsp-creds", action="store_true",
                     dest="no_cam_creds",
-                    help="camera recon (RTSP OPTIONS/DESCRIBE + ONVIF "
-                         "GetSystemDateAndTime/GetDeviceInformation) stays "
+                    help="camera recon (RTSP/RTSPS OPTIONS/DESCRIBE + ONVIF "
+                         "GetSystemDateAndTime/GetDeviceInformation, plus "
+                         "GetUsers/GetProfiles once access is confirmed) stays "
                          "read-only; this disables the one active step -- trying "
                          "factory-default creds on a gated stream/device "
                          "(admin:admin, root:root, ...). --no-rtsp-creds is a "

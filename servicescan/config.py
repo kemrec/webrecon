@@ -30,10 +30,12 @@ class ScanConfig:
                                           # to catch JS-global/DOM-only catalog apps
     timeout: float = 8.0                  # per-probe timeout (s)
     concurrency: int = 50
-    cam_creds: bool = True                # on a gated RTSP stream / ONVIF device,
-                                          # try a tiny factory-default credential
-                                          # list (admin:admin ...); --no-cam-creds
-                                          # disables this one active step
+    cam_creds: bool = True                # on a gated RTSP/RTSPS stream or ONVIF
+                                          # device, try a tiny factory-default
+                                          # credential list (admin:admin ...);
+                                          # --no-cam-creds disables this one active
+                                          # step (read-only recon + ONVIF
+                                          # GetUsers/GetProfiles still run)
 
     # cve correlation
     cve: bool = True
