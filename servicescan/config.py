@@ -30,6 +30,14 @@ class ScanConfig:
                                           # to catch JS-global/DOM-only catalog apps
     timeout: float = 8.0                  # per-probe timeout (s)
     concurrency: int = 50
+    realm: str | None = None              # AD/Kerberos realm for the TCP-88
+                                          # AS-REQ user-enum / AS-REP-roast
+                                          # posture check (--realm/--domain).
+                                          # When unset it is auto-derived from a
+                                          # dotted-FQDN target; no realm (and a
+                                          # bare-IP target) -> the check is
+                                          # skipped, since the AS-REQ realm is
+                                          # mandatory. No credentials are sent.
     cam_creds: bool = True                # on a gated RTSP/RTSPS stream, ONVIF
                                           # device, or vendor camera CGI, try a
                                           # tiny factory-default credential list

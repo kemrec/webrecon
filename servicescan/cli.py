@@ -78,6 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "disables the one active step -- trying factory-default "
                          "creds on a gated stream/device (admin:admin, "
                          "root:root, ...). --no-rtsp-creds is a back-compat alias")
+    fp.add_argument("--realm", "--domain", dest="realm", default=None,
+                    metavar="REALM",
+                    help="AD/Kerberos realm for the TCP-88 posture check "
+                         "(AS-REQ user enumeration + AS-REP-roast detection, "
+                         "no credentials sent). If omitted it is derived from a "
+                         "dotted-FQDN target (dc01.corp.local -> CORP.LOCAL); a "
+                         "bare-IP target with no --realm skips the Kerberos check")
 
     cv = p.add_argument_group("cve")
     cv.add_argument("--no-cve", action="store_true", help="skip CVE correlation")
@@ -196,6 +203,7 @@ def cfg_from_args(a: argparse.Namespace) -> ScanConfig:
         write_hosts=a.write_hosts,
         concurrency=a.concurrency,
         timeout=a.timeout,
+        realm=a.realm,
         outdir=a.outdir,
         quiet=a.quiet,
         verbose=a.verbose,

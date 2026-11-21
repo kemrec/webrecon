@@ -14,6 +14,7 @@ confidence evidence without discarding nmap's result when it was already good.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import ssl
 import struct
@@ -2656,6 +2657,201 @@ async def winrm_probe(host: str, port: int, timeout: float, tls: bool):
 
 
 # ---------------------------------------------------------------------------
+# Kerberos KDC (TCP 88). Dependency-free ASN.1/DER per RFC 4120. For each
+# candidate principal an AS-REQ is sent with NO pre-authentication (no PA-DATA);
+# the KDC's reply classifies the account WITHOUT sending any credential:
+#   * KRB-ERROR KDC_ERR_PREAUTH_REQUIRED (25)  -> the user EXISTS (AD requires
+#     pre-auth, so a known principal is asked for it)         [informational].
+#   * KRB-ERROR KDC_ERR_C_PRINCIPAL_UNKNOWN (6) -> the user does not exist.
+#   * an AS-REP (no error) -> the account EXISTS *and* has pre-auth DISABLED
+#     (DONT_REQUIRE_PREAUTH): the KDC just handed out a reply whose enc-part is
+#     encrypted with the account's key = an offline-crackable hash obtained with
+#     no credentials ("AS-REP roasting")                              [ALERT].
+# A realm is mandatory in the AS-REQ (supplied with --realm or derived from a
+# dotted-FQDN target). Kerberos messages are explicitly application-tagged DER:
+# AS-REQ=[APPLICATION 10]=0x6A, AS-REP=[APPLICATION 11]=0x6B,
+# KRB-ERROR=[APPLICATION 30]=0x7E. Transport is TCP (4-byte length prefix).
+# Nothing but the unauthenticated AS-REQ is ever sent. Wire format and error
+# codes per RFC 4120 (section 5.4 KDC-REQ, 5.9.1 KRB-ERROR, 7.5.9 error table,
+# 6.2 principal-name types); the AS-REP hash layout matches hashcat 18200 /
+# impacket GetNPUsers.
+# ---------------------------------------------------------------------------
+_KRB_PORTS = {88}
+_KRB_DEFAULT_USERS = ("administrator", "guest", "krbtgt", "svc-sql",
+                      "svc-backup", "service", "backup")
+# NT-PRINCIPAL = 1, NT-SRV-INST = 2 (RFC 4120 section 6.2).
+# KDCOptions bits forwardable|proxiable|renewable (matches impacket's AS-REQ).
+_KRB_KDC_OPTIONS = 0x40810010
+
+
+def _looks_like_ip(s: str) -> bool:
+    import ipaddress
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _krb_principal(name_type: int, components: list) -> bytes:
+    """PrincipalName ::= SEQUENCE { name-type [0] Int32,
+    name-string [1] SEQUENCE OF KerberosString (GeneralString, tag 0x1B) }."""
+    names = b"".join(_der(0x1B, c.encode()) for c in components)
+    return _der(0x30, _der(0xA0, _ber_int(name_type))
+                + _der(0xA1, _der(0x30, names)))
+
+
+def _krb_as_req(user: str, realm: str) -> bytes:
+    """AS-REQ ([APPLICATION 10]) with no PA-DATA (pre-auth omitted), cname=user,
+    sname=krbtgt/REALM, etype preference RC4(23),AES256(18),AES128(17)."""
+    nonce = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
+    body = _der(0x30,
+        _der(0xA0, _der(0x03, b"\x00" + _KRB_KDC_OPTIONS.to_bytes(4, "big")))
+        + _der(0xA1, _krb_principal(1, [user]))            # cname  [1] NT-PRINCIPAL
+        + _der(0xA2, _der(0x1B, realm.encode()))           # realm  [2]
+        + _der(0xA3, _krb_principal(2, ["krbtgt", realm]))  # sname [3] NT-SRV-INST
+        + _der(0xA5, _der(0x18, b"20370913024805Z"))       # till   [5]
+        + _der(0xA7, _ber_int(nonce))                      # nonce  [7]
+        + _der(0xA8, _der(0x30, _ber_int(23) + _ber_int(18)
+                          + _ber_int(17))))                # etype  [8]
+    kdc_req = _der(0x30,
+        _der(0xA1, _ber_int(5))        # pvno     [1] = 5
+        + _der(0xA2, _ber_int(10))     # msg-type [2] = 10 (AS-REQ)
+        + _der(0xA4, body))            # req-body [4]   (padata [3] omitted)
+    return _der(0x6A, kdc_req)
+
+
+def _krb_seq_fields(data: bytes) -> list:
+    """Unwrap [APPLICATION n] -> SEQUENCE and return its context-tagged fields."""
+    top = _ber_split(data)
+    if not top:
+        return []
+    seq = _ber_split(top[0][1])        # the inner SEQUENCE TLV
+    if not seq or seq[0][0] != 0x30:
+        return []
+    return _ber_split(seq[0][1])
+
+
+def _krb_ctx_int(fields: list, ctx_tag: int):
+    for t, c in fields:
+        if t == ctx_tag:
+            kids = _ber_split(c)
+            if kids and kids[0][0] == 0x02:
+                return int.from_bytes(kids[0][1], "big")
+    return None
+
+
+def _krb_ctx_str(fields: list, ctx_tag: int) -> str:
+    for t, c in fields:
+        if t == ctx_tag:
+            kids = _ber_split(c)
+            if kids:
+                return kids[0][1].decode("latin-1", "replace")
+    return ""
+
+
+def _krb_asrep_hash(fields: list, user: str, realm: str) -> dict:
+    """Pull EncryptedData (etype + cipher) from enc-part [6] of an AS-REP and,
+    for RC4 (etype 23), format the hashcat-18200 $krb5asrep$ string."""
+    out = {}
+    for t, c in fields:
+        if t != 0xA6:                  # enc-part [6] EncryptedData
+            continue
+        ed = _ber_split(c)
+        if not ed or ed[0][0] != 0x30:
+            return out
+        edf = _ber_split(ed[0][1])
+        etype = _krb_ctx_int(edf, 0xA0)
+        cipher = b""
+        for tt, cc in edf:
+            if tt == 0xA2:             # cipher [2] OCTET STRING
+                oc = _ber_split(cc)
+                if oc and oc[0][0] == 0x04:
+                    cipher = oc[0][1]
+        out["etype"] = etype
+        if etype == 23 and len(cipher) > 16:
+            out["hash"] = (f"$krb5asrep$23${user}@{realm}:"
+                           f"{cipher[:16].hex()}${cipher[16:].hex()}")
+        elif cipher:
+            out["cipher_len"] = len(cipher)
+    return out
+
+
+def _krb_parse(data: bytes, user: str, realm: str) -> dict:
+    """Classify a KDC reply. kind in {'error','as-rep'}; errors carry 'error'."""
+    if not data:
+        return {}
+    tag = data[0]
+    fields = _krb_seq_fields(data)
+    if tag == 0x7E:                    # KRB-ERROR
+        return {"kind": "error", "error": _krb_ctx_int(fields, 0xA6),  # [6]
+                "realm": _krb_ctx_str(fields, 0xA9)}                    # [9]
+    if tag == 0x6B:                    # AS-REP
+        return {"kind": "as-rep", "asrep": _krb_asrep_hash(fields, user, realm)}
+    return {}
+
+
+async def _krb_send(host: str, port: int, timeout: float, msg: bytes):
+    """Send one Kerberos message over TCP (4-byte big-endian length prefix) and
+    return the reply body, or None. Read-only exchange."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        writer.write(len(msg).to_bytes(4, "big") + msg)
+        await writer.drain()
+        hdr = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
+        n = int.from_bytes(hdr, "big")
+        if n <= 0 or n > 262144:
+            return None
+        return await asyncio.wait_for(reader.readexactly(n), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+
+
+async def kerberos_probe(host: str, port: int, timeout: float, realm: str,
+                         users=_KRB_DEFAULT_USERS):
+    """Unauthenticated AS-REQ (no pre-auth) per candidate principal. Returns
+    {realm, is_kdc, wrong_realm, valid[], unknown[], roastable[{user,etype,hash}]}
+    or None when the port is not a KDC. No credentials are ever sent."""
+    res = {"realm": realm, "is_kdc": False, "wrong_realm": False,
+           "valid": [], "unknown": [], "roastable": []}
+    for u in users:
+        reply = await _krb_send(host, port, timeout, _krb_as_req(u, realm))
+        if not reply:
+            continue
+        info = _krb_parse(reply, u, realm)
+        if not info:
+            continue
+        res["is_kdc"] = True
+        if info["kind"] == "as-rep":
+            res["valid"].append(u)
+            res["roastable"].append({"user": u,
+                                     "etype": info["asrep"].get("etype"),
+                                     "hash": info["asrep"].get("hash")})
+        elif info["kind"] == "error":
+            e = info.get("error")
+            if e == 25:                # KDC_ERR_PREAUTH_REQUIRED -> exists
+                res["valid"].append(u)
+            elif e == 6:               # KDC_ERR_C_PRINCIPAL_UNKNOWN -> absent
+                res["unknown"].append(u)
+            elif e == 68:              # KDC_ERR_WRONG_REALM
+                res["wrong_realm"] = True
+                if info.get("realm"):
+                    res["realm_hint"] = info["realm"]
+                break                  # wrong realm -> every reply is the same
+    return res if res["is_kdc"] else None
+
+
+# ---------------------------------------------------------------------------
 # NFS / rpcbind (TCP 111). Dependency-free ONC RPC: a portmap DUMP (proc 4)
 # enumerates the registered RPC programs, and if mountd (100005) is present its
 # EXPORT (proc 5) lists the NFS exports and the hosts each is shared with. An
@@ -3481,7 +3677,8 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "camera-ws-stream-unauth", "ttyd-shell-unauth",
                       "mqtt-unauth", "smbv1-enabled", "smb-signing-not-required",
                       "nfs-export-world", "ldap-anonymous-read",
-                      "rsync-anon-module", "winrm-basic-cleartext"}
+                      "rsync-anon-module", "winrm-basic-cleartext",
+                      "krb-asrep-roastable"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -3609,6 +3806,69 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                             f"candidates for the --web pivot (mapped to this IP), "
                             f"surfacing internal hostnames that exist only in the "
                             f"certificate."})
+        return
+
+    # Kerberos KDC (TCP 88). Unauthenticated AS-REQ (no pre-auth) per candidate
+    # principal enumerates valid accounts and flags any whose pre-auth is
+    # DISABLED (AS-REP returned = offline-crackable hash obtained with no
+    # credentials = the only alert here). Needs a realm: --realm, else derived
+    # from a dotted-FQDN scan target; a bare-IP target with no --realm is skipped.
+    if port in _KRB_PORTS or "kerberos" in name:
+        realm = (cfg.realm or "").strip()
+        if not realm:
+            for tok in (cfg.targets or (cfg.target or "").split()):
+                tok = tok.strip()
+                # a dotted hostname (has a letter, not a CIDR, not an IP/range);
+                # the realm is its domain part. IP ranges ("10.0.0.1-50") have no
+                # letters, so they are excluded without rejecting hyphenated names.
+                if ("." in tok and "/" not in tok and not _looks_like_ip(tok)
+                        and any(ch.isalpha() for ch in tok)):
+                    realm = tok.split(".", 1)[1]
+                    break
+        if not realm:
+            return                     # no realm -> cannot build an AS-REQ
+        realm = realm.upper()
+        res = await kerberos_probe(host, port, cfg.timeout, realm)
+        if res:
+            if not svc.name:
+                svc.name = "kerberos-sec"
+            if not svc.product:
+                svc.product = "Kerberos KDC"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            if res["wrong_realm"]:
+                hint = res.get("realm_hint")
+                svc.scripts.append({"id": "krb-wrong-realm", "output":
+                    f"Kerberos KDC present but realm '{realm}' is not served"
+                    + (f" (KDC indicated '{hint}')" if hint else "")
+                    + ". Re-run with the correct --realm to enumerate accounts."})
+            else:
+                svc.scripts.append({"id": "krb-kdc", "output":
+                    f"Kerberos KDC confirmed for realm {realm}. Unauthenticated "
+                    f"AS-REQ probing (no pre-auth) tested "
+                    f"{len(_KRB_DEFAULT_USERS)} default principal(s): "
+                    f"{len(res['valid'])} valid, {len(res['unknown'])} absent."})
+                if res["valid"]:
+                    svc.scripts.append({"id": "krb-user-enum", "output":
+                        "Valid principals enumerated WITHOUT credentials "
+                        "(KDC_ERR_PREAUTH_REQUIRED / AS-REP vs "
+                        "KDC_ERR_C_PRINCIPAL_UNKNOWN): "
+                        + ", ".join(res["valid"]) + ". Kerberos pre-auth leaks "
+                        "username validity to anyone who can reach 88 -- a "
+                        "password-spray / roast target list."})
+                for r in res["roastable"]:
+                    svc.confidence = "high"
+                    svc.extrainfo = "AS-REP-roastable account"
+                    detail = (f" Hash: {r['hash']}" if r.get("hash")
+                              else f" (enc-part etype {r.get('etype')}).")
+                    svc.scripts.append({"id": "krb-asrep-roastable", "output":
+                        f"Account '{r['user']}' has Kerberos pre-authentication "
+                        f"DISABLED (DONT_REQUIRE_PREAUTH): the KDC returned an "
+                        f"AS-REP to an unauthenticated AS-REQ, whose enc-part is "
+                        f"encrypted with the account's key and is crackable "
+                        f"offline = credential compromise with no prior access "
+                        f"('AS-REP roasting').{detail} Require pre-authentication "
+                        f"on this account."})
         return
 
     # WinRM / WS-Management (5985 plaintext / 5986 TLS, endpoint /wsman).

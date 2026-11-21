@@ -482,6 +482,21 @@ nmap's result and, for every under-identified port, adds:
   captures them and a valid WinRM credential grants remote PowerShell = host
   takeover (`winrm-basic-cleartext`). `Basic` over TLS (`5986`) is informational
   (`winrm-basic-tls`). All operations are reads.
+- **Kerberos KDC** (TCP `88`): dependency-free ASN.1/DER per RFC 4120. For a
+  small built-in set of default principals an **AS-REQ with no pre-authentication**
+  is sent; the KDC's reply classifies each account without ever sending a
+  credential — `KDC_ERR_PREAUTH_REQUIRED` (25) or an AS-REP means the user
+  **exists**, `KDC_ERR_C_PRINCIPAL_UNKNOWN` (6) means it does not
+  (`krb-user-enum`, informational; Kerberos pre-auth leaks username validity to
+  anyone who can reach `88`). The **alert** is an account whose pre-auth is
+  **disabled**: the KDC returns an AS-REP to the unauthenticated request, and its
+  enc-part — encrypted with the account's key — is crackable offline, i.e. a
+  credential obtained with no prior access (**AS-REP roasting**,
+  `krb-asrep-roastable`; the hashcat-`18200` `$krb5asrep$` hash is emitted as
+  proof for RC4). A **realm is mandatory** in the AS-REQ: supply it with
+  `--realm`/`--domain`, or it is derived from a dotted-FQDN target
+  (`dc01.corp.local` → `CORP.LOCAL`); a bare-IP target with no `--realm` skips
+  the check. Only the unauthenticated AS-REQ is ever sent.
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully
@@ -532,6 +547,8 @@ servicescan host --no-cve                 # service/version detection only
 servicescan host --min-cvss 7             # only show CVSS >= 7.0
 servicescan host --all-cves               # show every CVE in reports (default focuses on KEV/HIGH/CRITICAL; scan.json always keeps all)
 servicescan 10.0.0.5 --no-cam-creds       # camera recon (RTSP+ONVIF) read-only, no default-cred test
+servicescan dc01.corp.local               # realm CORP.LOCAL auto-derived for the Kerberos (88) check
+servicescan 10.0.0.5 --realm CORP.LOCAL   # bare-IP DC: supply the realm for AS-REP-roast / user enum
 servicescan host --no-epss --no-kev       # CVEs only, skip risk enrichment
 servicescan host --no-nmap -p 80,443,8080 # fingerprint-only, no nmap
 servicescan host --exploits               # map CVEs to public exploits/PoCs
@@ -591,7 +608,7 @@ the spec itself. Results group per host in the console, in `scan.json`
 each host gets its own `web/<ip>/<port>-<scheme>/` output subtree.
 
 Key flags: `-iL/--target-file`, `-p/--ports`, `--top-ports`, `--rate` (nmap `--min-rate`),
-`--no-nmap`, `--udp`, `--nse`, `--nse-scripts`, `--fp-all`, `--render`, `--no-cam-creds`, `--no-cve`,
+`--no-nmap`, `--udp`, `--nse`, `--nse-scripts`, `--fp-all`, `--render`, `--no-cam-creds`, `--realm/--domain`, `--no-cve`,
 `--no-nvd`, `--no-osv`, `--no-epss`, `--no-kev`, `--exploits`, `--nvd-api-key`,
 `--min-cvss`, `--all-cves`, `--kev-high`, `--no-cache`, `--cache-ttl`, `--web`, `--full`, `--web-render`,
 `--web-depth`, `--web-max-pages`, `--write-hosts`, `-c/--concurrency`,
