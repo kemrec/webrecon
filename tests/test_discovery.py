@@ -53,6 +53,27 @@ def test_weblogic_presence_only_no_version():
     assert aux["Oracle WebLogic Server"] == ""     # version-less (no CVE guess)
 
 
+def test_weblogic_version_from_console_footer():
+    # 12.x/14.x consoles disclose the exact build unauthenticated in the login
+    # page footer; the probe must capture it (lab body from vulhub 12.2.1.3-2018).
+    body = ('<html><body><p id="footerVersion">WebLogic Server Version: '
+            '12.2.1.3.0</p></body></html>')
+    svc = _run({"/console/login/LoginForm.jsp": _Resp(200, body)})
+    aux = {p[0]: p[1] for p in svc.aux}
+    assert aux.get("Oracle WebLogic Server") == "12.2.1.3"  # _norm_ver 4-part cap
+
+
+def test_weblogic_console_version_promoted_to_primary():
+    # nmap named the primary product WebLogic but version-less; the footer build
+    # must promote onto svc.version so CVE lookup is version-scoped.
+    svc = Service(port=7001, name="http", state="open",
+                  product="Oracle WebLogic Server")
+    body = '<p id="footerVersion">WebLogic Server Version: 12.2.1.3.0</p>'
+    _run({"/console/login/LoginForm.jsp": _Resp(200, body)}, svc)
+    assert svc.version == "12.2.1.3"
+    assert svc.cve_skip is False
+
+
 def test_appwrite_discovered_with_version():
     svc = _run({"/v1/health/version": _Resp(200, '{"version":"1.5.7"}')})
     aux = {p[0]: p[1] for p in svc.aux}

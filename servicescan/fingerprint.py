@@ -900,12 +900,16 @@ _DISCOVERY_PROBES = [
          re.compile(r'"(?:solr-spec-version|lucene)"', re.I),
          re.compile(r'"solr-spec-version"\s*:\s*"([0-9][0-9.]+)"')),
     ]),
-    # Oracle WebLogic: the admin console login page names the product. WebLogic
-    # does not disclose its version over unauthenticated HTTP, so the probe is
-    # presence-only; the version (when known) is inherited from nmap via `token`.
+    # Oracle WebLogic: the admin console login page names the product AND, on
+    # 12.x/14.x, prints the exact build unauthenticated in a page footer
+    #   <p id="footerVersion">WebLogic Server Version: 12.2.1.3.0</p>
+    # (lab-confirmed on vulhub/weblogic:12.2.1.3-2018). Capture it when present;
+    # a hardened console that omits the footer leaves the probe presence-only,
+    # and the version (when known) is then inherited from nmap via `token`.
     ("Oracle WebLogic Server", "weblogic", [
         ("/console/login/LoginForm.jsp",
-         re.compile(r"WebLogic", re.I), None),
+         re.compile(r"WebLogic", re.I),
+         re.compile(r"WebLogic Server Version:\s*([0-9][0-9.]+)")),
     ]),
     # Appwrite: the health endpoint returns a bare {"version":"x.y.z"} object.
     ("Appwrite", "appwrite", [
