@@ -100,3 +100,56 @@ def test_parse_banner_unrealircd_isupport():
     product, _ver, conf = fp.parse_banner(banner)
     assert product == "UnrealIRCd"
     assert conf in ("high", "medium")
+
+
+# --- Tomcat version recovery (FP-free: version from the server itself) -------
+def test_valid_tomcat_version_rejects_coyote_protocol():
+    # the Coyote connector protocol version (1.1) must never pass as a server
+    # version -- that is the whole class of false positives we guard against.
+    assert fp._valid_tomcat_version("1.1") == ""
+    assert fp._valid_tomcat_version("2.0") == ""
+    assert fp._valid_tomcat_version("") == ""
+    # plausible server versions (major >= 3) pass through
+    assert fp._valid_tomcat_version("9.0.30") == "9.0.30"
+    assert fp._valid_tomcat_version("5.5.26") == "5.5.26"
+
+
+class _TomcatHTTP:
+    """Stub: maps a path substring -> (status, body); default is a 404 body."""
+    def __init__(self, routes, default=""):
+        self.routes = routes
+        self.default = default
+
+    async def fetch(self, url, method="GET", read_body=True):
+        path = "/" + url.split("://", 1)[1].split("/", 1)[1]
+        for frag, body in self.routes.items():
+            if frag in path:
+                return type("R", (), {"text": body, "status": 404, "ok": False})()
+        return type("R", (), {"text": self.default, "status": 404,
+                              "ok": False})()
+
+
+def test_probe_tomcat_version_from_error_page_footer():
+    # the default error page (any random 404) carries the exact version in its
+    # footer -- the real tomcat:9.0.30 body shape.
+    body = ('<!doctype html><html><body><h1>HTTP Status 404</h1>'
+            '<h3>Apache Tomcat/9.0.30</h3></body></html>')
+    http = _TomcatHTTP({}, default=body)       # every path returns the footer
+    ver = asyncio.run(fp._probe_tomcat_version(http, "10.0.0.5", 8080, False))
+    assert ver == "9.0.30"
+
+
+def test_probe_tomcat_version_from_release_notes_fallback():
+    body = "Apache Tomcat Version 8.5.61\n...release notes..."
+    http = _TomcatHTTP({"/RELEASE-NOTES.txt": body}, default="")
+    ver = asyncio.run(fp._probe_tomcat_version(http, "10.0.0.5", 8080, False))
+    assert ver == "8.5.61"
+
+
+def test_probe_tomcat_version_hardened_returns_empty():
+    # a hardened server (custom error page, no RELEASE-NOTES) discloses nothing;
+    # the probe must return "" so the caller suppresses CVE correlation instead
+    # of guessing (no version-less flood).
+    http = _TomcatHTTP({}, default="<html><body>Not Found</body></html>")
+    ver = asyncio.run(fp._probe_tomcat_version(http, "10.0.0.5", 8080, False))
+    assert ver == ""

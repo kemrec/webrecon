@@ -1488,17 +1488,22 @@ async def fingerprint_service(cfg: ScanConfig, http, host: str,
                           "--allow and a firewall; never expose 3632 to "
                           "untrusted networks."})
 
-    # 1c) Tomcat/Coyote misattribution fixup. nmap reports the Coyote connector
-    #     product + its protocol version ("1.1"), which correlates to an empty
-    #     NVD product (zero CVEs) while hiding a real, often ancient Tomcat.
-    #     Recover the true version from the server; only then correlate. If the
-    #     version is not disclosed, keep the (correct) product label but set
-    #     cve_skip so correlate() does NOT dump every Tomcat CVE -- correlating
-    #     against the protocol version, or version-less, would be false positives.
-    if is_coyote_misattrib(svc):
+    # 1c) Tomcat version recovery. nmap frequently pins a service as Tomcat but
+    #     without a usable server version -- either it mislabels it as the Coyote
+    #     connector and reports the protocol version ("1.1"), or it names "Apache
+    #     Tomcat" with no version at all (the Server header is suppressed by
+    #     default). Version-less correlation then dumps EVERY Tomcat CVE (seen on
+    #     tomcat:9.0.30 -> 254 CVEs). Tomcat discloses its exact version
+    #     unauthenticated in the default error-page footer
+    #     ("<h3>Apache Tomcat/9.0.30</h3>"), so recover it from the server and
+    #     only then correlate. If a hardened server withholds it, keep the
+    #     product label but set cve_skip so correlate() does not flood.
+    _tomcat_unversioned = ("tomcat" in (svc.product or "").lower()
+                           and not _valid_tomcat_version(svc.version or ""))
+    if is_coyote_misattrib(svc) or _tomcat_unversioned:
         realver = await _probe_tomcat_version(host=host, port=svc.port,
                                               http=http, tls=is_tls)
-        # drop nmap's misleading coyote_* CPE and its protocol "version"
+        # drop nmap's misleading coyote_* CPE and any protocol "version"
         svc.cpe = [c for c in svc.cpe
                    if not any(p in (c or "").lower()
                               for p in _COYOTE_CPE_PRODUCTS)]
@@ -1510,16 +1515,17 @@ async def fingerprint_service(cfg: ScanConfig, http, host: str,
             svc.cve_skip = False
             svc.confidence = "high"
             svc.scripts.append({"id": "tomcat-version", "output":
-                f"Apache Tomcat {realver} (nmap reported the Coyote connector "
-                f"protocol version '1.1', not the server version)."})
+                f"Apache Tomcat {realver} recovered from the server's default "
+                f"error-page footer (nmap exposed no server version; its banner "
+                f"shows only the suppressed header / Coyote connector protocol)."})
         else:
             svc.version = ""
             svc.cve_skip = True            # identified but version undisclosed
             svc.scripts.append({"id": "tomcat-version", "output":
                 "Apache Tomcat detected but the server version is not disclosed "
-                "(nmap's '1.1' is the Coyote connector protocol version). CVE "
-                "correlation suppressed to avoid version-less false positives; "
-                "determine the Tomcat version to assess exposure."})
+                "(Server header suppressed and the default error page hardened). "
+                "CVE correlation suppressed to avoid version-less false "
+                "positives; determine the Tomcat version to assess exposure."})
 
     # 2) TLS cert
     if is_tls:
