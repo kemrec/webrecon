@@ -6,6 +6,8 @@ GET  /                       -> the operator console (static HTML page)
 GET  /api/health             -> {"ok": true, "service": "webrecon-ui"}
 GET  /api/alert-ids          -> ids that are unauthenticated-breach alerts
 POST /api/scan               -> {scan_id, ...ScanResult.to_dict()}  (body: request)
+GET  /api/scan/stream?...     -> text/event-stream of scan milestones (SSE; config
+                                 from the query string, same allowlist as POST)
 POST /api/scan.sarif         -> SARIF 2.1.0 document    (same body)
 GET  /api/export/<id>/<fmt>  -> one output file for a completed scan, as a download
 
@@ -30,10 +32,13 @@ import contextlib
 import io
 import json
 import os
+import queue
 import tempfile
+import threading
 import uuid
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from servicescan import formats, fingerprint, report
 from servicescan.config import ScanConfig
@@ -166,13 +171,14 @@ def build_config(payload: dict) -> ScanConfig:
     return cfg
 
 
-def run_scan(cfg: ScanConfig):
+def run_scan(cfg: ScanConfig, on_event=None):
     """Run one scan to completion and return the ScanResult.
 
+    `on_event` is forwarded to the orchestrator for live-streaming milestones.
     Module-level so tests can monkeypatch it (webrecon_ui.server.run_scan) to
     avoid any real network activity.
     """
-    return asyncio.run(_orchestrator_run(cfg))
+    return asyncio.run(_orchestrator_run(cfg, on_event=on_event))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -234,6 +240,10 @@ class Handler(BaseHTTPRequestHandler):
             # alerts (vs informational) lives in Python; the UI fetches it to
             # colour exposure findings, so the two never drift.
             self._send_json(200, {"alert_ids": sorted(fingerprint.EXPOSURE_ALERT_IDS)})
+            return
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/scan/stream":
+            self._handle_stream(parsed.query)
             return
         if self.path.startswith("/api/export/"):
             self._handle_export(self.path[len("/api/export/"):])
@@ -298,6 +308,53 @@ class Handler(BaseHTTPRequestHandler):
             body = result.to_dict()
             body["scan_id"] = _cache_scan(result)   # for the export endpoints
             self._send_json(200, body)
+
+    def _handle_stream(self, query: str) -> None:
+        """Server-Sent Events: stream scan milestones as they happen.
+
+        EventSource can only GET, so the scan config comes from the query string
+        (the same allowlist as POST /api/scan). The scan runs in a worker thread
+        and pushes events through a queue that this handler thread drains to the
+        wire, so findings appear live instead of all at once at the end. The
+        final 'done' event carries the scan_id for the export endpoints.
+        """
+        params = {k: v[-1] for k, v in
+                  parse_qs(query, keep_blank_values=True).items()}
+        try:
+            cfg = build_config(params)
+        except BadRequest as e:
+            self._error(400, str(e))
+            return
+
+        events: "queue.Queue" = queue.Queue()
+
+        def worker():
+            try:
+                result = run_scan(cfg, on_event=events.put)
+                events.put({"type": "done", "scan_id": _cache_scan(result),
+                            "nmap_used": result.nmap_used, "errors": result.errors})
+            except Exception as e:  # noqa: BLE001
+                events.put({"type": "error", "error": str(e)})
+            finally:
+                events.put(None)       # sentinel: no more events
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            while True:
+                ev = events.get()
+                if ev is None:
+                    break
+                frame = f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                self.wfile.write(frame.encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass               # client disconnected; the worker drains on its own
 
     def log_message(self, fmt, *args):  # silence default stderr access log
         pass

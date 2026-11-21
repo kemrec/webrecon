@@ -129,6 +129,7 @@
 "use strict";
 let ALERT_IDS = new Set();
 let scanId = null;
+let es = null;        // active EventSource (live scan stream)
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, txt) => { const e = document.createElement(tag);
@@ -141,19 +142,20 @@ async function loadAlertIds() {
   } catch (_) { /* highlighting is best-effort */ }
 }
 
-function buildBody() {
-  const b = { target: $("target").value.trim() };
+function buildQuery() {
+  const p = new URLSearchParams();
+  p.set("target", $("target").value.trim());
   const ports = $("ports").value.trim();
-  if (ports) b.ports = ports;
-  b.use_nmap = $("use_nmap").checked;
-  b.fingerprint = $("fingerprint").checked;
-  b.fp_all = $("fp_all").checked;
-  b.udp = $("udp").checked;
-  b.cve = $("cve").checked;
-  b.exploits = $("exploits").checked;
+  if (ports) p.set("ports", ports);
+  p.set("use_nmap", $("use_nmap").checked);
+  p.set("fingerprint", $("fingerprint").checked);
+  p.set("fp_all", $("fp_all").checked);
+  p.set("udp", $("udp").checked);
+  p.set("cve", $("cve").checked);
+  p.set("exploits", $("exploits").checked);
   const mc = parseFloat($("min_cvss").value);
-  if (!isNaN(mc) && mc > 0) b.min_cvss = mc;
-  return b;
+  if (!isNaN(mc) && mc > 0) p.set("min_cvss", mc);
+  return p.toString();
 }
 
 function cveDispScore(c) {
@@ -269,33 +271,57 @@ async function doExport() {
   } catch (e) { note.textContent = "— " + e.message; }
 }
 
-async function doScan(ev) {
+function endScan() {
+  if (es) { es.close(); es = null; }
+  $("go").disabled = false;
+}
+
+// Live scan over Server-Sent Events: hosts render as each one finishes, instead
+// of the page blocking until the whole scan completes.
+function doScan(ev) {
   ev.preventDefault();
-  const body = buildBody();
-  if (!body.target) { setStatus("Enter a target.", true); return; }
+  const target = $("target").value.trim();
+  if (!target) { setStatus("Enter a target.", true); return; }
+  if (es) { es.close(); es = null; }
   $("go").disabled = true;
-  setStatus("Scanning " + body.target + " … (this can take a while on large port ranges)");
   $("downloads").hidden = true;
+  $("results").innerHTML = "";
+  const hosts = [];
+  let expected = null;
   const t0 = Date.now();
-  try {
-    const r = await fetch("/api/scan", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const data = await r.json();
-    if (!r.ok) { setStatus("Error: " + (data.error || r.status), true); return; }
-    scanId = data.scan_id || null;
-    render(data);
-    const secs = ((Date.now() - t0) / 1000).toFixed(1);
-    const nh = (data.hosts || []).length;
-    const ns = (data.hosts || []).reduce((n, h) => n + (h.services || []).length, 0);
-    setStatus(`Done in ${secs}s — ${ns} service(s) across ${nh} host(s)${data.nmap_used ? " (nmap)" : ""}.`);
-    $("downloads").hidden = false;
-  } catch (e) {
-    setStatus("Request failed: " + e.message, true);
-  } finally {
-    $("go").disabled = false;
-  }
+  setStatus("Scanning " + target + " …");
+
+  es = new EventSource("/api/scan/stream?" + buildQuery());
+  es.onmessage = (e) => {
+    let msg; try { msg = JSON.parse(e.data); } catch (_) { return; }
+    if (msg.type === "start") {
+      expected = msg.nhosts;
+      setStatus(expected
+        ? `Scanning ${target} … ${expected} host(s) with open ports`
+        : `Scanning ${target} … (no open ports yet)`);
+    } else if (msg.type === "host") {
+      hosts.push(msg.host);
+      render({ hosts });                       // incremental re-render
+      const done = hosts.length + (expected ? "/" + expected : "");
+      setStatus(`Scanning ${target} … ${done} host(s) done`);
+    } else if (msg.type === "done") {
+      scanId = msg.scan_id || null;
+      if (!hosts.length) render({ hosts: [], errors: msg.errors });
+      const secs = ((Date.now() - t0) / 1000).toFixed(1);
+      const ns = hosts.reduce((n, h) => n + (h.services || []).length, 0);
+      setStatus(`Done in ${secs}s — ${ns} service(s) across ${hosts.length} host(s)${msg.nmap_used ? " (nmap)" : ""}.`);
+      if (scanId) $("downloads").hidden = false;
+      endScan();
+    } else if (msg.type === "error") {
+      setStatus("Error: " + (msg.error || "scan failed"), true);
+      endScan();
+    }
+  };
+  es.onerror = () => {
+    if (!es) return;                           // normal close after 'done'
+    setStatus("Stream interrupted.", true);
+    endScan();
+  };
 }
 
 $("scan-form").addEventListener("submit", doScan);

@@ -24,7 +24,22 @@ def _is_ip(token: str) -> bool:
         return False
 
 
-async def run(cfg: ScanConfig) -> ScanResult:
+async def run(cfg: ScanConfig, on_event=None) -> ScanResult:
+    """Run the scan pipeline and return a ScanResult.
+
+    `on_event`, if given, is a plain callable invoked with small JSON-able dicts
+    as milestones are reached -- {"type":"start","nhosts":N} once hosts are
+    discovered, then {"type":"host","host":<host.to_dict()>} as each host's
+    fingerprint/exposure/CVE work completes. It drives the web UI's live stream;
+    it is best-effort (exceptions are swallowed) and never changes the result.
+    """
+    def _emit(ev):
+        if on_event is not None:
+            try:
+                on_event(ev)
+            except Exception:  # noqa: BLE001
+                pass
+
     tokens = cfg.targets or ([cfg.target] if cfg.target else [])
     result = ScanResult(target=cfg.target or " ".join(tokens))
 
@@ -42,9 +57,11 @@ async def run(cfg: ScanConfig) -> ScanResult:
     result.hosts = hosts
     if not any(h.services for h in hosts):
         utils.warn("no open services found")
+        _emit({"type": "start", "nhosts": 0})
         return result
 
     nhosts = sum(1 for h in hosts if h.services)
+    _emit({"type": "start", "nhosts": nhosts})
     if nhosts > 1:
         utils.info(f"fingerprint + CVE across {nhosts} hosts")
 
@@ -76,6 +93,7 @@ async def run(cfg: ScanConfig) -> ScanResult:
                 # FTP services that do not actually offer TLS (probes only the
                 # services carrying that CVE).
                 await cve.refine_ftp_alpaca(cfg, conn_host, h.services)
+            _emit({"type": "host", "host": h.to_dict()})
     finally:
         await http.close()
 

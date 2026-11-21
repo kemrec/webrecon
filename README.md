@@ -791,7 +791,9 @@ HTML/JS page** (no framework, no build step): a target + options form, a
 per-host service table with CVEs, unauthenticated-exposure findings highlighted
 in red (the page pulls the alert-id list from `/api/alert-ids` so it never
 drifts from the engine), and a **Download** control with a format picker
-(scan.json, SARIF, CSV, JSONL, HTML report, nuclei target lists, …).
+(scan.json, SARIF, CSV, JSONL, HTML report, nuclei target lists, …). Scans run
+**live** over SSE, so each host appears as it finishes rather than after the
+whole scan.
 
 It binds to **localhost** on purpose: the API launches scans against whatever
 target the caller names, so it must not be reachable by untrusted clients. A
@@ -804,6 +806,11 @@ API:
 - `GET  /api/alert-ids` → the set of script ids that are unauthenticated-breach
   alerts (vs informational), for the page's exposure highlighting
 - `POST /api/scan` → `scan.json`-shaped result plus a `scan_id`
+- `GET  /api/scan/stream?<opts>` → a **Server-Sent Events** stream of scan
+  milestones (`start` with the host count, a `host` event as each host's
+  fingerprint/exposure/CVE work finishes, a final `done` carrying the
+  `scan_id`). Config comes from the query string, through the same allowlist.
+  The page uses this so hosts render live instead of all at once at the end.
 - `POST /api/scan.sarif` → SARIF 2.1.0 document (same as `scan.sarif`)
 - `GET  /api/export/<scan_id>/<fmt>` → one output file for that scan, as a
   download. `<fmt>` is one of `json`, `sarif`, `services-csv`, `cves-csv`,
