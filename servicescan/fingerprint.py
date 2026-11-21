@@ -917,9 +917,38 @@ def _load_catalog() -> dict:
     return _CATALOG
 
 
-def match_catalog(headers, body: str) -> list[list[str]]:
-    """Return [[app, version], ...] for every catalog app whose signatures match
-    this HTTP response. Version is '' when no version-capturing sig matched."""
+def catalog_js_vars() -> list[str]:
+    """Every JavaScript global path any catalog app looks for (deduped). A
+    renderer evaluates window.<path> for each and passes the results to
+    match_catalog as js_globals."""
+    seen = set()
+    for entry in _load_catalog().values():
+        for s in entry.get("sigs", []):
+            if s.get("loc") == "js":
+                seen.add(s["key"])
+    return sorted(seen)
+
+
+def catalog_dom_specs() -> list[tuple]:
+    """Every DOM check any catalog app looks for, as (selector, mode, attr).
+    A renderer resolves each selector and passes dom_eval to match_catalog."""
+    seen = set()
+    for entry in _load_catalog().values():
+        for s in entry.get("sigs", []):
+            if s.get("loc") == "dom":
+                seen.add((s["sel"], s["mode"], s.get("attr")))
+    return sorted(seen)
+
+
+def match_catalog(headers, body: str, js_globals: dict | None = None,
+                  dom_eval: dict | None = None) -> list[list[str]]:
+    """Return [[app, version], ...] for every catalog app whose signatures match.
+
+    headers/body cover the plain-HTTP signals (header/meta/cookie/script/html).
+    js_globals ({var.path: stringified value}) and dom_eval ({selector:
+    {"exists":bool, "attrs":{name:val}, "text":str}}) cover the rendered-page
+    signals; when they are None (a plain GET) every js/dom sig is simply
+    skipped, so a non-rendering caller behaves exactly as before."""
     cat = _load_catalog()
     if not cat:
         return []
@@ -955,13 +984,38 @@ def match_catalog(headers, body: str) -> list[list[str]]:
                 if s["key"] not in setcookie:
                     continue
                 target = setcookie
+            elif loc == "js":
+                if js_globals is None or s["key"] not in js_globals:
+                    continue
+                target = str(js_globals.get(s["key"]) or "")
+            elif loc == "dom":
+                if dom_eval is None:
+                    continue
+                d = dom_eval.get(s["sel"])
+                if not d or not d.get("exists"):
+                    continue
+                mode = s.get("mode")
+                if mode == "exists":
+                    target = ""          # presence already confirmed
+                elif mode == "attr":
+                    val = (d.get("attrs") or {}).get(s.get("attr"))
+                    if val is None:
+                        continue
+                    target = str(val)
+                elif mode == "text":
+                    target = str(d.get("text") or "")
+                else:
+                    continue
             else:                               # script / html -> whole body
                 target = body or ""
-            m = rx.search(target)
-            if not m:
-                continue
+            if loc == "dom" and s.get("mode") == "exists":
+                m = True                        # presence sig, no regex needed
+            else:
+                m = rx.search(target)
+                if not m:
+                    continue
             hit = True
-            if s["v"] and not ver:
+            if s["v"] and not ver and m is not True:
                 try:
                     g = m.group(s["v"])
                     if g:

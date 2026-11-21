@@ -13,15 +13,23 @@ Refresh:
         servicescan/data/tech_fingerprints.json
 
 We keep only apps that carry a CPE (the ones we can CVE-correlate) and reduce
-each to the signals we can cheaply match on an HTTP response: response headers,
-<meta> generators, <script src> and body HTML. JS-runtime checks are dropped.
+each to the signals we can match: response headers, <meta> generators,
+<script src> and body HTML (available on a plain HTTP GET), PLUS JavaScript
+global variables and DOM selectors (available only on a rendered page -- the
+servicescan --render path and webrecon's Playwright crawl supply those; a plain
+GET simply never matches a js/dom sig, so they cost nothing there).
 
 Output schema:
     {"_meta": {...},
      "apps": {"<name>": {"cpe": ["vendor","product"],
                           "sigs": [{"loc":"header|meta|script|html|cookie",
                                     "key":"<header/meta/cookie name>"?,
-                                    "re":"<regex>", "v":<version group or 0>}]}}}
+                                    "re":"<regex>", "v":<version group or 0>},
+                                   {"loc":"js","key":"<window.dotted.path>",
+                                    "re":"<regex>","v":<grp>},
+                                   {"loc":"dom","sel":"<css selector>",
+                                    "mode":"exists|attr|text","attr":"<name>"?,
+                                    "re":"<regex>","v":<grp>}]}}}
 """
 from __future__ import annotations
 
@@ -64,7 +72,7 @@ def _valid(regex: str) -> bool:
         return False
 
 
-def _emit(sigs, loc, key, raw):
+def _emit(sigs, loc, key, raw, lower=True):
     if raw is None:
         return
     # a dict value may be a single pattern or a list of them
@@ -79,8 +87,67 @@ def _emit(sigs, loc, key, raw):
             continue
         sig = {"loc": loc, "re": regex, "v": vgroup}
         if key is not None:
-            sig["key"] = key.lower()
+            sig["key"] = key.lower() if lower else key
         sigs.append(sig)
+
+
+def _emit_js(sigs, js):
+    """wappalyzer 'js': {var.path: patternOrEmpty}. var.path is case-sensitive
+    and read on the rendered page as window.<var.path>."""
+    if not isinstance(js, dict):
+        return
+    for var, pat in js.items():
+        if not isinstance(var, str):
+            continue
+        regex, vgroup = _split_pattern(pat) if isinstance(pat, str) else (".*", 0)
+        if regex == "":
+            regex = ".*"
+        if not _valid(regex):
+            continue
+        sigs.append({"loc": "js", "key": var, "re": regex, "v": vgroup})
+
+
+def _emit_dom(sigs, dom):
+    """wappalyzer 'dom': a selector string, a list of them, or
+    {selector: {exists|attributes|text|properties: ...}}. We keep exists,
+    attribute-regex and text-regex (properties need JS runtime, skipped)."""
+    if isinstance(dom, str):
+        dom = [dom]
+    if isinstance(dom, list):
+        for sel in dom:
+            if isinstance(sel, str):
+                sigs.append({"loc": "dom", "sel": sel, "mode": "exists",
+                             "re": ".*", "v": 0})
+        return
+    if not isinstance(dom, dict):
+        return
+    for sel, spec in dom.items():
+        if not isinstance(sel, str):
+            continue
+        if not isinstance(spec, dict):
+            sigs.append({"loc": "dom", "sel": sel, "mode": "exists",
+                         "re": ".*", "v": 0})
+            continue
+        if "exists" in spec:
+            sigs.append({"loc": "dom", "sel": sel, "mode": "exists",
+                         "re": ".*", "v": 0})
+        for attr, pat in (spec.get("attributes") or {}).items():
+            if not isinstance(pat, str):
+                continue
+            regex, vg = _split_pattern(pat)
+            if regex == "":
+                regex = ".*"
+            if _valid(regex):
+                sigs.append({"loc": "dom", "sel": sel, "mode": "attr",
+                             "attr": attr, "re": regex, "v": vg})
+        text = spec.get("text")
+        if isinstance(text, str):
+            regex, vg = _split_pattern(text)
+            if regex == "":
+                regex = ".*"
+            if _valid(regex):
+                sigs.append({"loc": "dom", "sel": sel, "mode": "text",
+                             "re": regex, "v": vg})
 
 
 def build(src_path: str, out_path: str) -> None:
@@ -105,6 +172,8 @@ def build(src_path: str, out_path: str) -> None:
             _emit(sigs, "script", None, pat)
         for pat in (a.get("html") or []):
             _emit(sigs, "html", None, pat)
+        _emit_js(sigs, a.get("js"))
+        _emit_dom(sigs, a.get("dom"))
         if not sigs:
             continue
         out[name] = {"cpe": parsed, "sigs": sigs}
