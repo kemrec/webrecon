@@ -825,7 +825,7 @@ small bounded LRU, fitting the single-operator, localhost nature of the tool.
 The POST body is a JSON object (the SSE endpoint takes the same keys as query
 params). Only an allowlisted subset of options is honoured — `target`
 (required; string or list), `ports`, `use_nmap`, `top_ports`, `udp`, `nse`,
-`fingerprint`, `fp_all`, `render`, `realm`, `scan_rate`, `cve`, `min_cvss`,
+`nse_scripts`, `fingerprint`, `fp_all`, `render`, `realm`, `scan_rate`, `cve`, `min_cvss`,
 `kev_high_only`, `exploits`, `timeout`, `concurrency`, and the `--web` crawl
 chain (`web`, `web_render`, `web_depth`, `web_max_pages`). These are all scan
 *semantics*; host-filesystem / subprocess-path knobs (`nmap_path`, `nmap_args`,

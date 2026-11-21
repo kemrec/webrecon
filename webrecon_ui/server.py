@@ -139,12 +139,30 @@ def _as_realm(v):
     return s
 
 
+def _as_nse_scripts(v):
+    # nmap --script selection (script names / categories / expressions). It is
+    # passed as a SINGLE argv token after "--script" (asyncio create_subprocess_exec,
+    # never a shell), so even with spaces or ';' it cannot smuggle extra nmap flags
+    # or shell commands. Empty -> the engine default ("vuln"). Rejecting a leading
+    # '-' (so the value can't masquerade as a flag) and capping the length is
+    # defence in depth, not a safety requirement.
+    s = str(v).strip()
+    if not s:
+        return "vuln"
+    if s.startswith("-"):
+        raise ValueError("nse_scripts must not start with '-'")
+    if len(s) > 256:
+        raise ValueError("nse_scripts too long")
+    return s
+
+
 _ALLOWED = {
     "ports":         ("ports", _as_ports),
     "use_nmap":      ("use_nmap", _as_bool),
     "top_ports":     ("top_ports", _as_int_or_none),
     "udp":           ("udp", _as_bool),
     "nse":           ("nse", _as_bool),
+    "nse_scripts":   ("nse_scripts", _as_nse_scripts),
     "fingerprint":   ("fingerprint", _as_bool),
     "fp_all":        ("fp_all", _as_bool),
     "render":        ("render", _as_bool),
