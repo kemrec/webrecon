@@ -94,10 +94,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="NVD API key (or env NVD_API_KEY)")
     cv.add_argument("--min-cvss", type=float, default=0.0,
                     help="drop CVEs below this base score")
+    cv.add_argument("--all-cves", action="store_true",
+                    help="show every correlated CVE (medium/low included) in the "
+                         "console/cves.txt/CSV/HTML reports; by default these are "
+                         "focused on KEV or HIGH/CRITICAL (CVSS >= 7.0) findings")
     cv.add_argument("--kev-high", action="store_true",
-                    help="focus the console/cves.txt/CSV/HTML reports on CVEs "
-                         "that are in CISA KEV or rated HIGH/CRITICAL "
-                         "(CVSS >= 7.0); scan.json still keeps the full set")
+                    help="(default behaviour; kept for compatibility) focus the "
+                         "human reports on CISA KEV or HIGH/CRITICAL (CVSS >= 7.0) "
+                         "CVEs -- scan.json always keeps the full set")
     cv.add_argument("--no-cache", action="store_true",
                     help="disable the on-disk CVE/enrichment cache")
     cv.add_argument("--cache-ttl", type=int, default=86400,
@@ -180,7 +184,7 @@ def cfg_from_args(a: argparse.Namespace) -> ScanConfig:
         exploits=a.exploits,
         nvd_api_key=a.nvd_api_key,
         min_cvss=a.min_cvss,
-        kev_high_only=a.kev_high,
+        kev_high_only=not a.all_cves,
         cam_creds=not a.no_cam_creds,
         cve_cache=not a.no_cache,
         cache_ttl=a.cache_ttl,

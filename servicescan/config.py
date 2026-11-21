@@ -48,9 +48,10 @@ class ScanConfig:
     exploits: bool = False                # map CVEs to public exploits/PoCs
     nvd_api_key: str | None = None        # optional, raises rate limit
     min_cvss: float = 0.0                 # filter out CVEs below this score
-    kev_high_only: bool = False           # human outputs show only KEV or
-                                          # HIGH/CRITICAL (>=7.0) CVEs; scan.json
-                                          # keeps the full set (nothing lost)
+    kev_high_only: bool = True            # DEFAULT: human outputs show only KEV
+                                          # or HIGH/CRITICAL (>=7.0) CVEs;
+                                          # scan.json keeps the full set (nothing
+                                          # lost). --all-cves turns this off.
     max_cves_per_service: int = 50        # DISPLAY cap (applied after KEV/EPSS
                                           # ranking, so KEV/critical survive)
     max_cve_fetch: int = 2000             # hard ceiling on CVEs pulled per NVD

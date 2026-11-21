@@ -221,6 +221,14 @@ exploitation probability) and flagged if it appears in the **CISA KEV**
 catalog of vulnerabilities known to be exploited in the wild — so the output
 ranks by real-world risk, not just CVSS.
 
+By default the human-facing reports (console, `cves.txt`, CSV, HTML) focus on
+the findings worth acting on first: CVEs in **CISA KEV** or rated
+**HIGH/CRITICAL** (CVSS ≥ 7.0). This keeps a long tail of medium/low CVEs on
+old products from burying the serious ones, and the console notes how many were
+hidden. Nothing is lost — `scan.json` always records the **complete** CVE set
+(medium and low included); pass `--all-cves` to show everything in the reports
+too.
+
 ### Why a layer on top of nmap?
 
 nmap's `-sV` is excellent on classic TCP services but often returns a bare
@@ -463,7 +471,7 @@ servicescan 10.0.0.5 --top-ports 1000 --rate 2000
 servicescan host --fp-all                 # fingerprint every open port, not just gaps
 servicescan host --no-cve                 # service/version detection only
 servicescan host --min-cvss 7             # only show CVSS >= 7.0
-servicescan host --kev-high               # reports show only KEV or HIGH/CRITICAL (scan.json keeps all)
+servicescan host --all-cves               # show every CVE in reports (default focuses on KEV/HIGH/CRITICAL; scan.json always keeps all)
 servicescan 10.0.0.5 --no-cam-creds       # camera recon (RTSP+ONVIF) read-only, no default-cred test
 servicescan host --no-epss --no-kev       # CVEs only, skip risk enrichment
 servicescan host --no-nmap -p 80,443,8080 # fingerprint-only, no nmap
@@ -526,7 +534,7 @@ each host gets its own `web/<ip>/<port>-<scheme>/` output subtree.
 Key flags: `-iL/--target-file`, `-p/--ports`, `--top-ports`, `--rate` (nmap `--min-rate`),
 `--no-nmap`, `--udp`, `--nse`, `--nse-scripts`, `--fp-all`, `--render`, `--no-cam-creds`, `--no-cve`,
 `--no-nvd`, `--no-osv`, `--no-epss`, `--no-kev`, `--exploits`, `--nvd-api-key`,
-`--min-cvss`, `--kev-high`, `--no-cache`, `--cache-ttl`, `--web`, `--full`, `--web-render`,
+`--min-cvss`, `--all-cves`, `--kev-high`, `--no-cache`, `--cache-ttl`, `--web`, `--full`, `--web-render`,
 `--web-depth`, `--web-max-pages`, `--write-hosts`, `-c/--concurrency`,
 `-t/--timeout`, `-o/--outdir`. Full list: `servicescan -h`.
 

@@ -193,8 +193,9 @@ def console_summary(result: ScanResult, outdir: str | None = None) -> None:
           f"{C.RED}{C.B}{kev} KEV{C.R})")
     hidden = getattr(result, "_kev_high_hidden", 0)
     if hidden:
-        print(f"  {C.GRY}--kev-high: {hidden} medium/low CVE(s) hidden from this "
-              f"view; full set in scan.json{C.R}")
+        print(f"  {C.GRY}{hidden} medium/low CVE(s) hidden from this view "
+              f"(KEV/HIGH-focused by default; --all-cves to show all); "
+              f"full set in scan.json{C.R}")
 
     for h in live_hosts:
         print(f"{C.B}{'-'*66}{C.R}")

@@ -39,10 +39,21 @@ def test_no_filter_shows_all_cves_in_reports(tmp_path):
     from servicescan import report
     out = str(tmp_path / "o")
     result = _result_with_cves()
-    report.write_all(out, result)             # default: no kev-high filter
+    report.write_all(out, result)             # write_all's own default: unfiltered
     txt = open(os.path.join(out, "cves.txt")).read()
     assert "\tCVE-MED\t" in txt                # medium visible when unfiltered
     assert getattr(result, "_kev_high_hidden", 0) == 0
+
+
+def test_default_run_focuses_on_kev_high_all_cves_opts_out():
+    # PRODUCT default (via the CLI): a bare run focuses human reports on
+    # KEV/HIGH; --all-cves opts back into the full display. scan.json is
+    # unaffected either way (the two tests above cover the write_all paths).
+    from servicescan import cli
+    p = cli.build_parser()
+    assert cli.cfg_from_args(p.parse_args(["10.0.0.5"])).kev_high_only is True
+    assert cli.cfg_from_args(
+        p.parse_args(["10.0.0.5", "--all-cves"])).kev_high_only is False
 
 
 def test_target_slug():
