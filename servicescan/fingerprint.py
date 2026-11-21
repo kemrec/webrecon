@@ -2483,6 +2483,139 @@ async def http_ntlm_probe(host: str, port: int, timeout: float, tls: bool):
 
 
 # ---------------------------------------------------------------------------
+# NFS / rpcbind (TCP 111). Dependency-free ONC RPC: a portmap DUMP (proc 4)
+# enumerates the registered RPC programs, and if mountd (100005) is present its
+# EXPORT (proc 5) lists the NFS exports and the hosts each is shared with. An
+# export shared with everyone (empty group list, or "*") is reachable by any
+# client -> read (and, with no_root_squash, write) of the server's files = an
+# unauthenticated data-exposure alert. All calls are read-only (DUMP/EXPORT
+# query procedures; nothing is mounted). Wire format per RFC 1833 (rpcbind),
+# RFC 5531 (RPC) and RFC 1813 Appendix I (MOUNT v3).
+# ---------------------------------------------------------------------------
+_NFS_PORTS = {111}
+_RPC_PROG_NAMES = {100000: "portmapper", 100003: "nfs", 100005: "mountd",
+                   100021: "nlockmgr", 100024: "status", 100227: "nfs_acl",
+                   100005: "mountd", 100011: "rquotad", 100009: "yppasswdd"}
+
+
+def _rpc_call(xid: int, prog: int, vers: int, proc: int, args: bytes = b"") -> bytes:
+    return (xid.to_bytes(4, "big") + (0).to_bytes(4, "big")      # mtype CALL
+            + (2).to_bytes(4, "big")                             # rpcvers 2
+            + prog.to_bytes(4, "big") + vers.to_bytes(4, "big")
+            + proc.to_bytes(4, "big")
+            + b"\x00" * 8 + b"\x00" * 8                          # AUTH_NULL cred+verf
+            + args)
+
+
+async def _rpc_roundtrip(host: str, port: int, call: bytes, timeout: float) -> bytes:
+    """Send one record-marked RPC call over TCP, return the reply body (b'')."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return b""
+    try:
+        writer.write((0x80000000 | len(call)).to_bytes(4, "big") + call)
+        await writer.drain()
+        mark = await asyncio.wait_for(reader.readexactly(4), timeout)
+        n = int.from_bytes(mark, "big") & 0x7fffffff
+        return await asyncio.wait_for(reader.readexactly(n), timeout)
+    except Exception:  # noqa: BLE001
+        return b""
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _rpc_results_offset(msg: bytes):
+    """(accepted, offset) of the procedure results in an RPC reply, or
+    (False, 0). Handles the AUTH_NULL verifier length generically."""
+    if len(msg) < 20:
+        return False, 0
+    if int.from_bytes(msg[4:8], "big") != 1:          # REPLY
+        return False, 0
+    if int.from_bytes(msg[8:12], "big") != 0:         # MSG_ACCEPTED
+        return False, 0
+    vlen = int.from_bytes(msg[16:20], "big")
+    off = 20 + vlen + ((4 - vlen % 4) % 4)
+    if off + 4 > len(msg):
+        return False, 0
+    return int.from_bytes(msg[off:off + 4], "big") == 0, off + 4
+
+
+def _xdr_str(data: bytes, i: int):
+    n = int.from_bytes(data[i:i + 4], "big")
+    i += 4
+    s = data[i:i + n]
+    i += n + ((4 - n % 4) % 4)
+    return s.decode("latin-1", "replace"), i
+
+
+def _parse_rpcb_dump(data: bytes, i: int):
+    """portmap PMAPPROC_DUMP result: linked list of {prog,vers,prot,port}."""
+    out = []
+    while i + 4 <= len(data):
+        if int.from_bytes(data[i:i + 4], "big") == 0:
+            break
+        i += 4
+        if i + 16 > len(data):
+            break
+        out.append((int.from_bytes(data[i:i + 4], "big"),
+                    int.from_bytes(data[i + 4:i + 8], "big"),
+                    int.from_bytes(data[i + 8:i + 12], "big"),
+                    int.from_bytes(data[i + 12:i + 16], "big")))
+        i += 16
+    return out
+
+
+def _parse_mount_exports(data: bytes, i: int):
+    """MOUNTPROC_EXPORT result: linked list of {dirpath, groups[]}."""
+    exports = []
+    while i + 4 <= len(data):
+        if int.from_bytes(data[i:i + 4], "big") == 0:
+            break
+        i += 4
+        dirp, i = _xdr_str(data, i)
+        groups = []
+        while i + 4 <= len(data):
+            if int.from_bytes(data[i:i + 4], "big") == 0:
+                i += 4
+                break
+            i += 4
+            g, i = _xdr_str(data, i)
+            groups.append(g)
+        exports.append((dirp, groups))
+    return exports
+
+
+async def nfs_probe(host: str, port: int, timeout: float):
+    """rpcbind DUMP + mountd EXPORT. Returns {programs, exports} or None.
+    programs = [(prog,vers,prot,port)]; exports = [(dirpath, [groups])]."""
+    dump = await _rpc_roundtrip(host, port, _rpc_call(1, 100000, 2, 4), timeout)
+    ok, off = _rpc_results_offset(dump)
+    if not ok:
+        return None
+    programs = _parse_rpcb_dump(dump, off)
+    if not programs:
+        return None
+    # mountd (100005) TCP port, highest version available
+    mountd = sorted([(v, pt) for (pg, v, pr, pt) in programs
+                     if pg == 100005 and pr == 6 and pt], reverse=True)
+    exports = []
+    if mountd:
+        mver, mport = mountd[0]
+        ex = await _rpc_roundtrip(host, mport,
+                                  _rpc_call(2, 100005, mver, 5), timeout)
+        eok, eoff = _rpc_results_offset(ex)
+        if eok:
+            exports = _parse_mount_exports(ex, eoff)
+    return {"programs": programs, "exports": exports}
+
+
+# ---------------------------------------------------------------------------
 # gRPC (HTTP/2). Modern device/service control planes expose gRPC; nmap usually
 # leaves these ports unidentified ("tcpwrapped"). Detection is dependency-free:
 # over TLS we offer ALPN and check for a negotiated "h2"; cleartext we send the
@@ -2947,7 +3080,8 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "prometheus-unauth", "consul-unauth", "rabbitmq-unauth",
                       "minio-unauth", "portainer-unauth", "zookeeper-unauth",
                       "camera-ws-stream-unauth", "ttyd-shell-unauth",
-                      "mqtt-unauth", "smbv1-enabled", "smb-signing-not-required"}
+                      "mqtt-unauth", "smbv1-enabled", "smb-signing-not-required",
+                      "nfs-export-world"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -3371,6 +3505,48 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 svc.scripts.append({"id": "smb-signing-required", "output":
                     f"SMB signing is required on dialect 0x{res['dialect']:04x} "
                     "(good posture; NTLM relay to this host is blocked)."})
+        return
+
+    if (port in _NFS_PORTS or "rpcbind" in name or "sunrpc" in name
+            or "portmap" in name or "nfs" in name):
+        res = await nfs_probe(host, port, cfg.timeout)
+        if res:
+            if not svc.name:
+                svc.name = "rpcbind"
+            if not svc.product:
+                svc.product = "rpcbind/NFS"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            progs = sorted({_RPC_PROG_NAMES.get(pg, str(pg))
+                            for (pg, v, pr, pt) in res["programs"]})
+            svc.scripts.append({"id": "rpcbind-dump", "output":
+                "rpcbind answered PMAPPROC_DUMP without authentication; "
+                "registered RPC programs: " + ", ".join(progs) + ". This maps "
+                "the host's RPC attack surface (NFS/NIS/quota/lock) to anyone "
+                "who can reach 111."})
+            exports = res["exports"]
+            if exports:
+                def _world(groups):
+                    return (not groups) or any(
+                        g in ("*", "", "(everyone)", "0.0.0.0", "0.0.0.0/0")
+                        for g in groups)
+                listing = "; ".join(
+                    f"{d} -> {', '.join(g) if g else 'everyone'}"
+                    for d, g in exports)
+                svc.scripts.append({"id": "nfs-exports", "output":
+                    f"mountd EXPORT listed {len(exports)} NFS export(s): "
+                    f"{listing}."})
+                world = [d for d, g in exports if _world(g)]
+                if world:
+                    svc.confidence = "high"
+                    svc.extrainfo = "world-readable NFS export"
+                    svc.scripts.append({"id": "nfs-export-world", "output":
+                        "NFS export(s) shared with EVERYONE (no host "
+                        f"restriction): {', '.join(world)}. Any client that can "
+                        "reach NFS can mount and read these paths, and if "
+                        "exported no_root_squash, write as root = host "
+                        "compromise. Restrict exports to specific hosts/subnets "
+                        "and keep root_squash enabled."})
         return
 
     # gRPC / HTTP2 on a dedicated gRPC port (or a `grpc`-named service). Scoped

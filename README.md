@@ -444,6 +444,14 @@ nmap's result and, for every under-identified port, adds:
   anchoring CVE correlation). `/` is always checked; the Exchange/RDWeb paths
   (`/ews/`, `/rpc/`, `/autodiscover/…`, `/RDWeb/`, …) are swept only when the
   server banner looks like Microsoft-IIS, so generic web ports cost one request.
+- **NFS / rpcbind** (TCP `111`): dependency-free ONC RPC. A portmap `DUMP`
+  enumerates the registered RPC programs (NFS/NIS/quota/lock — `rpcbind-dump`,
+  informational attack-surface map), and when `mountd` is present its `EXPORT`
+  procedure lists the NFS exports and the hosts each is shared with
+  (`nfs-exports`). An export shared with **everyone** (empty group list or `*`)
+  is reachable by any client — mountable and readable, and with `no_root_squash`
+  writable as root — a **world-readable export alert** (`nfs-export-world`). All
+  calls are read-only query procedures; nothing is mounted.
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully
