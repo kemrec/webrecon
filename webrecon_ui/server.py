@@ -9,7 +9,9 @@ POST /api/scan               -> {scan_id, ...ScanResult.to_dict()}  (body: reque
 GET  /api/scan/stream?...     -> text/event-stream of scan milestones (SSE; config
                                  from the query string, same allowlist as POST)
 POST /api/scan.sarif         -> SARIF 2.1.0 document    (same body)
-GET  /api/export/<id>/<fmt>  -> one output file for a completed scan, as a download
+GET  /api/export/<id>/<fmt>  -> one output file for a completed scan, as a
+                                download; <fmt>="all" bundles every output (and
+                                the web-crawl dir) as a <target>-<timestamp>.zip
 
 The POST body is a JSON object; only an allowlisted subset of ScanConfig fields
 is honoured (see _ALLOWED), so a request can never set, e.g., an arbitrary
@@ -29,13 +31,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as _dt
 import io
 import json
 import os
 import queue
+import re
 import tempfile
 import threading
 import uuid
+import zipfile
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -105,6 +110,33 @@ def render_export(result, fmt: str) -> bytes | None:
             return None
         with open(path, "rb") as fh:
             return fh.read()
+
+
+def render_export_zip(result) -> bytes:
+    """Render EVERY servicescan output into a single in-memory zip.
+
+    report.write_all drops the whole output tree (scan.json/.sarif, the CSV/TXT
+    lists, the HTML report, nuclei target files, and -- when the --web chain ran
+    -- the per-port crawl dir) into one temp dir in a single pass; we zip that
+    tree verbatim. So the archive is a superset of the per-format downloads and
+    additionally carries the web-crawl artifacts, which have no single-file route.
+    """
+    with tempfile.TemporaryDirectory(prefix="webrecon-ui-") as td:
+        with contextlib.redirect_stdout(io.StringIO()):
+            report.write_all(td, result, kev_high_only=False)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, _dirs, files in os.walk(td):
+                for name in sorted(files):
+                    full = os.path.join(root, name)
+                    zf.write(full, os.path.relpath(full, td))
+        return buf.getvalue()
+
+
+def _safe_slug(s: str, fallback: str = "scan") -> str:
+    """A filesystem-safe filename stem from a scan target spec (host/CIDR/list)."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", (s or "").strip()).strip("._-")
+    return slug[:60] or fallback
 
 # JSON request field -> (ScanConfig attribute, coercer). Anything not listed is
 # ignored, so the web surface can never reach sensitive/local-only config such
@@ -325,12 +357,29 @@ class Handler(BaseHTTPRequestHandler):
             self._error(404, "not found")
             return
         scan_id, fmt = parts
-        if fmt not in _EXPORTS:
+        if fmt != "all" and fmt not in _EXPORTS:
             self._error(400, f"unknown format '{fmt}'")
             return
         result = _SCANS.get(scan_id)
         if result is None:
             self._error(404, "unknown or expired scan_id")
+            return
+        if fmt == "all":
+            # every output format (+ web-crawl dir) bundled as <target>-<ts>.zip
+            try:
+                data = render_export_zip(result)
+            except Exception as e:  # noqa: BLE001
+                self._error(500, f"export failed: {e}")
+                return
+            stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            fname = f"{_safe_slug(getattr(result, 'target', ''))}-{stamp}.zip"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(data)
             return
         try:
             data = render_export(result, fmt)

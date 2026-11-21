@@ -156,6 +156,7 @@
       </select>
     </label>
     <button class="ghost" id="dl-go">Download</button>
+    <button class="ghost" id="dl-all">Download all (zip)</button>
     <span id="dl-note" class="muted"></span>
   </div>
 </main>
@@ -331,9 +332,8 @@ function setStatus(msg, isErr) {
   const s = $("status"); s.textContent = msg; s.className = isErr ? "err" : "";
 }
 
-async function doExport() {
+async function fetchAndSave(fmt, fallbackName) {
   if (!scanId) return;
-  const fmt = $("fmt").value;
   const note = $("dl-note"); note.textContent = "";
   try {
     const r = await fetch(`/api/export/${scanId}/${encodeURIComponent(fmt)}`);
@@ -346,12 +346,14 @@ async function doExport() {
     const blob = await r.blob();
     const cd = r.headers.get("Content-Disposition") || "";
     const m = cd.match(/filename="([^"]+)"/);
-    const fname = m ? m[1] : (fmt + ".txt");
+    const fname = m ? m[1] : fallbackName;
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a"); a.href = url; a.download = fname; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (e) { note.textContent = "— " + e.message; }
 }
+function doExport() { fetchAndSave($("fmt").value, $("fmt").value + ".txt"); }
+function doExportAll() { fetchAndSave("all", "scan.zip"); }
 
 function endScan() {
   if (es) { es.close(); es = null; }
@@ -414,6 +416,7 @@ function doScan(ev) {
 
 $("scan-form").addEventListener("submit", doScan);
 $("dl-go").addEventListener("click", doExport);
+$("dl-all").addEventListener("click", doExportAll);
 loadAlertIds();
 </script>
 </body>

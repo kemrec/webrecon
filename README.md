@@ -819,7 +819,9 @@ API:
 - `POST /api/scan.sarif` → SARIF 2.1.0 document (same as `scan.sarif`)
 - `GET  /api/export/<scan_id>/<fmt>` → one output file for that scan, as a
   download. `<fmt>` is one of `json`, `sarif`, `services-csv`, `cves-csv`,
-  `jsonl`, `html`, `nuclei-web`, `nuclei-net`, `services-txt`, `cves-txt`
+  `jsonl`, `html`, `nuclei-web`, `nuclei-net`, `services-txt`, `cves-txt`, or
+  `all` → **every** output (plus the `--web` crawl dir) bundled as a
+  `<target>-<timestamp>.zip` (the console's "Download all (zip)" button)
 
 So the console offers **every servicescan output format** (not just JSON/SARIF):
 each completed scan is cached server-side under its `scan_id`, and an export is
