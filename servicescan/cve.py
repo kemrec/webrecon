@@ -55,6 +55,13 @@ _CPE_MAP = {
     "tomcat": ("apache", "tomcat"),
     "apache tomcat": ("apache", "tomcat"),    # label the Coyote-fixup emits
     "jenkins": ("jenkins", "jenkins"),
+    # recovered by the hand-written discovery path-probes (no wappalyzergo
+    # signal); NVD vendors (the catalog's WebLogic cpe used the old "bea").
+    "solr": ("apache", "solr"),
+    "apache solr": ("apache", "solr"),
+    "oracle weblogic server": ("oracle", "weblogic_server"),
+    "weblogic": ("oracle", "weblogic_server"),
+    "appwrite": ("appwrite", "appwrite"),
 }
 
 # OSV is reliable only when queried WITH an ecosystem (PyPI, npm, Go, Packagist,

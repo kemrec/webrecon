@@ -63,6 +63,8 @@ async def run(cfg: ScanConfig) -> ScanResult:
             if cfg.fingerprint:
                 await fingerprint.run_fingerprint(cfg, http, conn_host, h.services)
                 await fingerprint.run_exposure_checks(cfg, conn_host, h.services)
+                await fingerprint.run_discovery_probes(cfg, http, conn_host,
+                                                       h.services)
             if cfg.render:
                 # render web-port roots to catch JS-global/DOM-only catalog apps
                 # BEFORE CVE so their versioned hits correlate (opt-in).

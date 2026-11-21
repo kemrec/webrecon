@@ -882,6 +882,96 @@ async def _probe_tomcat_version(http, host: str, port: int, tls: bool) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Discovery path-probes: apps that carry a CPE but ship NO HTTP fingerprint
+# signal in wappalyzergo (so the catalog can never find them, rendered or not).
+# We hit one known read-only endpoint per app and identify it (+ version where
+# the app discloses it). Each label must match a cve._CPE_MAP key so a versioned
+# hit CVE-correlates. Product-agnostic: add an app by adding a row.
+# ---------------------------------------------------------------------------
+_DISCOVERY_PROBES = [
+    # Apache Solr: the admin system endpoint returns JSON with the exact version
+    ("Solr", [
+        ("/solr/admin/info/system?wt=json",
+         re.compile(r'"(?:solr-spec-version|lucene)"', re.I),
+         re.compile(r'"solr-spec-version"\s*:\s*"([0-9][0-9.]+)"')),
+    ]),
+    # Oracle WebLogic: the admin console login page names the product. WebLogic
+    # does not disclose its version over unauthenticated HTTP, so presence only
+    # (version-less -> recorded, not CVE-correlated: no wildcard guess).
+    ("Oracle WebLogic Server", [
+        ("/console/login/LoginForm.jsp",
+         re.compile(r"WebLogic", re.I), None),
+    ]),
+    # Appwrite: the health endpoint returns a bare {"version":"x.y.z"} object.
+    ("Appwrite", [
+        ("/v1/health/version",
+         re.compile(r'^\s*\{\s*"version"\s*:\s*"[0-9]'),
+         re.compile(r'"version"\s*:\s*"([0-9][0-9.]+)"')),
+    ]),
+]
+
+
+async def _discover_app(http, host: str, port: int, tls: bool,
+                        label: str, attempts) -> list | None:
+    scheme = "https" if tls else "http"
+    for path, detect_rx, ver_rx in attempts:
+        try:
+            r = await http.fetch(f"{scheme}://{host}:{port}{path}",
+                                 method="GET", read_body=True)
+        except Exception:  # noqa: BLE001
+            continue
+        if getattr(r, "status", 0) != 200:
+            continue
+        body = getattr(r, "text", "") or ""
+        if not body or not detect_rx.search(body):
+            continue
+        ver = ""
+        if ver_rx is not None:
+            m = ver_rx.search(body)
+            if m:
+                ver = _norm_ver(m.group(1))
+        return [label, ver]
+    return None
+
+
+async def run_discovery_probes(cfg: ScanConfig, http, host: str,
+                               services: list[Service]) -> None:
+    """Read-only discovery path-probes over every open web service (Solr,
+    Oracle WebLogic, Appwrite). Runs in the fingerprint phase, before CVE, so a
+    versioned hit correlates. One GET per app; a miss is a plain 404."""
+    web = [s for s in services if s.state == "open" and is_web_service(s)]
+    if not web:
+        return
+    sem = asyncio.Semaphore(cfg.concurrency)
+
+    async def one(svc: Service):
+        tls = is_tls_service(svc)
+        for label, attempts in _DISCOVERY_PROBES:
+            async with sem:
+                try:
+                    hit = await _discover_app(http, host, svc.port, tls,
+                                              label, attempts)
+                except Exception as e:  # noqa: BLE001
+                    utils.debug(f"discovery :{svc.port} {label}: {e}")
+                    continue
+            if not hit:
+                continue
+            name, ver = hit
+            same = next((p for p in svc.aux if p[0].lower() == name.lower()), None)
+            if same is None:
+                svc.aux.append([name, ver])
+            elif ver and not same[1]:
+                same[1] = ver
+            if "discovery" not in svc.sources:
+                svc.sources.append("discovery")
+            svc.scripts.append({"id": "discovery-app",
+                                "output": f"{name}{(' ' + ver) if ver else ''} "
+                                          f"detected via a known endpoint probe"})
+
+    await asyncio.gather(*(one(s) for s in web))
+
+
+# ---------------------------------------------------------------------------
 # Technology fingerprint catalog (generated from projectdiscovery/wappalyzergo,
 # MIT; see scripts/build_tech_catalog.py). Gives breadth our hand-written
 # _HTTP_BODY_SIGS can't: ~270 CVE-correlatable web apps with header/meta/script/

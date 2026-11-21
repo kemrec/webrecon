@@ -1,0 +1,79 @@
+"""Discovery path-probes (Solr / WebLogic / Appwrite). The HTTP client is a
+stub returning canned responses per path -- no network needed."""
+import asyncio
+
+from servicescan import fingerprint as fp
+from servicescan.config import ScanConfig
+from servicescan.models import Service
+
+
+class _Resp:
+    def __init__(self, status, text):
+        self.status = status
+        self.text = text
+        self.ok = 200 <= status < 400
+
+
+class _StubHTTP:
+    """Maps a path -> _Resp; any other path is a 404."""
+    def __init__(self, routes):
+        self.routes = routes
+
+    async def fetch(self, url, method="GET", read_body=True):
+        path = url.split("://", 1)[1].split("/", 1)[1]
+        path = "/" + path
+        for p, resp in self.routes.items():
+            if path.startswith(p):
+                return resp
+        return _Resp(404, "not found")
+
+
+def _run(routes, svc=None):
+    svc = svc or Service(port=8080, name="http", state="open")
+    http = _StubHTTP(routes)
+    cfg = ScanConfig(target="x", concurrency=5, timeout=5.0)
+    asyncio.run(fp.run_discovery_probes(cfg, http, "10.0.0.9", [svc]))
+    return svc
+
+
+def test_solr_discovered_with_version():
+    body = '{"lucene":{"solr-spec-version":"8.11.2"},"system":{}}'
+    svc = _run({"/solr/admin/info/system": _Resp(200, body)})
+    aux = {p[0]: p[1] for p in svc.aux}
+    assert aux.get("Solr") == "8.11.2"
+    assert any(s["id"] == "discovery-app" for s in svc.scripts)
+    assert "discovery" in svc.sources
+
+
+def test_weblogic_presence_only_no_version():
+    body = "<html><title>Oracle WebLogic Server Administration Console</title></html>"
+    svc = _run({"/console/login/LoginForm.jsp": _Resp(200, body)})
+    aux = {p[0]: p[1] for p in svc.aux}
+    assert "Oracle WebLogic Server" in aux
+    assert aux["Oracle WebLogic Server"] == ""     # version-less (no CVE guess)
+
+
+def test_appwrite_discovered_with_version():
+    svc = _run({"/v1/health/version": _Resp(200, '{"version":"1.5.7"}')})
+    aux = {p[0]: p[1] for p in svc.aux}
+    assert aux.get("Appwrite") == "1.5.7"
+
+
+def test_generic_version_json_is_not_appwrite():
+    # a different API that also returns {"version":...} but not the bare Appwrite
+    # shape must NOT be mislabelled Appwrite
+    svc = _run({"/v1/health/version": _Resp(200,
+               '{"status":"ok","data":{"version":"2.0"}}')})
+    assert not any(p[0] == "Appwrite" for p in svc.aux)
+
+
+def test_no_match_leaves_service_untouched():
+    svc = _run({})                                 # everything 404
+    assert svc.aux == [] and svc.scripts == []
+
+
+def test_non_web_service_skipped():
+    svc = Service(port=22, name="ssh", state="open")
+    _run({"/solr/admin/info/system": _Resp(200, '{"solr-spec-version":"9.0.0"}')},
+         svc)
+    assert svc.aux == []

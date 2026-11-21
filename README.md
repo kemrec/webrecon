@@ -241,6 +241,10 @@ nmap's result and, for every under-identified port, adds:
   webrecon crawl needed. (A full `--web` crawl also runs the catalog, including
   these rendered signals, and lists what it found per port.)
 - **TLS certificate** (subject/issuer/SAN, often naming the host/app),
+- **discovery path-probes** (read-only) for high-value apps that expose no
+  landing-page fingerprint: Apache Solr (`/solr/admin/info/system` → exact
+  version), Oracle WebLogic (`/console/` → presence), Appwrite
+  (`/v1/health/version` → version). One GET each; a versioned hit feeds CVE,
 - **silent binary-protocol probes** for services that never send a banner:
   AJP13 (CPing/CPong, Ghostcat surface), distcc on 3632 (read-only behavioural
   probe, CVE-2004-2687 unrestricted-exec exposure), plus unauthenticated
