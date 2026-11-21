@@ -586,6 +586,165 @@ async def kubelet_probe(host: str, port: int, timeout: float, tls: bool):
     return None
 
 
+# ---------------------------------------------------------------------------
+# UDP exposure probes (SNMP, IPMI). Both are single-packet, read-only requests
+# over UDP. A shared datagram helper sends one payload and waits for one reply;
+# a closed port (ICMP unreachable) resolves fast rather than blocking the whole
+# timeout, and nothing is ever written/SET on the target.
+# ---------------------------------------------------------------------------
+async def _udp_query(host: str, port: int, payload: bytes,
+                     timeout: float) -> bytes:
+    """Send one UDP datagram, return the first reply (b'' on timeout/error)."""
+    loop = asyncio.get_event_loop()
+    got = loop.create_future()
+
+    class _P(asyncio.DatagramProtocol):
+        def datagram_received(self, data, addr):  # noqa: ARG002
+            if not got.done():
+                got.set_result(data)
+
+        def error_received(self, exc):  # noqa: ARG002
+            if not got.done():
+                got.set_result(b"")    # ICMP port-unreachable -> give up fast
+
+    try:
+        transport, _ = await asyncio.wait_for(
+            loop.create_datagram_endpoint(_P, remote_addr=(host, port)),
+            timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return b""
+    try:
+        transport.sendto(payload)
+        try:
+            return await asyncio.wait_for(got, timeout=timeout)
+        except asyncio.TimeoutError:
+            return b""
+    finally:
+        transport.close()
+
+
+# --- SNMP (UDP 161). A GetRequest for sysDescr.0 answered with the community we
+# sent means the agent is readable with a well-known community string -- a full
+# read of the device's configuration surface. We hand-build the ASN.1/BER packet
+# (no pysnmp dependency) and try v2c then v1 for "public"/"private" at once.
+def _ber_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(b)]) + b
+
+
+def _ber_tlv(tag: int, value: bytes) -> bytes:
+    return bytes([tag]) + _ber_len(len(value)) + value
+
+
+def _ber_int(n: int) -> bytes:
+    if n == 0:
+        body = b"\x00"
+    else:
+        body = n.to_bytes((n.bit_length() // 8) + 1, "big")
+        while len(body) > 1 and body[0] == 0 and not (body[1] & 0x80):
+            body = body[1:]
+    return _ber_tlv(0x02, body)
+
+
+def _ber_oid(parts: tuple) -> bytes:
+    body = bytes([40 * parts[0] + parts[1]])
+    for p in parts[2:]:
+        if p < 0x80:
+            body += bytes([p])
+        else:
+            chunks = []
+            while p:
+                chunks.insert(0, p & 0x7F)
+                p >>= 7
+            for i in range(len(chunks) - 1):
+                chunks[i] |= 0x80
+            body += bytes(chunks)
+    return _ber_tlv(0x06, body)
+
+
+def _ber_split(value: bytes) -> list:
+    """Split one constructed BER value into its [(tag, content), ...] children."""
+    out, i = [], 0
+    while i + 1 < len(value):
+        tag = value[i]
+        l = value[i + 1]
+        i += 2
+        if l & 0x80:
+            nb = l & 0x7F
+            l = int.from_bytes(value[i:i + nb], "big")
+            i += nb
+        out.append((tag, value[i:i + l]))
+        i += l
+    return out
+
+
+_SYSDESCR_OID = (1, 3, 6, 1, 2, 1, 1, 1, 0)
+_SNMP_COMMUNITIES = ("public", "private")
+
+
+def _snmp_get(community: str, oid: tuple, version: int, reqid: int) -> bytes:
+    """Build an SNMP GetRequest (version 1 == v2c, 0 == v1)."""
+    varbind = _ber_tlv(0x30, _ber_oid(oid) + b"\x05\x00")       # OID + NULL value
+    pdu = _ber_tlv(0xA0,                                        # 0xA0 GetRequest
+                   _ber_int(reqid) + _ber_int(0) + _ber_int(0)  # id, errstat, erridx
+                   + _ber_tlv(0x30, varbind))                   # varbind list
+    msg = _ber_int(version) + _ber_tlv(0x04, community.encode()) + pdu
+    return _ber_tlv(0x30, msg)
+
+
+def _snmp_sysdescr(data: bytes) -> str | None:
+    """Pull sysDescr out of a GetResponse (error-status 0). None if not one."""
+    try:
+        top = _ber_split(data)
+        if not top or top[0][0] != 0x30:
+            return None
+        msg = _ber_split(top[0][1])                 # [version, community, pdu]
+        pdu = next((c for (t, c) in msg if t == 0xA2), None)   # 0xA2 GetResponse
+        if pdu is None:
+            return None
+        parts = _ber_split(pdu)                     # id, errstat, erridx, vbl
+        if len(parts) < 4:
+            return None
+        if parts[1][1] and int.from_bytes(parts[1][1], "big") != 0:
+            return None                             # error-status != 0
+        vbs = _ber_split(parts[3][1])
+        if not vbs:
+            return None
+        vb = _ber_split(vbs[0][1])                  # [oid, value]
+        if len(vb) < 2:
+            return None
+        return vb[1][1].decode("latin-1", "replace").strip()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def snmp_probe(host: str, port: int, timeout: float,
+                     communities=_SNMP_COMMUNITIES):
+    """SNMP sysDescr.0 read. Returns {community, sysdescr, version} on a reply
+    with a well-known community, else None. All attempts race in parallel so the
+    whole probe is bounded by a single (short) timeout."""
+    t = min(timeout, 3.0)
+    attempts = [(c, v) for c in communities for v in (1, 0)]   # v2c then v1
+
+    async def one(comm: str, ver: int):
+        data = await _udp_query(host, port,
+                                _snmp_get(comm, _SYSDESCR_OID, ver, 0x01020304), t)
+        if not data:
+            return None
+        sd = _snmp_sysdescr(data)
+        if sd is not None:
+            return {"community": comm, "sysdescr": sd,
+                    "version": "2c" if ver == 1 else "1"}
+        return None
+
+    for r in await asyncio.gather(*(one(c, v) for c, v in attempts)):
+        if r:
+            return r
+    return None
+
+
 _REDIS_PORTS = {6379, 6380}
 _MEMCACHED_PORTS = {11211}
 _MONGO_PORTS = {27017, 27018, 27019}
@@ -1687,7 +1846,7 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "onvif-unauth", "onvif-default-creds",
                       "camera-snapshot-unauth",
                       "cam-cgi-unauth", "cam-cgi-default-creds",
-                      "grpc-reflection-exposed"}
+                      "grpc-reflection-exposed", "snmp-unauth"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -2052,6 +2211,39 @@ async def run_exposure_checks(cfg: ScanConfig, host: str,
             + "; ".join(b for b in bits if b)
             + ". The device advertises its type/name/location and the "
               "device_service URL without authentication."})
+
+    def _udp_svc(port: int, name: str) -> Service:
+        s = next((s for s in services
+                  if s.port == port and s.proto == "udp"), None)
+        if s is None:
+            s = Service(port=port, proto="udp", state="open", name=name)
+            services.append(s)
+        if "exposure" not in s.sources:
+            s.sources.append("exposure")
+        return s
+
+    # Host-level SNMP (UDP 161). Runs once per host regardless of UDP scanning,
+    # since 161 is rarely in a default TCP scan. A GetRequest answered with a
+    # well-known community string is a full read of the device over SNMP.
+    try:
+        snmp = await snmp_probe(host, 161, cfg.timeout)
+    except Exception:  # noqa: BLE001
+        snmp = None
+    if snmp:
+        svc = _udp_svc(161, "snmp")
+        if not svc.product:
+            svc.product = "SNMP agent"
+        svc.confidence = "high"
+        svc.extrainfo = f"UNAUTHENTICATED (community \"{snmp['community']}\")"
+        one_line = " ".join(snmp["sysdescr"].split())[:300]
+        svc.scripts.append({"id": "snmp-unauth", "output":
+            f"SNMP agent readable with the well-known community "
+            f"\"{snmp['community']}\" (SNMP v{snmp['version']}): a GetRequest for "
+            f"sysDescr.0 returned \"{one_line}\". The whole MIB -- interfaces, ARP "
+            f"and routing tables, running processes, and on many devices "
+            f"credentials -- is readable, and a writable community additionally "
+            f"allows configuration changes. Change the community strings, restrict "
+            f"SNMP to a management network, or move to SNMPv3 with auth+priv."})
 
     hits = [s for s in services
             if any(sc.get("id", "") in EXPOSURE_ALERT_IDS for sc in s.scripts)]

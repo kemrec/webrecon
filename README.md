@@ -312,6 +312,14 @@ nmap's result and, for every under-identified port, adds:
   reader are needed — no gRPC library. `grpcurl`/`grpcio` are used only as an
   optional fallback if the native client can't complete the exchange. Scoped to
   gRPC ports so HTTPS/2 web ports are never mislabelled. Read-only (list only).
+- **SNMP** (UDP 161): a hand-built (no `pysnmp` dependency) `GetRequest` for
+  `sysDescr.0` with the well-known community strings `public`/`private`, over
+  both SNMP v2c and v1. A reply is a **critical** finding — the whole MIB
+  (interfaces, ARP/routing tables, processes, and on many devices credentials)
+  is readable, and a writable community also allows configuration changes. The
+  recovered `sysDescr` is included. Run once per host (161 is rarely in a default
+  TCP scan); the four attempts race so the probe is bounded by one short timeout.
+  Read-only (`GET` only, never `SET`).
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully
