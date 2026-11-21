@@ -156,6 +156,18 @@ def _as_nse_scripts(v):
     return s
 
 
+def _as_str_or_none(v):
+    # An opaque operator-supplied token (e.g. the NVD API key): a scan-semantics
+    # value handed to an HTTPS request header, never a filesystem or subprocess
+    # path. Empty -> None (unset).
+    s = str(v).strip()
+    if not s:
+        return None
+    if len(s) > 256:
+        raise ValueError("value too long")
+    return s
+
+
 _ALLOWED = {
     "ports":         ("ports", _as_ports),
     "use_nmap":      ("use_nmap", _as_bool),
@@ -169,6 +181,12 @@ _ALLOWED = {
     "realm":         ("realm", _as_realm),
     "scan_rate":     ("scan_rate", _as_int_or_none),
     "cve":           ("cve", _as_bool),
+    # cve-correlation sources (each a feed that can be toggled off) + optional key
+    "nvd":           ("nvd", _as_bool),
+    "osv":           ("osv", _as_bool),
+    "epss":          ("epss", _as_bool),
+    "kev":           ("kev", _as_bool),
+    "nvd_api_key":   ("nvd_api_key", _as_str_or_none),
     "min_cvss":      ("min_cvss", lambda v: float(v) if v not in (None, "") else 0.0),
     "kev_high_only": ("kev_high_only", _as_bool),
     "exploits":      ("exploits", _as_bool),

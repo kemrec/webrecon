@@ -112,6 +112,16 @@
         <label class="inline"><input type="checkbox" id="render"> render web roots (JS)</label>
       </div>
       <div class="row">
+        <span class="muted" style="font-size:12px;">CVE sources:</span>
+        <label class="inline"><input type="checkbox" id="nvd" checked> NVD</label>
+        <label class="inline"><input type="checkbox" id="osv" checked> OSV</label>
+        <label class="inline"><input type="checkbox" id="epss" checked> EPSS</label>
+        <label class="inline"><input type="checkbox" id="kev" checked> KEV</label>
+        <label>NVD API key
+          <input type="text" id="nvd_api_key" placeholder="optional, raises rate limit">
+        </label>
+      </div>
+      <div class="row">
         <label class="inline"><input type="checkbox" id="web"> web chain (crawl web ports)</label>
         <label class="inline"><input type="checkbox" id="web_render"> chain JS render</label>
         <label>depth
@@ -181,6 +191,14 @@ function buildQuery() {
   }
   p.set("udp", $("udp").checked);
   p.set("cve", $("cve").checked);
+  if ($("cve").checked) {            // CVE-source feeds only matter when CVE is on
+    p.set("nvd", $("nvd").checked);
+    p.set("osv", $("osv").checked);
+    p.set("epss", $("epss").checked);
+    p.set("kev", $("kev").checked);
+    const key = $("nvd_api_key").value.trim();
+    if (key) p.set("nvd_api_key", key);
+  }
   p.set("exploits", $("exploits").checked);
   p.set("render", $("render").checked);
   const mc = parseFloat($("min_cvss").value);
