@@ -761,11 +761,196 @@ async def rtsp_try_default_creds(host: str, port: int, timeout: float,
     return None
 
 
+# ---------------------------------------------------------------------------
+# ONVIF (IP cameras / NVRs). SOAP over HTTP at /onvif/device_service. ONVIF's
+# GetSystemDateAndTime is unauthenticated BY SPEC (clients need the device clock
+# to build a WS-UsernameToken), so it is a clean read-only presence+time probe.
+# GetDeviceInformation needs auth: unauthenticated it returns the device make/
+# model (misconfig) or a SOAP Fault (gated). On a gated device we optionally try
+# the same tiny default-credential list via a WS-UsernameToken PasswordDigest.
+# ---------------------------------------------------------------------------
+_ONVIF_PATH = "/onvif/device_service"
+_ONVIF_PORTS = {8000, 8899, 2020, 8081, 10080}   # common ONVIF-only HTTP ports
+_ONVIF_DEV_NS = "http://www.onvif.org/ver10/device/wsdl"
+_ONVIF_DEVINFO_RX = {
+    "manufacturer": re.compile(r"<[^>]*Manufacturer>([^<]+)<", re.I),
+    "model": re.compile(r"<[^>]*Model>([^<]+)<", re.I),
+    "firmware": re.compile(r"<[^>]*FirmwareVersion>([^<]+)<", re.I),
+    "serial": re.compile(r"<[^>]*SerialNumber>([^<]+)<", re.I),
+}
+# ONVIF orders UTCDateTime as Time(Hour,Minute,Second) THEN Date(Year,Month,Day),
+# so parse each field independently inside the block rather than assuming order.
+_ONVIF_UTC_BLOCK = re.compile(r"UTCDateTime[^>]*>(.*?)</[^>]*UTCDateTime>",
+                              re.I | re.S)
+
+
+def _onvif_utc_created(body: str) -> str:
+    mb = _ONVIF_UTC_BLOCK.search(body)
+    if not mb:
+        return ""
+    blk = mb.group(1)
+    def f(name):
+        m = re.search(rf"<[^>]*{name}>\s*(\d+)\s*<", blk, re.I)
+        return int(m.group(1)) if m else None
+    y, mo, d, hh, mm, ss = (f("Year"), f("Month"), f("Day"),
+                            f("Hour"), f("Minute"), f("Second"))
+    if None in (y, mo, d, hh, mm, ss):
+        return ""
+    return f"{y:04d}-{mo:02d}-{d:02d}T{hh:02d}:{mm:02d}:{ss:02d}Z"
+
+
+async def _http_post_once(host: str, port: int, path: str, body: bytes,
+                          timeout: float, tls: bool = False,
+                          content_type: str = "application/soap+xml; charset=utf-8",
+                          nbytes: int = 32768):
+    """Raw HTTP/1.0 POST. Returns (status, headers, body:bytes) or None.
+    Read-only in effect (ONVIF GET-style SOAP calls); no redirects, no TLS verify."""
+    ctx = None
+    if tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    raw = b""
+    try:
+        req = (f"POST {path} HTTP/1.0\r\nHost: {host}\r\n"
+               f"User-Agent: servicescan\r\nContent-Type: {content_type}\r\n"
+               f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
+        writer.write(req + body)
+        await writer.drain()
+        try:
+            while len(raw) < nbytes:
+                chunk = await asyncio.wait_for(reader.read(nbytes), timeout=timeout)
+                if not chunk:
+                    break
+                raw += chunk
+        except asyncio.TimeoutError:
+            pass
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+    if not raw.startswith(b"HTTP/"):
+        return None
+    head, _, rbody = raw.partition(b"\r\n\r\n")
+    try:
+        status = int(head.split(b"\r\n")[0].split(b" ")[1])
+    except (IndexError, ValueError):
+        return None
+    return status, {}, rbody
+
+
+def _onvif_envelope(body_inner: str, header: str = "") -> bytes:
+    hdr = f"<s:Header>{header}</s:Header>" if header else ""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+        f'{hdr}<s:Body>{body_inner}</s:Body></s:Envelope>'
+    ).encode()
+
+
+def _onvif_ws_security(user: str, pw: str, created: str) -> str:
+    """WS-UsernameToken with PasswordDigest = Base64(SHA1(nonce+created+pass))."""
+    import base64
+    import hashlib
+    import os as _os
+    nonce = _os.urandom(16)
+    digest = base64.b64encode(
+        hashlib.sha1(nonce + created.encode() + pw.encode()).digest()).decode()
+    wsse = ("http://docs.oasis-open.org/wss/2004/01/"
+            "oasis-200401-wss-wssecurity-secext-1.0.xsd")
+    wsu = ("http://docs.oasis-open.org/wss/2004/01/"
+           "oasis-200401-wss-wssecurity-utility-1.0.xsd")
+    pt = ("http://docs.oasis-open.org/wss/2004/01/"
+          "oasis-200401-wss-username-token-profile-1.0#PasswordDigest")
+    et = ("http://docs.oasis-open.org/wss/2004/01/"
+          "oasis-200401-wss-soap-message-security-1.0#Base64Binary")
+    return (
+        f'<Security s:mustUnderstand="1" xmlns="{wsse}"><UsernameToken>'
+        f'<Username>{user}</Username>'
+        f'<Password Type="{pt}">{digest}</Password>'
+        f'<Nonce EncodingType="{et}">{base64.b64encode(nonce).decode()}</Nonce>'
+        f'<Created xmlns="{wsu}">{created}</Created>'
+        f'</UsernameToken></Security>'
+    )
+
+
+def _parse_onvif_devinfo(body: bytes) -> dict:
+    text = body.decode("latin-1", "replace")
+    out = {}
+    for key, rx in _ONVIF_DEVINFO_RX.items():
+        m = rx.search(text)
+        if m:
+            out[key] = m.group(1).strip()
+    return out
+
+
+async def onvif_probe(host: str, port: int, timeout: float,
+                      tls: bool = False) -> dict | None:
+    """Read-only ONVIF recon. None if not ONVIF, else {created, unauth(bool),
+    device{...}, auth(bool)}. GetSystemDateAndTime confirms ONVIF + gives the
+    device clock; an unauthenticated GetDeviceInformation reveals make/model
+    (misconfig) or faults (gated)."""
+    dt = await _http_post_once(host, port, _ONVIF_PATH,
+        _onvif_envelope(f'<GetSystemDateAndTime xmlns="{_ONVIF_DEV_NS}"/>'),
+        timeout, tls)
+    if dt is None:
+        return None
+    body = dt[2].decode("latin-1", "replace")
+    if "SystemDateAndTime" not in body and "onvif.org/ver10/device" not in body:
+        return None                              # not an ONVIF device_service
+    created = _onvif_utc_created(body)
+    info = {"created": created, "unauth": False, "device": {}, "auth": False}
+    gi = await _http_post_once(host, port, _ONVIF_PATH,
+        _onvif_envelope(f'<GetDeviceInformation xmlns="{_ONVIF_DEV_NS}"/>'),
+        timeout, tls)
+    if gi is not None:
+        gbody = gi[2]
+        dev = _parse_onvif_devinfo(gbody)
+        if gi[0] == 200 and dev:
+            info["unauth"], info["device"] = True, dev
+        elif b"Fault" in gbody or gi[0] in (400, 401):
+            info["auth"] = True
+    return info
+
+
+async def onvif_try_default_creds(host: str, port: int, timeout: float,
+                                  info: dict, tls: bool = False):
+    """Try the default-credential list with a WS-UsernameToken GetDeviceInformation.
+    Returns ('user:pass', device_dict) on success, else None. Active step."""
+    created = info.get("created") or _utcnow_iso()
+    for user, pw in _RTSP_DEFAULT_CREDS:
+        env = _onvif_envelope(
+            f'<GetDeviceInformation xmlns="{_ONVIF_DEV_NS}"/>',
+            _onvif_ws_security(user, pw, created))
+        r = await _http_post_once(host, port, _ONVIF_PATH, env, timeout, tls)
+        if r and r[0] == 200:
+            dev = _parse_onvif_devinfo(r[2])
+            if dev:
+                return f"{user}:{pw or '<blank>'}", dev
+    return None
+
+
+def _utcnow_iso() -> str:
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
 # script ids that mark a confirmed unauthenticated/anonymous exposure (critical)
 EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "elasticsearch-unauth", "couchdb-unauth",
                       "docker-api-unauth", "etcd-unauth", "kubelet-anon",
-                      "rtsp-unauth", "rtsp-default-creds"}
+                      "rtsp-unauth", "rtsp-default-creds",
+                      "onvif-unauth", "onvif-default-creds"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -853,7 +1038,7 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                     f"RTSP detected{banner}; authentication enforced "
                     f"({info['auth']}{realm}). Unauthenticated DESCRIBE was "
                     f"refused (401)."})
-                if getattr(cfg, "rtsp_creds", True):
+                if getattr(cfg, "cam_creds", True):
                     hit = await rtsp_try_default_creds(host, port, cfg.timeout,
                                                        info)
                     if hit:
@@ -933,6 +1118,60 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 f"via /exec and /run, run commands inside containers on this node. "
                 f"Set --anonymous-auth=false and --authorization-mode=Webhook, "
                 f"firewall {port}.")
+        return
+
+    # ONVIF rides HTTP (no dedicated port of its own in most deployments), so it
+    # is checked on any web service or a known ONVIF-only port. A single SOAP
+    # POST to /onvif/device_service confirms or rules it out.
+    if is_web_service(svc) or port in _ONVIF_PORTS:
+        info = await onvif_probe(host, port, cfg.timeout, tls=is_tls_service(svc))
+        if info is not None:
+            if not svc.name:
+                svc.name = "onvif"
+            dev = info.get("device", {})
+            label = " ".join(v for v in (dev.get("manufacturer"),
+                                         dev.get("model")) if v)
+            if label and not svc.product:
+                svc.product = label
+            if dev.get("firmware") and not svc.version:
+                svc.version = _norm_ver(dev["firmware"]) or svc.version
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            if info["unauth"]:
+                svc.confidence = "high"
+                svc.extrainfo = "UNAUTHENTICATED ONVIF device info"
+                svc.scripts.append({"id": "onvif-unauth", "output":
+                    f"ONVIF GetDeviceInformation answered WITHOUT authentication "
+                    f"({label or 'device'}): make/model/firmware/serial are "
+                    f"exposed and the camera's control surface is likely "
+                    f"unauthenticated. Require WS-Security on {port}."})
+            elif info["auth"]:
+                svc.scripts.append({"id": "onvif-auth", "output":
+                    "ONVIF device detected; GetDeviceInformation requires "
+                    "authentication (WS-UsernameToken)."})
+                if getattr(cfg, "cam_creds", True):
+                    hit = await onvif_try_default_creds(
+                        host, port, cfg.timeout, info, tls=is_tls_service(svc))
+                    if hit:
+                        creds, dev2 = hit
+                        lbl2 = " ".join(v for v in (dev2.get("manufacturer"),
+                                                    dev2.get("model")) if v)
+                        if lbl2 and (not svc.product or svc.product == "RTSP"):
+                            svc.product = lbl2
+                        if dev2.get("firmware") and not svc.version:
+                            svc.version = _norm_ver(dev2["firmware"]) or svc.version
+                        svc.confidence = "high"
+                        svc.extrainfo = f"DEFAULT CREDENTIALS ({creds})"
+                        svc.scripts.append({"id": "onvif-default-creds", "output":
+                            f"ONVIF accepts DEFAULT credentials {creds}: a "
+                            f"WS-UsernameToken GetDeviceInformation returned the "
+                            f"device info ({lbl2 or 'device'}). An attacker gains "
+                            f"the camera's management API (media URIs, users, "
+                            f"PTZ). Change the password immediately."})
+            else:
+                svc.scripts.append({"id": "onvif-info", "output":
+                    "ONVIF device_service detected (GetSystemDateAndTime "
+                    "answered); device-info access undetermined."})
         return
 
 

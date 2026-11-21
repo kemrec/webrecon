@@ -266,9 +266,19 @@ nmap's result and, for every under-identified port, adds:
   gated one (`401` → the auth scheme/realm is recorded). On a gated stream it
   also tries a tiny list of factory-default credentials (`admin:admin`,
   `root:root`, …) over Basic **and** Digest; an accepted default is a critical
-  finding. Nothing is ever `PLAY`ed or recorded. The default-credential step is
-  the only active one — disable it with `--no-rtsp-creds` to stay fully
-  read-only.
+  finding. Nothing is ever `PLAY`ed or recorded.
+- **ONVIF camera checks** (any web port or a common ONVIF port): a SOAP
+  `GetSystemDateAndTime` (unauthenticated by spec) confirms an ONVIF
+  `device_service` and reads the device clock; an unauthenticated
+  `GetDeviceInformation` either returns make/model/firmware/serial (**critical**
+  misconfiguration) or faults (gated). On a gated device it tries the same
+  factory-default list via a WS-UsernameToken `PasswordDigest`; an accepted
+  default exposes the camera's management API (media URIs, users, PTZ) and is
+  critical. Read-only SOAP calls only.
+
+The camera default-credential attempt (RTSP + ONVIF) is the one active step;
+disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully
+read-only run.
 
 Evidence is merged by confidence, so nmap's good answers are kept and only the
 gaps get filled. The result is strictly **≥ nmap** on version coverage — not a
@@ -314,7 +324,7 @@ servicescan host --fp-all                 # fingerprint every open port, not jus
 servicescan host --no-cve                 # service/version detection only
 servicescan host --min-cvss 7             # only show CVSS >= 7.0
 servicescan host --kev-high               # reports show only KEV or HIGH/CRITICAL (scan.json keeps all)
-servicescan 10.0.0.5 -p 554 --no-rtsp-creds # RTSP camera recon, read-only (no default-cred test)
+servicescan 10.0.0.5 --no-cam-creds       # camera recon (RTSP+ONVIF) read-only, no default-cred test
 servicescan host --no-epss --no-kev       # CVEs only, skip risk enrichment
 servicescan host --no-nmap -p 80,443,8080 # fingerprint-only, no nmap
 servicescan host --exploits               # map CVEs to public exploits/PoCs
@@ -374,7 +384,7 @@ the spec itself. Results group per host in the console, in `scan.json`
 each host gets its own `web/<ip>/<port>-<scheme>/` output subtree.
 
 Key flags: `-iL/--target-file`, `-p/--ports`, `--top-ports`, `--rate` (nmap `--min-rate`),
-`--no-nmap`, `--udp`, `--nse`, `--nse-scripts`, `--fp-all`, `--render`, `--no-rtsp-creds`, `--no-cve`,
+`--no-nmap`, `--udp`, `--nse`, `--nse-scripts`, `--fp-all`, `--render`, `--no-cam-creds`, `--no-cve`,
 `--no-nvd`, `--no-osv`, `--no-epss`, `--no-kev`, `--exploits`, `--nvd-api-key`,
 `--min-cvss`, `--kev-high`, `--no-cache`, `--cache-ttl`, `--web`, `--full`, `--web-render`,
 `--web-depth`, `--web-max-pages`, `--write-hosts`, `-c/--concurrency`,
