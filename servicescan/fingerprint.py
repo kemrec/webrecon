@@ -1317,6 +1317,153 @@ async def wsdiscovery_probe(host: str, port: int, timeout: float) -> dict | None
     return _parse_wsd(text)
 
 
+# ---------------------------------------------------------------------------
+# gRPC (HTTP/2). Modern device/service control planes expose gRPC; nmap usually
+# leaves these ports unidentified ("tcpwrapped"). Detection is dependency-free:
+# over TLS we offer ALPN and check for a negotiated "h2"; cleartext we send the
+# HTTP/2 connection preface and look for a SETTINGS frame (h2c). The real prize
+# is server reflection -- an unauthenticated client can enumerate every service
+# and method (the gRPC analogue of an open Swagger). Reflection/health enum uses
+# grpcurl (if on PATH) or grpcio (lazy import) when available; otherwise we still
+# report the HTTP/2 detection and say which tool to install. Scoped to common
+# gRPC ports / `grpc`-named services so HTTPS/2 web ports are never mislabelled.
+# ---------------------------------------------------------------------------
+_GRPC_PORTS = {50051, 6565, 9090, 8980, 9000, 7070}
+_H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+
+def _h2_frame(ftype: int, stream: int, payload: bytes = b"") -> bytes:
+    return (len(payload).to_bytes(3, "big") + bytes([ftype]) + b"\x00"
+            + (stream & 0x7FFFFFFF).to_bytes(4, "big") + payload)
+
+
+def _is_h2_settings(data: bytes) -> bool:
+    """True if the bytes begin with an HTTP/2 SETTINGS frame on stream 0."""
+    return (len(data) >= 9 and data[3] == 0x04
+            and int.from_bytes(data[5:9], "big") & 0x7FFFFFFF == 0)
+
+
+async def _grpc_h2c_detect(host: str, port: int, timeout: float) -> bool:
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        writer.write(_H2_PREFACE + _h2_frame(0x04, 0))   # preface + empty SETTINGS
+        await writer.drain()
+        data = b""
+        while len(data) < 9:
+            chunk = await asyncio.wait_for(reader.read(64), timeout=timeout)
+            if not chunk:
+                break
+            data += chunk
+        return _is_h2_settings(data)
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+
+
+async def _grpc_h2_alpn_detect(host: str, port: int, timeout: float) -> bool:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        sslobj = writer.get_extra_info("ssl_object")
+        return bool(sslobj) and sslobj.selected_alpn_protocol() == "h2"
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+
+
+async def grpc_probe(host: str, port: int, timeout: float,
+                     tls: bool) -> dict | None:
+    """Dependency-free HTTP/2 detection. None if the port is not HTTP/2, else
+    {transport}. TLS uses ALPN; cleartext uses the h2c preface."""
+    if tls:
+        return {"transport": "h2 (ALPN, TLS)"} if await _grpc_h2_alpn_detect(
+            host, port, timeout) else None
+    return {"transport": "h2c (cleartext)"} if await _grpc_h2c_detect(
+        host, port, timeout) else None
+
+
+def _parse_grpcurl_list(text: str) -> list[str]:
+    """Service names from `grpcurl ... list` stdout (one dotted name per line)."""
+    out = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if ln and "." in ln and " " not in ln and "\t" not in ln:
+            out.append(ln)
+    return out
+
+
+async def _grpc_list_via_grpcio(host: str, port: int, timeout: float,
+                                tls: bool):
+    try:
+        import grpc
+        from grpc_reflection.v1alpha.proto_reflection_descriptor_database \
+            import ProtoReflectionDescriptorDatabase
+    except Exception:  # noqa: BLE001
+        return None
+
+    def blocking():
+        target = f"{host}:{port}"
+        channel = (grpc.secure_channel(target, grpc.ssl_channel_credentials())
+                   if tls else grpc.insecure_channel(target))
+        try:
+            return list(ProtoReflectionDescriptorDatabase(channel).get_services())
+        finally:
+            channel.close()
+
+    loop = asyncio.get_event_loop()
+    return await asyncio.wait_for(
+        loop.run_in_executor(None, blocking), timeout=timeout + 2)
+
+
+async def grpc_list_services(host: str, port: int, timeout: float,
+                             tls: bool) -> dict | None:
+    """Enumerate gRPC services via reflection. Returns {tool, services} when a
+    tool is available (services empty = reflection off/auth), or None when
+    neither grpcurl nor grpcio is installed. Read-only (list only)."""
+    import shutil
+    gc = shutil.which("grpcurl")
+    if gc:
+        args = [gc, "-max-time", str(max(1, int(timeout))),
+                "-insecure" if tls else "-plaintext", f"{host}:{port}", "list"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE)
+            out, _err = await asyncio.wait_for(proc.communicate(),
+                                               timeout=timeout + 2)
+        except Exception:  # noqa: BLE001
+            return {"tool": "grpcurl", "services": []}
+        return {"tool": "grpcurl",
+                "services": _parse_grpcurl_list(out.decode("utf-8", "replace"))}
+    try:
+        svcs = await _grpc_list_via_grpcio(host, port, timeout, tls)
+    except Exception:  # noqa: BLE001
+        return {"tool": "grpcio", "services": []}
+    return {"tool": "grpcio", "services": svcs} if svcs is not None else None
+
+
 # script ids that mark a confirmed unauthenticated/anonymous exposure (critical)
 EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "elasticsearch-unauth", "couchdb-unauth",
@@ -1324,7 +1471,8 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "rtsp-unauth", "rtsp-default-creds",
                       "onvif-unauth", "onvif-default-creds",
                       "camera-snapshot-unauth",
-                      "cam-cgi-unauth", "cam-cgi-default-creds"}
+                      "cam-cgi-unauth", "cam-cgi-default-creds",
+                      "grpc-reflection-exposed"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -1496,6 +1644,39 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 f"via /exec and /run, run commands inside containers on this node. "
                 f"Set --anonymous-auth=false and --authorization-mode=Webhook, "
                 f"firewall {port}.")
+        return
+
+    # gRPC / HTTP2 on a dedicated gRPC port (or a `grpc`-named service). Scoped
+    # this way so HTTPS/2 web ports (also "h2") are never mislabelled as gRPC.
+    if port in _GRPC_PORTS or "grpc" in name:
+        tlsd = is_tls_service(svc)
+        det = await grpc_probe(host, port, cfg.timeout, tlsd)
+        if det is not None:
+            if not svc.name:
+                svc.name = "grpc"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            refl = await grpc_list_services(host, port, cfg.timeout, tlsd)
+            if refl and refl.get("services"):
+                svc.confidence = "high"
+                if not svc.product:
+                    svc.product = "gRPC"
+                svc.extrainfo = "gRPC server reflection ENABLED"
+                svc.scripts.append({"id": "grpc-reflection-exposed", "output":
+                    f"gRPC server reflection is ENABLED without authentication "
+                    f"(via {refl['tool']}, transport {det['transport']}): the "
+                    f"full service/method surface is enumerable. Services: "
+                    f"{', '.join(refl['services'])}. Disable reflection on "
+                    f"exposed deployments and require per-RPC authentication."})
+            else:
+                if refl is not None:
+                    note = ("server reflection is disabled or requires "
+                            "authentication")
+                else:
+                    note = "install grpcurl or grpcio to enumerate services"
+                svc.scripts.append({"id": "grpc-detected", "output":
+                    f"gRPC/HTTP2 server detected (transport {det['transport']}); "
+                    f"{note}."})
         return
 
     # ONVIF rides HTTP (no dedicated port of its own in most deployments), so it

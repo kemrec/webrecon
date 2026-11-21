@@ -301,6 +301,15 @@ nmap's result and, for every under-identified port, adds:
   fed to CVE correlation) is **critical**. The cred test is self-limiting — a path
   the device doesn't implement `404`s, so defaults are only tried against the API
   the device actually speaks — and is governed by the same `--no-cam-creds` switch.
+- **gRPC / HTTP2** (dedicated gRPC ports — 50051/6565/9090/… — or a `grpc`-named
+  service): dependency-free detection (TLS ALPN `h2`, or the cleartext h2c
+  preface → SETTINGS frame). The real finding is **server reflection enabled
+  without authentication**, which lets anyone enumerate every service and method
+  (the gRPC analogue of an open Swagger) — reported as critical with the service
+  list. Reflection/health enumeration uses `grpcurl` (if on `PATH`) or `grpcio`
+  (lazy import) when present; otherwise the HTTP/2 detection is still reported
+  with a note on which tool to install. Scoped to gRPC ports so HTTPS/2 web ports
+  are never mislabelled. Read-only (list only).
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully
