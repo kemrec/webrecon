@@ -790,7 +790,8 @@ Opening `http://127.0.0.1:8787/` serves a single, self-contained **vanilla
 HTML/JS page** (no framework, no build step): a target + options form, a
 per-host service table with CVEs, unauthenticated-exposure findings highlighted
 in red (the page pulls the alert-id list from `/api/alert-ids` so it never
-drifts from the engine), and **Download scan.json / scan.sarif** buttons.
+drifts from the engine), and a **Download** control with a format picker
+(scan.json, SARIF, CSV, JSONL, HTML report, nuclei target lists, …).
 
 It binds to **localhost** on purpose: the API launches scans against whatever
 target the caller names, so it must not be reachable by untrusted clients. A
@@ -802,8 +803,17 @@ API:
 - `GET  /api/health` → `{"ok": true, "service": "webrecon-ui"}`
 - `GET  /api/alert-ids` → the set of script ids that are unauthenticated-breach
   alerts (vs informational), for the page's exposure highlighting
-- `POST /api/scan` → `scan.json`-shaped result (`ScanResult.to_dict()`)
+- `POST /api/scan` → `scan.json`-shaped result plus a `scan_id`
 - `POST /api/scan.sarif` → SARIF 2.1.0 document (same as `scan.sarif`)
+- `GET  /api/export/<scan_id>/<fmt>` → one output file for that scan, as a
+  download. `<fmt>` is one of `json`, `sarif`, `services-csv`, `cves-csv`,
+  `jsonl`, `html`, `nuclei-web`, `nuclei-net`, `services-txt`, `cves-txt`
+
+So the console offers **every servicescan output format** (not just JSON/SARIF):
+each completed scan is cached server-side under its `scan_id`, and an export is
+rendered from that same scan via `report.write_all` (reusing every existing
+writer verbatim — no re-scan, no duplicated formatting logic). The cache is a
+small bounded LRU, fitting the single-operator, localhost nature of the tool.
 
 The POST body is a JSON object. Only an allowlisted subset of options is
 honoured — `target` (required; string or list), `ports`, `use_nmap`,

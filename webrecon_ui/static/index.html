@@ -25,7 +25,7 @@
   .row { display:flex; flex-wrap:wrap; gap:14px 18px; align-items:center; }
   label { color:var(--muted); font-size:12px; display:flex; flex-direction:column; gap:4px; }
   label.inline { flex-direction:row; align-items:center; gap:6px; color:var(--fg); font-size:13px; }
-  input[type=text], input[type=number] {
+  input[type=text], input[type=number], select {
     background:var(--bg); border:1px solid var(--line); color:var(--fg);
     border-radius:6px; padding:8px 10px; font:inherit; min-width:120px; }
   input#target { min-width:320px; }
@@ -106,15 +106,29 @@
 
   <div id="results"></div>
   <div id="downloads" class="dl" hidden>
-    <button class="ghost" id="dl-json">Download scan.json</button>
-    <button class="ghost" id="dl-sarif">Download scan.sarif</button>
+    <label class="inline">Download
+      <select id="fmt">
+        <option value="json">scan.json</option>
+        <option value="sarif">scan.sarif</option>
+        <option value="services-csv">services.csv</option>
+        <option value="cves-csv">cves.csv</option>
+        <option value="jsonl">scan.jsonl</option>
+        <option value="html">report.html</option>
+        <option value="nuclei-web">nuclei-targets.txt (web)</option>
+        <option value="nuclei-net">nuclei-targets-net.txt</option>
+        <option value="services-txt">services.txt</option>
+        <option value="cves-txt">cves.txt</option>
+      </select>
+    </label>
+    <button class="ghost" id="dl-go">Download</button>
+    <span id="dl-note" class="muted"></span>
   </div>
 </main>
 
 <script>
 "use strict";
 let ALERT_IDS = new Set();
-let lastBody = null, lastResult = null;
+let scanId = null;
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, txt) => { const e = document.createElement(tag);
@@ -233,11 +247,26 @@ function setStatus(msg, isErr) {
   const s = $("status"); s.textContent = msg; s.className = isErr ? "err" : "";
 }
 
-function downloadBlob(obj, filename) {
-  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a"); a.href = url; a.download = filename; a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+async function doExport() {
+  if (!scanId) return;
+  const fmt = $("fmt").value;
+  const note = $("dl-note"); note.textContent = "";
+  try {
+    const r = await fetch(`/api/export/${scanId}/${encodeURIComponent(fmt)}`);
+    if (!r.ok) {
+      let msg = String(r.status);
+      try { msg = (await r.json()).error || msg; } catch (_) {}
+      note.textContent = "— " + msg;
+      return;
+    }
+    const blob = await r.blob();
+    const cd = r.headers.get("Content-Disposition") || "";
+    const m = cd.match(/filename="([^"]+)"/);
+    const fname = m ? m[1] : (fmt + ".txt");
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = fname; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (e) { note.textContent = "— " + e.message; }
 }
 
 async function doScan(ev) {
@@ -255,7 +284,7 @@ async function doScan(ev) {
     });
     const data = await r.json();
     if (!r.ok) { setStatus("Error: " + (data.error || r.status), true); return; }
-    lastBody = body; lastResult = data;
+    scanId = data.scan_id || null;
     render(data);
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
     const nh = (data.hosts || []).length;
@@ -269,22 +298,8 @@ async function doScan(ev) {
   }
 }
 
-async function doDownloadSarif() {
-  if (!lastBody) return;
-  try {
-    const r = await fetch("/api/scan.sarif", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(lastBody),
-    });
-    const data = await r.json();
-    if (!r.ok) { setStatus("SARIF error: " + (data.error || r.status), true); return; }
-    downloadBlob(data, "scan.sarif");
-  } catch (e) { setStatus("SARIF request failed: " + e.message, true); }
-}
-
 $("scan-form").addEventListener("submit", doScan);
-$("dl-json").addEventListener("click", () => lastResult && downloadBlob(lastResult, "scan.json"));
-$("dl-sarif").addEventListener("click", doDownloadSarif);
+$("dl-go").addEventListener("click", doExport);
 loadAlertIds();
 </script>
 </body>
