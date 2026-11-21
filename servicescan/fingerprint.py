@@ -442,6 +442,81 @@ async def mongodb_probe(host: str, port: int, timeout: float):
     return None
 
 
+# PostgreSQL (TCP 5432). A protocol-3.0 StartupMessage with no password lets the
+# backend declare its authentication method without a credential ever being
+# sent: AuthenticationOk (subtype 0) means pg_hba matched `trust`, i.e. ANY
+# client that can reach the port gets a session with no password = full unauth
+# read/write (an alert); subtypes 3/5/10 (password/md5/SCRAM) mean auth is
+# enforced (informational posture). Wire format per the PostgreSQL frontend/
+# backend protocol ("Message Formats"): StartupMessage is a length + protocol
+# 196608 + NUL-terminated key/value pairs; every backend reply is a type byte +
+# Int32 length. On trust we stop at AuthenticationOk and never issue a query.
+def _pg_startup(user: str, database: str) -> bytes:
+    params = (b"user\x00" + user.encode() + b"\x00"
+              + b"database\x00" + database.encode() + b"\x00\x00")
+    body = (196608).to_bytes(4, "big") + params
+    return (len(body) + 4).to_bytes(4, "big") + body
+
+
+_PG_AUTH = {0: "trust", 2: "kerberos", 3: "password", 5: "md5", 6: "scm",
+            7: "gss", 9: "sspi", 10: "scram"}
+
+
+async def postgres_probe(host: str, port: int, timeout: float):
+    """PostgreSQL unauthenticated StartupMessage. Returns
+    {auth, version, sqlstate, detail} or None. No credential is sent; a `trust`
+    (AuthenticationOk) result is read and the session is then dropped."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    info = {}
+    try:
+        writer.write(_pg_startup("postgres", "postgres"))
+        await writer.drain()
+
+        async def read_msg():
+            hdr = await reader.readexactly(5)
+            n = int.from_bytes(hdr[1:5], "big") - 4
+            body = await reader.readexactly(n) if 0 < n <= 65535 else b""
+            return hdr[0:1], body
+
+        for _ in range(8):
+            try:
+                t, body = await asyncio.wait_for(read_msg(), timeout=timeout)
+            except Exception:  # noqa: BLE001
+                break
+            if t == b"R" and len(body) >= 4:
+                info["auth"] = _PG_AUTH.get(int.from_bytes(body[0:4], "big"),
+                                            "other")
+                if info["auth"] != "trust":
+                    break                 # auth demanded -> stop, send nothing
+            elif t == b"S":               # ParameterStatus (server_version etc.)
+                kv = body.split(b"\x00")
+                if len(kv) >= 2 and kv[0] == b"server_version":
+                    info["version"] = kv[1].decode("latin-1", "replace")
+            elif t == b"E":               # ErrorResponse -> auth enforced / refused
+                info.setdefault("auth", "enforced")
+                for f in body.split(b"\x00"):
+                    if f[0:1] == b"C":
+                        info["sqlstate"] = f[1:].decode("latin-1", "replace")
+                    elif f[0:1] == b"M":
+                        info["detail"] = f[1:].decode("latin-1", "replace")
+                break
+            elif t == b"Z":               # ReadyForQuery -> trust session is up
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+    return info or None
+
+
 # --- HTTP(S)-based stores: Elasticsearch / CouchDB / Docker API / etcd / kubelet
 # All read-only GETs (no POST/PUT/DELETE), no redirects followed.
 async def _http_get_once(host: str, port: int, path: str, timeout: float,
@@ -1035,6 +1110,7 @@ async def ipmi_cipher_zero_probe(host: str, port: int, timeout: float):
 _REDIS_PORTS = {6379, 6380}
 _MEMCACHED_PORTS = {11211}
 _MONGO_PORTS = {27017, 27018, 27019}
+_POSTGRES_PORTS = {5432, 5433}
 _ES_PORTS = {9200, 9201}
 _COUCHDB_PORTS = {5984, 6984}
 _DOCKER_PORTS = {2375, 2376}
@@ -3678,7 +3754,7 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "mqtt-unauth", "smbv1-enabled", "smb-signing-not-required",
                       "nfs-export-world", "ldap-anonymous-read",
                       "rsync-anon-module", "winrm-basic-cleartext",
-                      "krb-asrep-roastable"}
+                      "krb-asrep-roastable", "postgres-trust-unauth"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -3739,6 +3815,48 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 f"succeeded). An unauthenticated client can read and modify every "
                 f"database. Enable authorization, bind to localhost, firewall "
                 f"{port}.")
+        return
+
+    if "postgres" in name or port in _POSTGRES_PORTS:
+        res = await postgres_probe(host, port, cfg.timeout)
+        if res:
+            auth = res.get("auth")
+            ver = res.get("version", "")
+            if not svc.name:
+                svc.name = "postgresql"
+            if not svc.product:
+                svc.product = "PostgreSQL"
+            if ver and not svc.version:
+                svc.version = ver
+                svc.cve_skip = False
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            if auth == "trust":
+                svc.confidence = "high"
+                svc.extrainfo = "UNAUTHENTICATED access"
+                svc.scripts.append({"id": "postgres-trust-unauth", "output":
+                    "PostgreSQL accepted a connection WITHOUT any password "
+                    "(pg_hba.conf `trust` auth -> AuthenticationOk"
+                    + (f", server_version {ver}" if ver else "") + "). Any "
+                    "client that can reach the port gets a full read/write "
+                    "session and, via COPY/large-objects or an untrusted PL, "
+                    "often code execution on the host. Replace `trust` with "
+                    "scram-sha-256 in pg_hba.conf, bind to localhost, firewall "
+                    f"{port}. (No query was issued; the session was dropped at "
+                    "AuthenticationOk.)"})
+            else:
+                note = {"password": "cleartext password", "md5": "MD5",
+                        "scram": "SCRAM-SHA-256", "kerberos": "Kerberos/GSSAPI",
+                        "gss": "GSSAPI", "sspi": "SSPI"}.get(auth, auth)
+                extra = ""
+                if auth == "password":
+                    extra = (" -- cleartext: credentials would transit "
+                             "unencrypted without TLS")
+                svc.scripts.append({"id": "postgres-auth", "output":
+                    f"PostgreSQL requires authentication ({note}{extra}); the "
+                    "unauthenticated StartupMessage was refused"
+                    + (f" [{res['sqlstate']}]" if res.get("sqlstate") else "")
+                    + ". Good posture."})
         return
 
     if "rtsp" in name or port in _RTSP_PORTS or port in _RTSPS_PORTS:

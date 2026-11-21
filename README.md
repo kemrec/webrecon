@@ -482,6 +482,16 @@ nmap's result and, for every under-identified port, adds:
   captures them and a valid WinRM credential grants remote PowerShell = host
   takeover (`winrm-basic-cleartext`). `Basic` over TLS (`5986`) is informational
   (`winrm-basic-tls`). All operations are reads.
+- **PostgreSQL** (TCP `5432`): a dependency-free protocol-3.0 StartupMessage with
+  no password makes the backend declare its authentication method without a
+  credential ever being sent. `AuthenticationOk` means `pg_hba.conf` matched
+  **`trust`** — any client that can reach the port gets a full read/write session
+  (and, via `COPY`/large-objects or an untrusted PL, often code execution on the
+  host): a **trust/unauthenticated alert** (`postgres-trust-unauth`, with the
+  leaked `server_version`). A password/MD5/SCRAM challenge or an `ErrorResponse`
+  means auth is enforced (`postgres-auth`, informational; a cleartext-password
+  demand is flagged). No query is ever issued — the session is dropped at
+  `AuthenticationOk`.
 - **Kerberos KDC** (TCP `88`): dependency-free ASN.1/DER per RFC 4120. For a
   small built-in set of default principals an **AS-REQ with no pre-authentication**
   is sent; the KDC's reply classifies each account without ever sending a
