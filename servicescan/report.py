@@ -225,6 +225,10 @@ def _print_service(s) -> None:
             print(f"        {C.RED}{C.B}! {sid}{C.R}: {C.RED}{first[:110]}{C.R}")
         else:
             print(f"        {C.YEL}chk {sid}{C.R}: {C.GRY}{first[:80]}{C.R}")
+    if getattr(s, "cve_unscoped", False) and s.cves:
+        print(f"        {C.YEL}{C.B}! version unknown{C.R} {C.YEL}— the {len(s.cves)} "
+              f"CVE(s) below are for all versions of {s.product}; "
+              f"not confirmed to apply{C.R}")
     for c in s.cves[:6]:
         col = _sev_color(c.disp_severity(), c.disp_cvss())
         # show the canonical base score, but the (possibly demoted) severity

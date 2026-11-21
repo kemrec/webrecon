@@ -596,6 +596,11 @@ async def correlate(cfg: ScanConfig, http, services: list[Service],
                         if found:
                             utils.debug(f":{svc.port} nvd cpe->kw fallback hit "
                                         f"({len(found)})")
+                # product identified but NO version: the CPE above was a wildcard
+                # (all-version) match, so NVD returned every CVE for the product.
+                # Flag it -- the listed CVEs are not version-confirmed.
+                if not nver and svc.product and found:
+                    svc.cve_unscoped = True
             # --- OSV (open-source packages) ---
             if cfg.osv and svc.version:
                 osv_name = _OSV_NAME.get(svc.product.lower())

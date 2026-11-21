@@ -30,6 +30,9 @@ class Service:
     cve_skip: bool = False             # product known but version untrustworthy:
                                        # correlate must NOT emit a version-less
                                        # all-CVE dump (see Tomcat/Coyote fixup)
+    cve_unscoped: bool = False         # product known but NO version: its CVEs
+                                       # came from a wildcard (all-version) CPE
+                                       # lookup, so they may not all apply
 
     def ident(self) -> str:
         v = f" {self.version}" if self.version else ""
