@@ -527,6 +527,13 @@ nmap's result and, for every under-identified port, adds:
   real credential (same model as the LDAP/rsync anonymous checks); no listing or
   transfer is performed — the session is closed with `QUIT` right after the login
   result.
+- **MSRPC endpoint mapper** (TCP `135`): an unauthenticated DCE/RPC bind to the
+  IOXIDResolver interface followed by **`ServerAlive2`** (opnum 5) returns a
+  `DUALSTRINGARRAY` naming every one of the host's network interface bindings —
+  hostnames and IPv4/IPv6 addresses, including internal ones — with no credential
+  (`msrpc-interfaces`, an informational topology leak like the NTLM-over-HTTP
+  disclosure). The string bindings are extracted from the response; PDU layout
+  per MS-RPCE, `ServerAlive2` per MS-DCOM. No credentials are sent.
 - **Kerberos KDC** (TCP `88`): dependency-free ASN.1/DER per RFC 4120. For a
   small built-in set of default principals an **AS-REQ with no pre-authentication**
   is sent; the KDC's reply classifies each account without ever sending a

@@ -820,6 +820,102 @@ async def ftp_probe(host: str, port: int, timeout: float):
     return out
 
 
+# MSRPC endpoint mapper (TCP 135). An unauthenticated DCE/RPC bind to the
+# IOXIDResolver interface (99fcfec4-5260-101b-bbcb-00aa0021347a) followed by
+# ServerAlive2 (opnum 5) makes the server return a DUALSTRINGARRAY naming every
+# one of its network interface bindings -- hostnames and IPv4/IPv6 addresses,
+# including internal ones -- with no credential. A classic unauthenticated
+# topology/identity leak (informational, like the NTLM-over-HTTP disclosure),
+# not a breach. The response's string bindings are UTF-16LE; rather than depend
+# on exact NDR offsets, the aligned UTF-16LE address runs are extracted. PDU
+# layout per MS-RPCE (C706); ServerAlive2 per MS-DCOM.
+_MSRPC_PORTS = {135}
+_MSRPC_BIND = bytes.fromhex(
+    "05000b0310000000480000000100000"
+    "0d016d016000000000100000000000100"
+    "c4fefc9960521b10bbcb00aa0021347a00000000"
+    "045d888aeb1cc9119fe808002b10486002000000")
+_MSRPC_SERVERALIVE2 = bytes.fromhex(
+    "050000031000000018000000010000000000000000000500")
+
+
+async def _dcerpc_read(reader, timeout: float) -> bytes:
+    """Read one connection-oriented DCE/RPC PDU (16-byte header + frag body)."""
+    try:
+        hdr = await asyncio.wait_for(reader.readexactly(16), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return b""
+    if len(hdr) < 16 or hdr[0] != 5:
+        return hdr
+    frag = int.from_bytes(hdr[8:10], "little")
+    rest = b""
+    if frag > 16:
+        try:
+            rest = await asyncio.wait_for(
+                reader.readexactly(frag - 16), timeout=timeout)
+        except Exception:  # noqa: BLE001
+            pass
+    return hdr + rest
+
+
+_MSRPC_ADDR_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:[]_")
+
+
+def _utf16le_addrs(data: bytes, minlen: int = 3) -> list:
+    """Extract aligned, printable UTF-16LE runs that look like host/IP bindings."""
+    out, cur = [], []
+    j = 0
+    while j + 1 < len(data):
+        lo, hi = data[j], data[j + 1]
+        if hi == 0 and 0x20 <= lo < 0x7F and chr(lo) in _MSRPC_ADDR_CHARS:
+            cur.append(chr(lo))
+        else:
+            if len(cur) >= minlen:
+                s = "".join(cur)
+                if any(c.isalnum() for c in s) and s not in out:
+                    out.append(s)
+            cur = []
+        j += 2
+    if len(cur) >= minlen:
+        s = "".join(cur)
+        if any(c.isalnum() for c in s) and s not in out:
+            out.append(s)
+    return out[:20]
+
+
+async def msrpc_probe(host: str, port: int, timeout: float):
+    """Unauthenticated DCE/RPC bind to IOXIDResolver + ServerAlive2 (opnum 5).
+    Returns {bind_ok, interfaces:[...]} or None. No credential is sent."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    out = None
+    try:
+        writer.write(_MSRPC_BIND)
+        await writer.drain()
+        ack = await _dcerpc_read(reader, timeout)
+        if len(ack) < 3 or ack[0] != 5 or ack[2] != 0x0C:    # bind_ack only
+            return None
+        out = {"bind_ok": True, "interfaces": []}
+        writer.write(_MSRPC_SERVERALIVE2)
+        await writer.drain()
+        resp = await _dcerpc_read(reader, timeout)
+        if len(resp) > 24 and resp[2] == 0x02:               # response PDU
+            out["interfaces"] = _utf16le_addrs(resp[24:])
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+    return out
+
+
 # --- HTTP(S)-based stores: Elasticsearch / CouchDB / Docker API / etcd / kubelet
 # All read-only GETs (no POST/PUT/DELETE), no redirects followed.
 async def _http_get_once(host: str, port: int, path: str, timeout: float,
@@ -4353,6 +4449,30 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
             else:
                 svc.scripts.append({"id": "ftp-anon-refused", "output":
                     "Anonymous FTP login refused -- good posture."})
+        return
+
+    if port in _MSRPC_PORTS or name == "msrpc" or name == "epmap":
+        res = await msrpc_probe(host, port, cfg.timeout)
+        if res and res.get("bind_ok"):
+            if not svc.name:
+                svc.name = "msrpc"
+            if not svc.product:
+                svc.product = "Microsoft Windows RPC"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            ifaces = res.get("interfaces") or []
+            if ifaces:
+                svc.scripts.append({"id": "msrpc-interfaces", "output":
+                    f"IOXIDResolver ServerAlive2 (opnum 5) disclosed "
+                    f"{len(ifaces)} network binding(s) WITHOUT authentication: "
+                    + ", ".join(ifaces) + ". The RPC endpoint mapper leaks the "
+                    "host's interface addresses (including internal and IPv6 "
+                    "names) to any client; restrict/firewall 135 if it need not "
+                    "be public."})
+            else:
+                svc.scripts.append({"id": "msrpc-bind", "output":
+                    "DCE/RPC endpoint mapper accepted an unauthenticated bind to "
+                    "IOXIDResolver; ServerAlive2 returned no parsable bindings."})
         return
 
     if "rtsp" in name or port in _RTSP_PORTS or port in _RTSPS_PORTS:
