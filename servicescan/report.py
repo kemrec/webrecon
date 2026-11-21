@@ -249,3 +249,7 @@ def _print_service(s) -> None:
         for v in vh[:5]:
             print(f"           {C.GRN}vhost{C.R} {v.get('host')} "
                   f"-> {v.get('status')} ({v.get('length')}b)")
+        wt = w.get("tech", [])
+        if wt:
+            print(f"           {C.CYN}tech{C.R} {', '.join(wt[:8])}"
+                  f"{' ...' if len(wt) > 8 else ''}")

@@ -233,6 +233,10 @@ async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
             "vhosts": data.get("vhosts", []),
             "secrets": len(data.get("secrets", [])),
             "subdomains": data.get("subdomains", []),
+            # technologies the crawl identified (hand-written sigs + the shared
+            # catalog, incl. JS-global/DOM apps when web rendering was on). CVE
+            # for the versioned ones comes from servicescan's own --render pass.
+            "tech": data.get("tech", []),
         }
         nv = len(svc.web["vhosts"])
         if nv:

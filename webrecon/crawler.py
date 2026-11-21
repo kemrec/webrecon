@@ -18,6 +18,22 @@ from .http_client import HTTPClient
 from . import utils, extract, secrets, tech
 
 
+# Lazy handle to servicescan's shared technology catalog + matcher. Imported on
+# demand so webrecon has no import-time dependency on servicescan.
+_CATMOD = None
+
+
+def _catmod():
+    global _CATMOD
+    if _CATMOD is None:
+        try:
+            from servicescan import fingerprint as _fp
+            _CATMOD = _fp
+        except Exception:  # noqa: BLE001
+            _CATMOD = False
+    return _CATMOD
+
+
 @dataclass
 class CrawlResult:
     pages: dict[str, int] = field(default_factory=dict)        # url -> status
@@ -38,6 +54,7 @@ class Crawler:
         self.result = CrawlResult()
         self._browser = None
         self._pw = None
+        self._cat_specs = None            # cached (js_vars, dom_specs)
 
     async def __aenter__(self):
         if self.cfg.render:
@@ -49,6 +66,34 @@ class Crawler:
             await self._browser.close()
         if self._pw:
             await self._pw.stop()
+
+    # -- technology catalog --------------------------------------------------
+    def _catalog_specs(self):
+        """(js_vars, dom_specs) the catalog wants evaluated on a rendered page;
+        cached. Empty when the catalog is unavailable."""
+        if self._cat_specs is None:
+            fp = _catmod()
+            if fp:
+                self._cat_specs = (fp.catalog_js_vars(), fp.catalog_dom_specs())
+            else:
+                self._cat_specs = ([], [])
+        return self._cat_specs
+
+    def _apply_catalog(self, headers, html, js_globals, dom_eval) -> None:
+        """Run the shared 299-app catalog over a page and fold the hits into
+        result.tech as 'Name version' labels. js_globals/dom_eval are None on a
+        plain GET, so only the static (header/meta/html/cookie) sigs fire there;
+        on a rendered page the JS-global / DOM sigs fire too."""
+        fp = _catmod()
+        if not fp:
+            return
+        try:
+            for name, ver in fp.match_catalog(headers or {}, html or "",
+                                              js_globals=js_globals,
+                                              dom_eval=dom_eval):
+                self.result.tech.add(f"{name} {ver}".strip())
+        except Exception as e:  # noqa: BLE001
+            utils.debug(f"catalog match: {type(e).__name__}")
 
     async def _start_browser(self):
         try:
@@ -86,10 +131,14 @@ class Crawler:
             except Exception:  # noqa: BLE001
                 pass
 
-    async def _render(self, url: str) -> tuple[int, str, set[str], dict]:
-        """Return (status, html, network_urls, headers) using Playwright."""
+    async def _render(self, url: str) -> tuple[int, str, set[str], dict, dict, dict]:
+        """Return (status, html, network_urls, headers, js_globals, dom_eval)
+        using Playwright. js_globals/dom_eval carry the rendered-page technology
+        signals (JS global vars, DOM selectors) the catalog matcher consumes."""
         net_urls: set[str] = set()
         headers: dict = {}
+        js_globals: dict = {}
+        dom_eval: dict = {}
         ctx = await self._browser.new_context(
             user_agent=self.cfg.user_agent,
             ignore_https_errors=True,
@@ -117,12 +166,20 @@ class Crawler:
             except Exception:
                 pass
             html = await page.content()
+            # evaluate the catalog's JS-global / DOM signals on the live page
+            try:
+                from . import render as _render_mod
+                js_vars, dom_specs = self._catalog_specs()
+                js_globals, dom_eval = await _render_mod.eval_specs(
+                    page, js_vars, dom_specs)
+            except Exception as e:  # noqa: BLE001
+                utils.debug(f"catalog eval {url}: {type(e).__name__}")
         except Exception as e:  # noqa: BLE001
             utils.debug(f"render failed {url}: {type(e).__name__}")
             html = ""
         finally:
             await ctx.close()
-        return status, html, net_urls, headers
+        return status, html, net_urls, headers, js_globals, dom_eval
 
     # -- per-page processing -------------------------------------------------
     def _in_scope(self, u: str) -> bool:
@@ -160,21 +217,26 @@ class Crawler:
                             visited: set[str]) -> None:
         # render or plain GET
         if self.cfg.render and self._browser:
-            status, html, net_urls, headers = await self._render(url)
+            status, html, net_urls, headers, js_globals, dom_eval = \
+                await self._render(url)
         else:
             r = await self.http.fetch(url)
             status, html, net_urls, headers = r.status, r.text, set(), r.headers
+            js_globals, dom_eval = None, None
 
         self.result.pages[url] = status
         self.result.hosts.add(utils.host_of(url))
         if not html:
             return
 
-        # technology fingerprint (headers + body), best-effort
+        # technology fingerprint (headers + body), best-effort: the hand-written
+        # sigs plus the shared 299-app catalog (static here, JS-global/DOM too
+        # when the page was rendered).
         try:
             self.result.tech |= tech.detect(headers, html)
         except Exception as e:  # noqa: BLE001
             utils.debug(f"tech {url}: {e}")
+        self._apply_catalog(headers, html, js_globals, dom_eval)
 
         # HTML forms -> endpoints + parameters
         for f in extract.extract_forms(html):
