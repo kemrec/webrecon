@@ -179,6 +179,10 @@ _ALLOWED = {
     "fp_all":        ("fp_all", _as_bool),
     "render":        ("render", _as_bool),
     "realm":         ("realm", _as_realm),
+    # active camera-recon step: try a tiny factory-default credential list on a
+    # gated RTSP/ONVIF/vendor-CGI device. Default on (as the engine); send false
+    # for a fully passive, read-only run.
+    "cam_creds":     ("cam_creds", _as_bool),
     "scan_rate":     ("scan_rate", _as_int_or_none),
     "cve":           ("cve", _as_bool),
     # cve-correlation sources (each a feed that can be toggled off) + optional key

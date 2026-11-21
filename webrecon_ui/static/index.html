@@ -110,6 +110,7 @@
         <label class="inline"><input type="checkbox" id="cve" checked> CVE correlation</label>
         <label class="inline"><input type="checkbox" id="exploits"> map exploits</label>
         <label class="inline"><input type="checkbox" id="render"> render web roots (JS)</label>
+        <label class="inline"><input type="checkbox" id="cam_creds" checked> camera default-cred test</label>
       </div>
       <div class="row">
         <span class="muted" style="font-size:12px;">CVE sources:</span>
@@ -201,6 +202,7 @@ function buildQuery() {
   }
   p.set("exploits", $("exploits").checked);
   p.set("render", $("render").checked);
+  p.set("cam_creds", $("cam_creds").checked);   // uncheck = fully passive camera recon
   const mc = parseFloat($("min_cvss").value);
   if (!isNaN(mc) && mc > 0) p.set("min_cvss", mc);
   const rate = parseInt($("rate").value, 10);
