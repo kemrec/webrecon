@@ -1219,6 +1219,66 @@ def is_tls_service(svc) -> bool:
             or bool(svc.tls) or svc.port in _TLS_PORTS)
 
 
+def _merge_render_hits(svc: Service, hits: list[list[str]]) -> None:
+    """Fold rendered-page catalog hits onto svc.aux (deduped, preferring a
+    version). CVE correlation picks up the version-anchored ones; the script
+    note makes every detected app visible even when version-less."""
+    if not hits:
+        return
+    labels = []
+    for name, ver in hits:
+        labels.append(f"{name} {ver}".strip())
+        same = next((p for p in svc.aux if p[0].lower() == name.lower()), None)
+        if same is None:
+            svc.aux.append([name, ver])
+        elif ver and not same[1]:
+            same[1] = ver
+    if "render" not in svc.sources:
+        svc.sources.append("render")
+    svc.scripts.append({"id": "render-tech",
+                        "output": "rendered-page technology (JS globals / DOM): "
+                                  + ", ".join(sorted(set(labels)))})
+
+
+async def run_render_catalog(cfg: ScanConfig, host: str,
+                             services: list[Service]) -> None:
+    """Render the root of every open web service and merge JS/DOM-only catalog
+    apps (Angular, CKEditor, Kubernetes Dashboard, Vtiger, ...) onto svc.aux, so
+    a plain `servicescan --render` run surfaces their versions in the port-scan
+    summary and CVE-correlates them -- no full webrecon crawl required. Opt-in
+    via cfg.render; a no-op when Playwright is unavailable. Runs before CVE
+    correlation so the versioned hits flow straight into it."""
+    web = [s for s in services if s.state == "open" and is_web_service(s)]
+    if not web:
+        return
+    try:
+        from webrecon.render import RootRenderer
+    except Exception as e:  # noqa: BLE001
+        utils.debug(f"render import failed: {type(e).__name__}")
+        return
+    js_vars = catalog_js_vars()
+    dom_specs = catalog_dom_specs()
+    async with RootRenderer(timeout=max(cfg.timeout, 15.0),
+                            user_agent="servicescan") as r:
+        if not r.available:
+            return
+        for svc in web:
+            scheme = "https" if is_tls_service(svc) else "http"
+            url = f"{scheme}://{utils.with_port(host, svc.port)}/"
+            info = await r.eval(url, js_vars, dom_specs)
+            if not info:
+                continue
+            hits = match_catalog(info.get("headers") or {}, info.get("html") or "",
+                                 js_globals=info.get("js_globals"),
+                                 dom_eval=info.get("dom_eval"))
+            _merge_render_hits(svc, hits)
+    done = [s for s in web if any(sc.get("id") == "render-tech"
+                                  for sc in s.scripts)]
+    if done:
+        utils.info(f"render: catalog tech detected on "
+                   f"{', '.join(str(s.port) for s in done)}")
+
+
 async def fingerprint_service(cfg: ScanConfig, http, host: str,
                               svc: Service) -> None:
     """Run the probe set appropriate for this port and merge findings.

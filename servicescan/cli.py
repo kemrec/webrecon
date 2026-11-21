@@ -65,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="skip our fingerprint gap-fill layer")
     fp.add_argument("--fp-all", action="store_true",
                     help="fingerprint ALL open ports, not just nmap-unknown ones")
+    fp.add_argument("--render", action="store_true",
+                    help="render each web port's root page (Playwright) to catch "
+                         "apps whose only signal is a JS global or DOM selector "
+                         "(Angular, CKEditor, Kubernetes Dashboard, ...); their "
+                         "versions then land in the summary and CVE correlation")
 
     cv = p.add_argument_group("cve")
     cv.add_argument("--no-cve", action="store_true", help="skip CVE correlation")
@@ -154,6 +159,7 @@ def cfg_from_args(a: argparse.Namespace) -> ScanConfig:
         nmap_args=a.nmap_arg,
         fingerprint=not a.no_fingerprint,
         fp_all=a.fp_all,
+        render=a.render,
         cve=not a.no_cve,
         nvd=not a.no_nvd,
         osv=not a.no_osv,

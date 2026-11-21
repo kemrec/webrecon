@@ -26,6 +26,8 @@ class ScanConfig:
     # fingerprint layer
     fingerprint: bool = True              # run our own layer on unknown services
     fp_all: bool = False                  # fingerprint ALL open ports, not just unknown
+    render: bool = False                  # render each web port's root (Playwright)
+                                          # to catch JS-global/DOM-only catalog apps
     timeout: float = 8.0                  # per-probe timeout (s)
     concurrency: int = 50
 

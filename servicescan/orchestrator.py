@@ -63,6 +63,10 @@ async def run(cfg: ScanConfig) -> ScanResult:
             if cfg.fingerprint:
                 await fingerprint.run_fingerprint(cfg, http, conn_host, h.services)
                 await fingerprint.run_exposure_checks(cfg, conn_host, h.services)
+            if cfg.render:
+                # render web-port roots to catch JS-global/DOM-only catalog apps
+                # BEFORE CVE so their versioned hits correlate (opt-in).
+                await fingerprint.run_render_catalog(cfg, conn_host, h.services)
             if cfg.cve:
                 utils.info(f"correlating CVEs (NVD / OSV) for {h.label()}")
                 await cve.correlate(cfg, http, h.services)
