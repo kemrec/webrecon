@@ -585,6 +585,72 @@ async def mysql_probe(host: str, port: int, timeout: float):
     return out
 
 
+# Microsoft SQL Server. Two unauthenticated, read-only identity leaks:
+#   * TCP 1433 TDS PRELOGIN (MS-TDS 2.2.6.5): a PRELOGIN request (packet type
+#     0x12) is answered (type 0x04) with the server VERSION and its ENCRYPTION
+#     posture -- no login is attempted. ENCRYPTION 0x02 (NOT_SUP) means the
+#     instance offers no TLS, so login credentials would transit in cleartext.
+#   * UDP 1434 SQL Server Browser (MC-SQLR): a single 0x02 datagram is answered
+#     with a semicolon-delimited list of every instance's name, version and TCP
+#     port -- a classic unauthenticated enumeration leak.
+# Both are informational (version anchors CVE correlation; encryption posture is
+# a hardening note). ENCRYPTION values 0x00 OFF / 0x01 ON / 0x02 NOT_SUP /
+# 0x03 REQ.
+_TDS_PRELOGIN = bytes.fromhex("12 01 00 1a 00 00 00 00".replace(" ", "")) + (
+    # option table: VERSION[0x00]@11 len6, ENCRYPTION[0x01]@17 len1, 0xFF
+    b"\x00" + (11).to_bytes(2, "big") + (6).to_bytes(2, "big")
+    + b"\x01" + (17).to_bytes(2, "big") + (1).to_bytes(2, "big")
+    + b"\xff"
+    + b"\x09\x00\x00\x00\x00\x00"       # VERSION data (client, arbitrary)
+    + b"\x00")                          # ENCRYPTION data (ENCRYPT_OFF request)
+_TDS_ENC = {0: "off (login-only)", 1: "on", 2: "not supported", 3: "required"}
+
+
+async def mssql_prelogin_probe(host: str, port: int, timeout: float):
+    """TDS PRELOGIN (TCP). Returns {version, encryption} or None. No login."""
+    data = await _read_once(host, port, _TDS_PRELOGIN, timeout, nbytes=4096)
+    if len(data) < 9 or data[0] != 0x04:       # PRELOGIN response packet type
+        return None
+    payload = data[8:]
+    opts, i = {}, 0
+    while i + 5 <= len(payload) and payload[i] != 0xFF:
+        tok = payload[i]
+        off = int.from_bytes(payload[i + 1:i + 3], "big")
+        ln = int.from_bytes(payload[i + 3:i + 5], "big")
+        opts[tok] = payload[off:off + ln]
+        i += 5
+    out = {}
+    v = opts.get(0x00, b"")
+    if len(v) >= 4:
+        out["version"] = f"{v[0]}.{v[1]}.{int.from_bytes(v[2:4], 'big')}"
+    enc = opts.get(0x01, b"")
+    if enc:
+        out["encryption"] = _TDS_ENC.get(enc[0], f"0x{enc[0]:02x}")
+    return out or None
+
+
+async def mssql_browser_probe(host: str, port: int, timeout: float):
+    """SQL Server Browser (UDP 1434). Returns a list of instance dicts or None."""
+    data = await _udp_query(host, port, b"\x02", timeout)
+    if len(data) < 3 or data[0] != 0x05:
+        return None
+    text = data[3:].decode("latin-1", "replace")
+    toks = text.split(";")
+    instances, cur = [], {}
+    i = 0
+    while i + 1 < len(toks):
+        key, val = toks[i], toks[i + 1]
+        i += 2
+        if key == "ServerName" and cur:
+            instances.append(cur)
+            cur = {}
+        if key:
+            cur[key] = val
+    if cur:
+        instances.append(cur)
+    return instances or None
+
+
 # --- HTTP(S)-based stores: Elasticsearch / CouchDB / Docker API / etcd / kubelet
 # All read-only GETs (no POST/PUT/DELETE), no redirects followed.
 async def _http_get_once(host: str, port: int, path: str, timeout: float,
@@ -1180,6 +1246,7 @@ _MEMCACHED_PORTS = {11211}
 _MONGO_PORTS = {27017, 27018, 27019}
 _POSTGRES_PORTS = {5432, 5433}
 _MYSQL_PORTS = {3306}
+_MSSQL_PORTS = {1433, 1434}
 _ES_PORTS = {9200, 9201}
 _COUCHDB_PORTS = {5984, 6984}
 _DOCKER_PORTS = {2375, 2376}
@@ -3965,6 +4032,55 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                     f"{tlsnote}. The server-initiated handshake was read WITHOUT "
                     f"sending anything -- version anchors CVE correlation; no "
                     f"authentication was attempted."})
+        return
+
+    if port in _MSSQL_PORTS or "ms-sql" in name or "mssql" in name:
+        if svc.proto == "udp":
+            insts = await mssql_browser_probe(host, port, cfg.timeout)
+            if insts:
+                if not svc.name:
+                    svc.name = "ms-sql-m"
+                if not svc.product:
+                    svc.product = "Microsoft SQL Server"
+                if "exposure" not in svc.sources:
+                    svc.sources.append("exposure")
+                listing = "; ".join(
+                    f"{d.get('InstanceName', '?')}"
+                    f"{' v' + d['Version'] if d.get('Version') else ''}"
+                    f"{' tcp/' + d['tcp'] if d.get('tcp') else ''}"
+                    for d in insts)
+                for d in insts:                     # first explicit version wins
+                    if d.get("Version") and not svc.version:
+                        svc.version = d["Version"]
+                        svc.cve_skip = False
+                        break
+                svc.scripts.append({"id": "mssql-browser", "output":
+                    f"SQL Server Browser (UDP 1434) listed {len(insts)} "
+                    f"instance(s) WITHOUT authentication: {listing}. The browser "
+                    f"discloses instance names, versions and TCP ports to any "
+                    f"client; disable it or firewall 1434/udp if not required."})
+        else:
+            res = await mssql_prelogin_probe(host, port, cfg.timeout)
+            if res:
+                if not svc.name:
+                    svc.name = "ms-sql-s"
+                if not svc.product:
+                    svc.product = "Microsoft SQL Server"
+                if res.get("version") and not svc.version:
+                    svc.version = res["version"]
+                    svc.cve_skip = False
+                if "exposure" not in svc.sources:
+                    svc.sources.append("exposure")
+                enc = res.get("encryption", "")
+                encnote = ""
+                if enc == "not supported":
+                    encnote = (" The instance offers NO TLS (ENCRYPT_NOT_SUP), "
+                               "so login credentials transit in cleartext.")
+                svc.scripts.append({"id": "mssql-prelogin", "output":
+                    f"Microsoft SQL Server TDS PRELOGIN"
+                    + (f" version {res['version']}" if res.get("version") else "")
+                    + (f"; encryption {enc}" if enc else "") + "."
+                    + encnote + " Read without authenticating (no login sent)."})
         return
 
     if "rtsp" in name or port in _RTSP_PORTS or port in _RTSPS_PORTS:

@@ -498,6 +498,13 @@ nmap's result and, for every under-identified port, adds:
   capability (`CLIENT_SSL`). Reported informationally (`mysql-handshake`); a
   server that does not advertise TLS is flagged (clients not forcing SSL would
   send credentials in cleartext). No login is attempted.
+- **Microsoft SQL Server** (TCP `1433` + UDP `1434`): two dependency-free,
+  unauthenticated leaks. A **TDS `PRELOGIN`** (MS-TDS) on 1433 returns the server
+  version and its encryption posture without a login (`mssql-prelogin`; an
+  instance offering no TLS — `ENCRYPT_NOT_SUP` — is flagged, since login
+  credentials would then be cleartext). The **SQL Server Browser** on UDP 1434
+  (MC-SQLR) answers a single datagram with every instance's name, version and TCP
+  port (`mssql-browser`). Informational; no login is ever sent.
 - **Kerberos KDC** (TCP `88`): dependency-free ASN.1/DER per RFC 4120. For a
   small built-in set of default principals an **AS-REQ with no pre-authentication**
   is sent; the KDC's reply classifies each account without ever sending a
