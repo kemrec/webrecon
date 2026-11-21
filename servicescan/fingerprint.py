@@ -2745,6 +2745,103 @@ async def ldap_probe(host: str, port: int, timeout: float, tls: bool):
 
 
 # ---------------------------------------------------------------------------
+# rsync daemon (TCP 873). The daemon greets with "@RSYNCD: <ver>"; after echoing
+# a version, an empty module request returns the module listing (each
+# "name<TAB>comment"), ending with "@RSYNCD: EXIT". Selecting a module then
+# answers "@RSYNCD: AUTHREQD <salt>" (auth required) or "@RSYNCD: OK" (no auth =
+# anonymous access -> the module's files are reachable without credentials).
+# We negotiate protocol 29 (so no digest-list is required) and never send rsync
+# options after OK, so no file transfer occurs. Wire per rsync csprotocol.txt.
+# ---------------------------------------------------------------------------
+_RSYNC_PORTS = {873}
+
+
+async def _rsync_line(reader, timeout: float):
+    try:
+        data = await asyncio.wait_for(reader.readuntil(b"\n"), timeout)
+        return data.rstrip(b"\r\n")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def rsync_probe(host: str, port: int, timeout: float):
+    """List an rsync daemon's modules and test whether the first module accepts
+    a connection without authentication. Returns {modules, first_module,
+    first_auth} or None (not an rsync daemon)."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    modules = []
+    try:
+        greet = await _rsync_line(reader, timeout)
+        if not greet or not greet.startswith(b"@RSYNCD:"):
+            return None
+        writer.write(b"@RSYNCD: 29\n")
+        await writer.drain()
+        writer.write(b"\n")                       # empty module => list request
+        await writer.drain()
+        for _ in range(200):
+            line = await _rsync_line(reader, timeout)
+            if line is None:
+                break
+            if line.startswith(b"@RSYNCD:"):
+                if b"EXIT" in line:
+                    break
+                continue
+            s = line.decode("latin-1", "replace")
+            if not s.strip():
+                continue
+            name, _, comment = s.partition("\t")
+            modules.append((name.strip(), comment.strip()))
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:  # noqa: BLE001
+            pass
+    if not modules:
+        return None
+
+    first_auth = None
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+        try:
+            greet = await _rsync_line(reader, timeout)
+            if greet and greet.startswith(b"@RSYNCD:"):
+                writer.write(b"@RSYNCD: 29\n")
+                await writer.drain()
+                writer.write(modules[0][0].encode("latin-1", "replace") + b"\n")
+                await writer.drain()
+                for _ in range(5):
+                    line = await _rsync_line(reader, timeout)
+                    if line is None:
+                        break
+                    if line.startswith(b"@RSYNCD: OK"):
+                        first_auth = False
+                        break
+                    if line.startswith(b"@RSYNCD: AUTHREQD"):
+                        first_auth = True
+                        break
+                    if line.startswith(b"@RSYNCD: EXIT") or b"ERROR" in line:
+                        break
+        finally:
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    return {"modules": modules, "first_module": modules[0][0],
+            "first_auth": first_auth}
+
+
+# ---------------------------------------------------------------------------
 # gRPC (HTTP/2). Modern device/service control planes expose gRPC; nmap usually
 # leaves these ports unidentified ("tcpwrapped"). Detection is dependency-free:
 # over TLS we offer ALPN and check for a negotiated "h2"; cleartext we send the
@@ -3210,7 +3307,8 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "minio-unauth", "portainer-unauth", "zookeeper-unauth",
                       "camera-ws-stream-unauth", "ttyd-shell-unauth",
                       "mqtt-unauth", "smbv1-enabled", "smb-signing-not-required",
-                      "nfs-export-world", "ldap-anonymous-read"}
+                      "nfs-export-world", "ldap-anonymous-read",
+                      "rsync-anon-module"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -3735,6 +3833,35 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                         "prime source for password-spray / Kerberoast "
                         "targeting). Disable anonymous reads (AD: dsHeuristics "
                         "bit; OpenLDAP: tighten the anonymous ACL)."})
+        return
+
+    if port in _RSYNC_PORTS or "rsync" in name:
+        res = await rsync_probe(host, port, cfg.timeout)
+        if res:
+            if not svc.name:
+                svc.name = "rsync"
+            if not svc.product:
+                svc.product = "rsync daemon"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            mods = res["modules"]
+            listing = ", ".join(n + (f" ({c})" if c else "") for n, c in mods)
+            svc.scripts.append({"id": "rsync-modules", "output":
+                f"rsync daemon listed {len(mods)} module(s) without "
+                f"authentication: {listing}."})
+            if res["first_auth"] is False:
+                svc.confidence = "high"
+                svc.extrainfo = "anonymous rsync module"
+                svc.scripts.append({"id": "rsync-anon-module", "output":
+                    f"rsync module '{res['first_module']}' accepts connections "
+                    "WITHOUT authentication (@RSYNCD: OK, no AUTHREQD): anyone "
+                    "who can reach 873 can read its contents (and, if the module "
+                    "is not read-only, write to it). Set 'auth users' + a secrets "
+                    "file and restrict 'hosts allow'."})
+            elif res["first_auth"] is True:
+                svc.scripts.append({"id": "rsync-module-auth", "output":
+                    f"rsync module '{res['first_module']}' requires "
+                    "authentication (@RSYNCD: AUTHREQD)."})
         return
 
     # gRPC / HTTP2 on a dedicated gRPC port (or a `grpc`-named service). Scoped

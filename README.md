@@ -462,6 +462,13 @@ nmap's result and, for every under-identified port, adds:
   and computers without credentials — a prime password-spray / Kerberoast
   target list (`ldap-anonymous-read`). A refused anonymous bind is noted as good
   posture. All operations are reads.
+- **rsync daemon** (TCP `873`): the daemon's module listing is read without
+  authentication (`rsync-modules`, informational). Selecting the first module
+  then shows whether it demands credentials: a module that answers `@RSYNCD: OK`
+  (no `AUTHREQD`) accepts **anonymous access** — anyone who can reach `873` can
+  read its files, and write to them if the module is not read-only (**alert**,
+  `rsync-anon-module`). Protocol 29 is negotiated so no digest list is needed,
+  and no rsync options are sent after `OK`, so no file transfer occurs.
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully
