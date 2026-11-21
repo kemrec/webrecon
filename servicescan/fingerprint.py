@@ -589,13 +589,183 @@ _COUCHDB_PORTS = {5984, 6984}
 _DOCKER_PORTS = {2375, 2376}
 _ETCD_PORTS = {2379, 4001}
 _KUBELET_PORTS = {10250, 10255}
+_RTSP_PORTS = {554, 8554, 7447, 10554, 1554, 555}
 # ports that always speak TLS (the plaintext peer, when one exists, is elsewhere)
 _TLS_EXPOSURE_PORTS = {2376, 6984, 10250}
+
+
+# ---------------------------------------------------------------------------
+# RTSP (cameras / NVRs). RTSP is a text protocol like HTTP; a read-only OPTIONS
+# names the server and lists methods, and an unauthenticated DESCRIBE tells us
+# whether the stream is open (200 + SDP) or gated (401 + WWW-Authenticate). On a
+# gated stream we optionally try a tiny set of factory-default credentials
+# (Basic and Digest) -- the one active step, kept to common camera defaults.
+# Nothing is ever PLAYed or recorded; DESCRIBE only fetches the SDP metadata.
+# ---------------------------------------------------------------------------
+_RTSP_DESCRIBE_PATHS = [
+    "/",                                        # base (also the auth-scheme probe)
+    "/Streaming/Channels/101",                  # Hikvision
+    "/cam/realmonitor?channel=1&subtype=0",     # Dahua
+    "/axis-media/media.amp",                    # Axis
+    "/live.sdp", "/live/ch0", "/11", "/stream1",  # generic / cheap-OEM
+]
+# factory defaults only; tiny list to avoid lockouts / noise ("" = blank password)
+_RTSP_DEFAULT_CREDS = [("admin", "admin"), ("admin", ""), ("root", "root"),
+                       ("admin", "12345"), ("admin", "password"), ("root", "")]
+_RTSP_STATUS_RX = re.compile(r"RTSP/\d\.\d\s+(\d+)")
+
+
+def _parse_rtsp(data: bytes) -> dict | None:
+    """Parse an RTSP response. Returns {code, headers(lower-keyed), body} or
+    None when the reply is not RTSP (so we never mislabel a non-RTSP port)."""
+    text = data.decode("latin-1", "replace")
+    head, _, body = text.partition("\r\n\r\n")
+    lines = head.split("\r\n")
+    m = _RTSP_STATUS_RX.match(lines[0] if lines else "")
+    if not m:
+        return None
+    hdrs: dict[str, str] = {}
+    for ln in lines[1:]:
+        if ":" in ln:
+            k, v = ln.split(":", 1)
+            hdrs[k.strip().lower()] = v.strip()
+    return {"code": int(m.group(1)), "headers": hdrs, "body": body}
+
+
+async def _rtsp_request(host: str, port: int, timeout: float, method: str,
+                        path: str, headers: dict | None = None) -> dict | None:
+    """Send one RTSP request on a fresh connection (CSeq 1) and parse the reply.
+    Read-only: only OPTIONS / DESCRIBE are ever issued by callers here."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    url = f"rtsp://{host}:{port}{path}"
+    lines = [f"{method} {url} RTSP/1.0", "CSeq: 1", "User-Agent: servicescan"]
+    for k, v in (headers or {}).items():
+        lines.append(f"{k}: {v}")
+    req = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace")
+    data = b""
+    try:
+        writer.write(req)
+        await writer.drain()
+        while b"\r\n\r\n" not in data and len(data) < 65536:
+            chunk = await asyncio.wait_for(reader.read(2048), timeout=timeout)
+            if not chunk:
+                break
+            data += chunk
+        # pull the SDP body (DESCRIBE 200) up to its Content-Length
+        head, sep, rest = data.partition(b"\r\n\r\n")
+        cl = re.search(rb"Content-Length:\s*(\d+)", head, re.I)
+        if sep and cl:
+            need = min(int(cl.group(1)), 131072)
+            while len(rest) < need:
+                chunk = await asyncio.wait_for(reader.read(2048), timeout=timeout)
+                if not chunk:
+                    break
+                rest += chunk
+            data = head + sep + rest
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+    return _parse_rtsp(data) if data else None
+
+
+def _parse_www_auth(wa: str) -> tuple[str, str, str, str]:
+    """(scheme, realm, nonce, qop) from a WWW-Authenticate header."""
+    low = wa.lower()
+    scheme = "Digest" if "digest" in low else ("Basic" if "basic" in low else "")
+    def grab(key):
+        m = re.search(key + r'\s*=\s*"?([^",]*)"?', wa, re.I)
+        return m.group(1) if m else ""
+    return scheme, grab("realm"), grab("nonce"), grab("qop")
+
+
+def _rtsp_auth_header(scheme: str, realm: str, nonce: str, qop: str,
+                      user: str, pw: str, method: str, uri: str) -> str:
+    """Build an Authorization header for one credential (Basic or Digest)."""
+    if scheme == "Basic":
+        import base64
+        return "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()
+    if scheme == "Digest" and realm and nonce:
+        import hashlib
+        h = lambda s: hashlib.md5(s.encode()).hexdigest()  # noqa: E731
+        ha1 = h(f"{user}:{realm}:{pw}")
+        ha2 = h(f"{method}:{uri}")
+        if qop:
+            nc, cnonce = "00000001", "0a4f113b"
+            resp = h(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}")
+            return (f'Digest username="{user}", realm="{realm}", nonce="{nonce}", '
+                    f'uri="{uri}", response="{resp}", qop={qop}, nc={nc}, '
+                    f'cnonce="{cnonce}"')
+        resp = h(f"{ha1}:{nonce}:{ha2}")
+        return (f'Digest username="{user}", realm="{realm}", nonce="{nonce}", '
+                f'uri="{uri}", response="{resp}"')
+    return ""
+
+
+async def rtsp_probe(host: str, port: int, timeout: float) -> dict | None:
+    """Read-only RTSP recon. Returns None if the port is not RTSP, else a dict:
+    {server, public, unauth(bool), unauth_path, auth(scheme), realm, nonce, qop,
+    auth_path}. OPTIONS gives presence+banner; an unauthenticated DESCRIBE over
+    common stream paths detects an open stream (200+SDP) or the auth scheme (401)."""
+    opt = await _rtsp_request(host, port, timeout, "OPTIONS", "/")
+    if opt is None:
+        return None                              # not RTSP (or no response)
+    info = {"server": opt["headers"].get("server", ""),
+            "public": opt["headers"].get("public", ""),
+            "unauth": False, "unauth_path": "",
+            "auth": "", "realm": "", "nonce": "", "qop": "", "auth_path": "/"}
+    for path in _RTSP_DESCRIBE_PATHS:
+        r = await _rtsp_request(host, port, timeout, "DESCRIBE", path,
+                                {"Accept": "application/sdp"})
+        if r is None:
+            continue
+        ctype = r["headers"].get("content-type", "").lower()
+        if r["code"] == 200 and ("sdp" in ctype or r["body"].startswith("v=")):
+            info["unauth"] = True
+            info["unauth_path"] = path
+            return info                          # open stream found -> stop
+        if r["code"] == 401 and not info["auth"]:
+            sc, realm, nonce, qop = _parse_www_auth(
+                r["headers"].get("www-authenticate", ""))
+            info["auth"], info["realm"] = sc, realm
+            info["nonce"], info["qop"] = nonce, qop
+            info["auth_path"] = path
+    return info
+
+
+async def rtsp_try_default_creds(host: str, port: int, timeout: float,
+                                 info: dict) -> str | None:
+    """Try the tiny factory-default credential list against a gated stream via
+    DESCRIBE. Returns 'user:pass' on the first 200, else None. Active step."""
+    if not info.get("auth"):
+        return None
+    path = info.get("auth_path") or "/"
+    uri = f"rtsp://{host}:{port}{path}"
+    for user, pw in _RTSP_DEFAULT_CREDS:
+        hdr = _rtsp_auth_header(info["auth"], info["realm"], info["nonce"],
+                                info["qop"], user, pw, "DESCRIBE", uri)
+        if not hdr:
+            continue
+        r = await _rtsp_request(host, port, timeout, "DESCRIBE", path,
+                                {"Accept": "application/sdp", "Authorization": hdr})
+        if r and r["code"] == 200:
+            return f"{user}:{pw or '<blank>'}"
+    return None
+
 
 # script ids that mark a confirmed unauthenticated/anonymous exposure (critical)
 EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "elasticsearch-unauth", "couchdb-unauth",
-                      "docker-api-unauth", "etcd-unauth", "kubelet-anon"}
+                      "docker-api-unauth", "etcd-unauth", "kubelet-anon",
+                      "rtsp-unauth", "rtsp-default-creds"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -656,6 +826,50 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 f"succeeded). An unauthenticated client can read and modify every "
                 f"database. Enable authorization, bind to localhost, firewall "
                 f"{port}.")
+        return
+
+    if "rtsp" in name or port in _RTSP_PORTS:
+        info = await rtsp_probe(host, port, cfg.timeout)
+        if info is not None:
+            if not svc.name:
+                svc.name = "rtsp"
+            if not svc.product:
+                svc.product = info["server"] or "RTSP"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            banner = f" ({info['server']})" if info["server"] else ""
+            if info["unauth"]:
+                svc.confidence = "high"
+                svc.extrainfo = "UNAUTHENTICATED RTSP stream"
+                svc.scripts.append({"id": "rtsp-unauth", "output":
+                    f"RTSP stream accessible WITHOUT authentication{banner}: an "
+                    f"unauthenticated DESCRIBE of {info['unauth_path']} returned "
+                    f"SDP. Anyone who can reach {port} can pull the live video/"
+                    f"audio feed. Require credentials and restrict {port} to "
+                    f"trusted networks."})
+            elif info["auth"]:
+                realm = f' realm="{info["realm"]}"' if info["realm"] else ""
+                svc.scripts.append({"id": "rtsp-auth", "output":
+                    f"RTSP detected{banner}; authentication enforced "
+                    f"({info['auth']}{realm}). Unauthenticated DESCRIBE was "
+                    f"refused (401)."})
+                if getattr(cfg, "rtsp_creds", True):
+                    hit = await rtsp_try_default_creds(host, port, cfg.timeout,
+                                                       info)
+                    if hit:
+                        svc.confidence = "high"
+                        svc.extrainfo = f"DEFAULT CREDENTIALS ({hit})"
+                        svc.scripts.append({"id": "rtsp-default-creds", "output":
+                            f"RTSP accepts DEFAULT credentials {hit} "
+                            f"({info['auth']} auth): a DESCRIBE of "
+                            f"{info['auth_path']} with factory creds returned 200. "
+                            f"An attacker can view the feed with well-known "
+                            f"credentials. Change the password immediately."})
+            else:
+                svc.scripts.append({"id": "rtsp-info", "output":
+                    f"RTSP server detected{banner}. Methods: "
+                    f"{info['public'] or 'n/a'}. No stream at common paths and no "
+                    f"401, so the unauth status is undetermined."})
         return
 
     # HTTP(S)-based stores. Use TLS when the cert was already grabbed or the

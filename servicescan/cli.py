@@ -70,6 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "apps whose only signal is a JS global or DOM selector "
                          "(Angular, CKEditor, Kubernetes Dashboard, ...); their "
                          "versions then land in the summary and CVE correlation")
+    fp.add_argument("--no-rtsp-creds", action="store_true",
+                    help="RTSP recon (OPTIONS/DESCRIBE, unauth-stream + auth "
+                         "detection) stays read-only; this disables the one "
+                         "active step -- trying factory-default creds on a gated "
+                         "stream (admin:admin, root:root, ...)")
 
     cv = p.add_argument_group("cve")
     cv.add_argument("--no-cve", action="store_true", help="skip CVE correlation")
@@ -173,6 +178,7 @@ def cfg_from_args(a: argparse.Namespace) -> ScanConfig:
         nvd_api_key=a.nvd_api_key,
         min_cvss=a.min_cvss,
         kev_high_only=a.kev_high,
+        rtsp_creds=not a.no_rtsp_creds,
         cve_cache=not a.no_cache,
         cache_ttl=a.cache_ttl,
         web=a.web or a.full,

@@ -259,6 +259,16 @@ nmap's result and, for every under-identified port, adds:
   is reported as such. The probes send only non-mutating GET/commands and
   never write or delete — e.g. etcd exposure is confirmed only when the v2
   keyspace is actually readable, not from the always-public `/version`.
+- **RTSP camera checks** (ports 554/8554/… or any `rtsp` service): a read-only
+  `OPTIONS` names the device and lists methods, and an unauthenticated
+  `DESCRIBE` over common stream paths (Hikvision/Dahua/Axis/generic) detects an
+  **open stream** (`200` + SDP → critical: anyone can view the feed) versus a
+  gated one (`401` → the auth scheme/realm is recorded). On a gated stream it
+  also tries a tiny list of factory-default credentials (`admin:admin`,
+  `root:root`, …) over Basic **and** Digest; an accepted default is a critical
+  finding. Nothing is ever `PLAY`ed or recorded. The default-credential step is
+  the only active one — disable it with `--no-rtsp-creds` to stay fully
+  read-only.
 
 Evidence is merged by confidence, so nmap's good answers are kept and only the
 gaps get filled. The result is strictly **≥ nmap** on version coverage — not a
@@ -304,6 +314,7 @@ servicescan host --fp-all                 # fingerprint every open port, not jus
 servicescan host --no-cve                 # service/version detection only
 servicescan host --min-cvss 7             # only show CVSS >= 7.0
 servicescan host --kev-high               # reports show only KEV or HIGH/CRITICAL (scan.json keeps all)
+servicescan 10.0.0.5 -p 554 --no-rtsp-creds # RTSP camera recon, read-only (no default-cred test)
 servicescan host --no-epss --no-kev       # CVEs only, skip risk enrichment
 servicescan host --no-nmap -p 80,443,8080 # fingerprint-only, no nmap
 servicescan host --exploits               # map CVEs to public exploits/PoCs
@@ -363,7 +374,7 @@ the spec itself. Results group per host in the console, in `scan.json`
 each host gets its own `web/<ip>/<port>-<scheme>/` output subtree.
 
 Key flags: `-iL/--target-file`, `-p/--ports`, `--top-ports`, `--rate` (nmap `--min-rate`),
-`--no-nmap`, `--udp`, `--nse`, `--nse-scripts`, `--fp-all`, `--render`, `--no-cve`,
+`--no-nmap`, `--udp`, `--nse`, `--nse-scripts`, `--fp-all`, `--render`, `--no-rtsp-creds`, `--no-cve`,
 `--no-nvd`, `--no-osv`, `--no-epss`, `--no-kev`, `--exploits`, `--nvd-api-key`,
 `--min-cvss`, `--kev-high`, `--no-cache`, `--cache-ttl`, `--web`, `--full`, `--web-render`,
 `--web-depth`, `--web-max-pages`, `--write-hosts`, `-c/--concurrency`,
