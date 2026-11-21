@@ -394,6 +394,17 @@ nmap's result and, for every under-identified port, adds:
   refuses it is still reported (with a note on the IPMI 2.0 RAKP hash-disclosure
   exposure). Read-only — the probe never completes RAKP or issues a command, so
   no session is actually established.
+- **MQTT** (TCP `1883`, `8883` over TLS): a dependency-free, hand-rolled MQTT
+  3.1.1 **anonymous** `CONNECT` (no username/password). A broker that answers
+  `CONNACK 0x00` accepts unauthenticated clients — anyone who can reach it can
+  subscribe to `#` to read every published message and publish to any topic,
+  which on IoT/OT deployments means reading telemetry and issuing device
+  commands (**critical**, `mqtt-unauth`). A refusal for credentials (`0x04`/
+  `0x05`) is reported informationally as auth-enforced (`mqtt-auth`), and a
+  refusal for another reason as detected-only (`mqtt-detected`); neither is an
+  alert. On an anonymous accept the probe additionally subscribes to the single
+  `$SYS/broker/version` metadata topic to recover a broker version for CVE
+  matching — **never an application topic**, and it publishes nothing.
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully

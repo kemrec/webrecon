@@ -695,6 +695,136 @@ async def zookeeper_probe(host: str, port: int, timeout: float):
 
 
 # ---------------------------------------------------------------------------
+# MQTT (TCP 1883, 8883 over TLS). Dependency-free, read-only: we hand-roll an
+# MQTT 3.1.1 anonymous CONNECT and read the CONNACK. A broker that answers
+# CONNACK 0x00 with no username/password accepts anonymous clients -- an
+# unauthenticated peer can then subscribe to '#' and read all telemetry and
+# publish commands (critical on IoT/OT). 0x04/0x05 mean auth is enforced. On an
+# anonymous accept we additionally SUBSCRIBE to the single broker-version
+# metadata topic ($SYS/broker/version) to recover a version for CVE matching --
+# never an application topic, and we publish nothing. Wire format verified
+# against OASIS MQTT 3.1.1 (CONNECT 0x10 / CONNACK 0x20 0x02 / return codes).
+# ---------------------------------------------------------------------------
+def _mqtt_rem_len(n: int) -> bytes:
+    """Encode an MQTT Remaining Length (variable byte integer)."""
+    out = bytearray()
+    while True:
+        b = n & 0x7f
+        n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def _mqtt_decode_rem_len(data: bytes, i: int):
+    """Decode a Remaining Length at i -> (value, next_index) or (None, i)."""
+    mult, val = 1, 0
+    for _ in range(4):
+        if i >= len(data):
+            return None, i
+        b = data[i]
+        i += 1
+        val += (b & 0x7f) * mult
+        if not (b & 0x80):
+            return val, i
+        mult <<= 7
+    return None, i
+
+
+def _mqtt_connect(client_id: bytes = b"servicescan") -> bytes:
+    """MQTT 3.1.1 anonymous CONNECT (clean session, no username/password)."""
+    # "MQTT" name, protocol level 4, connect flags 0x02 (clean session only),
+    # keep-alive 60s.
+    var = b"\x00\x04MQTT\x04\x02\x00\x3c"
+    payload = len(client_id).to_bytes(2, "big") + client_id
+    body = var + payload
+    return b"\x10" + _mqtt_rem_len(len(body)) + body
+
+
+def _mqtt_subscribe(topic: bytes, pid: int = 1) -> bytes:
+    """MQTT SUBSCRIBE for one topic filter at QoS 0."""
+    body = pid.to_bytes(2, "big") + len(topic).to_bytes(2, "big") + topic + b"\x00"
+    return b"\x82" + _mqtt_rem_len(len(body)) + body
+
+
+def _mqtt_find_publish(buf: bytes, want_topic: bytes):
+    """Scan a buffer of MQTT packets for a PUBLISH on want_topic; return its
+    payload bytes or None. Handles any QoS (skips the packet id when QoS > 0)."""
+    i = 0
+    while i < len(buf):
+        first = buf[i]
+        rl, j = _mqtt_decode_rem_len(buf, i + 1)
+        if rl is None or j + rl > len(buf):
+            break
+        pkt = buf[j:j + rl]
+        if (first & 0xf0) == 0x30 and len(pkt) >= 2:   # PUBLISH
+            tlen = int.from_bytes(pkt[0:2], "big")
+            topic = pkt[2:2 + tlen]
+            qos = (first >> 1) & 0x3
+            off = 2 + tlen + (2 if qos else 0)
+            if topic == want_topic:
+                return pkt[off:]
+        i = j + rl
+    return None
+
+
+async def mqtt_probe(host: str, port: int, timeout: float, tls: bool):
+    """Anonymous MQTT 3.1.1 CONNECT. ('open', version_banner) when the broker
+    accepts an anonymous connection (CONNACK 0x00; banner read read-only from
+    $SYS/broker/version, '' if the broker does not publish it), ('auth', '')
+    when refused for credentials (0x04/0x05), ('detected', '') when refused for
+    another reason (0x01/0x02/0x03), or None when the peer is not MQTT."""
+    ctx = None
+    if tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        writer.write(_mqtt_connect())
+        await writer.drain()
+        connack = await asyncio.wait_for(reader.read(8), timeout=timeout)
+        if len(connack) < 4 or connack[0] != 0x20 or connack[1] != 0x02:
+            return None                                # not an MQTT broker
+        rc = connack[3]
+        if rc in (0x04, 0x05):
+            return ("auth", "")
+        if rc != 0x00:
+            return ("detected", "")
+        # Anonymous connection accepted -- recover the broker version read-only.
+        banner = ""
+        sub_to = min(timeout, 3.0)
+        try:
+            writer.write(_mqtt_subscribe(b"$SYS/broker/version"))
+            await writer.drain()
+            buf = b""
+            while len(buf) < 4096:
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=sub_to)
+                if not chunk:
+                    break
+                buf += chunk
+                pub = _mqtt_find_publish(buf, b"$SYS/broker/version")
+                if pub is not None:
+                    banner = pub.decode("latin-1", "replace").strip()
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        return ("open", banner)
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # UDP exposure probes (SNMP, IPMI). Both are single-packet, read-only requests
 # over UDP. A shared datagram helper sends one payload and waits for one reply;
 # a closed port (ICMP unreachable) resolves fast rather than blocking the whole
@@ -916,6 +1046,8 @@ _RABBITMQ_PORTS = {15672}
 _MINIO_PORTS = {9000, 9001}
 _PORTAINER_PORTS = {9000, 9443}
 _ZOOKEEPER_PORTS = {2181}
+_MQTT_PORTS = {1883}                              # MQTT over plain TCP
+_MQTTS_PORTS = {8883}                             # MQTT over TLS (MQTTS)
 _RTSP_PORTS = {554, 8554, 7447, 10554, 1554, 555}
 _RTSPS_PORTS = {322}                             # RTSP over TLS (RTSPS, IANA 322)
 # ports that always speak TLS (the plaintext peer, when one exists, is elsewhere)
@@ -2433,7 +2565,8 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "ipmi-cipher-zero",
                       "prometheus-unauth", "consul-unauth", "rabbitmq-unauth",
                       "minio-unauth", "portainer-unauth", "zookeeper-unauth",
-                      "camera-ws-stream-unauth", "ttyd-shell-unauth"}
+                      "camera-ws-stream-unauth", "ttyd-shell-unauth",
+                      "mqtt-unauth"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -2730,6 +2863,44 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 f"can read and modify znodes (service registries, Kafka/HBase "
                 f"metadata). Restrict the 4lw whitelist, enable SASL + ACLs, "
                 f"firewall {port}.")
+            return
+
+    if "mqtt" in name or port in _MQTT_PORTS or port in _MQTTS_PORTS:
+        mtls = (port in _MQTTS_PORTS or is_tls_service(svc)
+                or "mqtts" in name or "ssl" in name)
+        res = await mqtt_probe(host, port, cfg.timeout, mtls)
+        if res:
+            kind, banner = res
+            if kind == "open":
+                m = re.search(r"[0-9]+\.[0-9][0-9.]*", banner)
+                ver = m.group(0) if m else ""
+                _mark_exposure(svc, "mqtt", "MQTT broker", "open", ver,
+                    "mqtt-unauth",
+                    f"MQTT broker accepts anonymous connections WITHOUT "
+                    f"authentication (an MQTT 3.1.1 CONNECT with no "
+                    f"username/password was answered CONNACK 0x00). An "
+                    f"unauthenticated client can subscribe to '#' and read every "
+                    f"published message and publish to any topic -- on IoT/OT "
+                    f"deployments that means reading sensor/telemetry data and "
+                    f"issuing device commands. The probe only subscribed to the "
+                    f"broker-version metadata topic, never an application topic. "
+                    f"Set allow_anonymous false with a password file/ACLs and "
+                    f"firewall {port}."
+                    + (f' Broker version banner: "{banner}".' if banner else ""))
+            elif kind == "auth":
+                _mark_exposure(svc, "mqtt", "MQTT broker", "auth", "",
+                               "mqtt-unauth", "")
+            else:  # detected but anonymous refused for a non-credential reason
+                if not svc.name:
+                    svc.name = "mqtt"
+                if not svc.product:
+                    svc.product = "MQTT broker"
+                if "exposure" not in svc.sources:
+                    svc.sources.append("exposure")
+                svc.scripts.append({"id": "mqtt-detected", "output":
+                    f"MQTT broker detected on {port}; an anonymous CONNECT was "
+                    f"refused for a non-credential reason (CONNACK != 0x00/0x04/"
+                    f"0x05), so anonymous access could not be confirmed."})
             return
 
     # gRPC / HTTP2 on a dedicated gRPC port (or a `grpc`-named service). Scoped
