@@ -14,12 +14,17 @@ endpoints and parameters from HTML and JS, check what's alive, enumerate
 subdomains, discover hidden vhosts from certificate SANs, and scan every
 response for API keys, tokens, passwords and other secrets.
 
-This repo ships **two CLIs** that share one async core:
+Drive it from the terminal, or run `servicescan` from a **local browser console**
+(`python -m webrecon_ui`) — a dependency-free operator UI with live scanning,
+CVE/exposure highlighting, and one-click export to every output format.
+
+This repo ships **two CLIs and a browser console**, all sharing one async core:
 
 | Tool | Purpose |
 |------|---------|
 | **`webrecon`** | web app crawler & recon (crawl + JS + params + alive + subdomains + vhost + secrets) |
 | **`servicescan`** | port/service/version discovery (nmap + own fingerprint layer) with NVD/OSV CVE correlation |
+| **`webrecon-ui`** | browser-based operator console for `servicescan` (localhost; `python -m webrecon_ui`) — live SSE scan, CVE/exposure highlighting, the `--web` crawl chain, every output format as a download |
 
 ---
 
