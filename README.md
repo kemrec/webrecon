@@ -521,6 +521,12 @@ nmap's result and, for every under-identified port, adds:
   (`vnc-none-auth`; the offered types are also listed via `vnc-security-types`).
   The probe only reads the offered types per RFC 6143 — it never selects one, so
   no session is taken.
+- **FTP** (TCP `21`): the `220` greeting leaks the server banner, then
+  `USER anonymous` / `PASS` tells whether **anonymous login** is allowed
+  (`230` → `ftp-anon` alert) or refused (good posture). Anonymous login uses no
+  real credential (same model as the LDAP/rsync anonymous checks); no listing or
+  transfer is performed — the session is closed with `QUIT` right after the login
+  result.
 - **Kerberos KDC** (TCP `88`): dependency-free ASN.1/DER per RFC 4120. For a
   small built-in set of default principals an **AS-REQ with no pre-authentication**
   is sent; the KDC's reply classifies each account without ever sending a

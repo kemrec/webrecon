@@ -744,6 +744,82 @@ async def vnc_probe(host: str, port: int, timeout: float):
     return out
 
 
+# FTP (TCP 21). RFC 959 anonymous-login check: the 220 greeting leaks the server
+# banner (version), then USER anonymous / PASS anonymous@ tells whether anonymous
+# access is allowed (230 = logged in) or refused (530). Anonymous login uses no
+# real credential (same model as the LDAP/rsync anonymous checks); it is the
+# exposure being proven. No file is listed or transferred -- the session is
+# closed with QUIT right after the login result.
+_FTP_PORTS = {21}
+
+
+async def _ftp_resp(reader, timeout: float) -> bytes:
+    """Read one (possibly multi-line) FTP reply, ending at a '<ddd> ' line."""
+    buf = b""
+    while len(buf) < 8192:
+        try:
+            chunk = await asyncio.wait_for(reader.read(512), timeout=timeout)
+        except Exception:  # noqa: BLE001
+            break
+        if not chunk:
+            break
+        buf += chunk
+        for ln in buf.split(b"\r\n"):
+            if len(ln) >= 4 and ln[:3].isdigit() and ln[3:4] == b" ":
+                return buf
+    return buf
+
+
+def _ftp_code(buf: bytes) -> int:
+    for ln in buf.split(b"\r\n"):
+        if len(ln) >= 4 and ln[:3].isdigit() and ln[3:4] == b" ":
+            return int(ln[:3])
+    return 0
+
+
+async def ftp_probe(host: str, port: int, timeout: float):
+    """Try anonymous FTP login (no real credential). Returns
+    {banner, anon:bool} or None."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    out = None
+    try:
+        greet = await _ftp_resp(reader, timeout)
+        if _ftp_code(greet) != 220:
+            return None
+        banner = ""
+        for ln in greet.split(b"\r\n"):
+            if ln[:3].isdigit():
+                banner = ln[4:].decode("latin-1", "replace").strip()
+                break
+        writer.write(b"USER anonymous\r\n")
+        await writer.drain()
+        c1 = _ftp_code(await _ftp_resp(reader, timeout))
+        anon = (c1 == 230)
+        if c1 == 331:                        # password requested
+            writer.write(b"PASS anonymous@example.com\r\n")
+            await writer.drain()
+            anon = (_ftp_code(await _ftp_resp(reader, timeout)) == 230)
+        try:
+            writer.write(b"QUIT\r\n")
+            await writer.drain()
+        except Exception:  # noqa: BLE001
+            pass
+        out = {"banner": banner, "anon": anon}
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+    return out
+
+
 # --- HTTP(S)-based stores: Elasticsearch / CouchDB / Docker API / etcd / kubelet
 # All read-only GETs (no POST/PUT/DELETE), no redirects followed.
 async def _http_get_once(host: str, port: int, path: str, timeout: float,
@@ -3985,7 +4061,7 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "nfs-export-world", "ldap-anonymous-read",
                       "rsync-anon-module", "winrm-basic-cleartext",
                       "krb-asrep-roastable", "postgres-trust-unauth",
-                      "vnc-none-auth"}
+                      "vnc-none-auth", "ftp-anon"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -4250,6 +4326,33 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                     "Set a VNC password or require VeNCrypt/TLS, bind to "
                     f"localhost, firewall {port}. (The probe only read the "
                     "offered types; no session was taken.)"})
+        return
+
+    if port in _FTP_PORTS or name == "ftp":
+        res = await ftp_probe(host, port, cfg.timeout)
+        if res:
+            if not svc.name:
+                svc.name = "ftp"
+            if res.get("banner") and not svc.banner:
+                svc.banner = res["banner"][:200]
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            if res.get("banner"):
+                svc.scripts.append({"id": "ftp-banner", "output":
+                    f"FTP greeting: {res['banner']}"})
+            if res.get("anon"):
+                svc.confidence = "high"
+                svc.extrainfo = "anonymous FTP"
+                svc.scripts.append({"id": "ftp-anon", "output":
+                    "Anonymous FTP login is allowed (USER anonymous -> 230). Any "
+                    "client can read the files the anonymous account can reach, "
+                    "and write/upload if a writable directory is exposed. Disable "
+                    "anonymous access or restrict it to a locked-down chroot, and "
+                    f"firewall {port}. (Login result only; no listing or transfer "
+                    "was performed.)"})
+            else:
+                svc.scripts.append({"id": "ftp-anon-refused", "output":
+                    "Anonymous FTP login refused -- good posture."})
         return
 
     if "rtsp" in name or port in _RTSP_PORTS or port in _RTSPS_PORTS:
