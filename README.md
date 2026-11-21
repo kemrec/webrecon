@@ -302,6 +302,16 @@ nmap's result and, for every under-identified port, adds:
   its Types, Scopes (`onvif://…/name|hardware|location`) and the `device_service`
   XAddr. Run once per host (one datagram, unicast only), so it surfaces cameras a
   default TCP scan misses.
+- **SSDP / UPnP** (UDP 1900): a unicast `M-SEARCH` (`ssdp:all`) makes a UPnP
+  device answer with its `SERVER` string, the `LOCATION` of its device
+  description, and the `ST`/`USN` of each advertised target; the description XML
+  is then fetched read-only (keeping the scanned host — the advertised LAN IP is
+  never followed) to recover manufacturer/model/firmware and the list of UPnP
+  services. UPnP discovery is unauthenticated **by design**, so this is reported
+  **informationally** (`ssdp-upnp`) — device enumeration for CVE anchoring and
+  attack-surface mapping, not an unauth-access alert. An advertised Internet
+  Gateway control service (`WANIPConnection`/`WANPPPConnection`) is flagged as a
+  hardening concern. Run once per host, unicast only.
 - **Vendor camera CGI** (camera-signalled web port): the HTTP management API that
   Hikvision (`/ISAPI/System/deviceInfo`), Dahua (`/cgi-bin/magicBox.cgi`) and Axis
   (`/axis-cgi/param.cgi`) cameras expose beside RTSP/ONVIF. A read-only `GET` that

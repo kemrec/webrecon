@@ -2102,6 +2102,119 @@ async def wsdiscovery_probe(host: str, port: int, timeout: float) -> dict | None
 
 
 # ---------------------------------------------------------------------------
+# SSDP / UPnP (UDP 1900). A unicast M-SEARCH (ssdp:all) makes a UPnP device
+# answer with HTTP-over-UDP responses naming its SERVER string, the LOCATION of
+# its device-description XML, and the ST/USN of each advertised target. UPnP
+# discovery is unauthenticated BY DESIGN, so this is INFORMATIONAL device
+# enumeration (model/firmware for CVE anchoring + advertised service surface),
+# not an unauth-access breach. Unicast only -- never leaves the scanned host.
+# ---------------------------------------------------------------------------
+_SSDP_PORTS = {1900}
+_SSDP_MSEARCH = (
+    "M-SEARCH * HTTP/1.1\r\n"
+    "HOST: 239.255.255.250:1900\r\n"
+    'MAN: "ssdp:discover"\r\n'
+    "MX: 1\r\n"
+    "ST: ssdp:all\r\n"
+    "USER-AGENT: servicescan UPnP/1.1\r\n\r\n"
+).encode()
+
+
+def _ssdp_headers(text: str) -> dict:
+    """Parse an SSDP/HTTP response's headers into a lower-cased dict."""
+    out = {}
+    for ln in text.split("\r\n")[1:]:
+        k, sep, v = ln.partition(":")
+        if sep:
+            out[k.strip().lower()] = v.strip()
+    return out
+
+
+def _ssdp_location_parts(location: str):
+    """(path, port, tls) from a LOCATION URL, keeping the scanned host so the
+    description fetch never pivots to an advertised LAN IP. None if unparseable."""
+    m = re.match(r"(https?)://[^/:]+(?::(\d+))?(/[^\s]*)?$", location, re.I)
+    if not m:
+        return None
+    tls = m.group(1).lower() == "https"
+    port = int(m.group(2)) if m.group(2) else (443 if tls else 80)
+    return (m.group(3) or "/"), port, tls
+
+
+def _parse_upnp_desc(xml: str) -> dict:
+    """Pull device identity + advertised serviceType list from a UPnP device
+    description XML (regex, dependency-free)."""
+    def grab(tag):
+        m = re.search(rf"<{tag}>(.*?)</{tag}>", xml, re.I | re.S)
+        return " ".join(m.group(1).split()) if m else ""
+    services = [" ".join(s.split())
+                for s in re.findall(r"<serviceType>(.*?)</serviceType>",
+                                    xml, re.I | re.S)]
+    return {"friendly": grab("friendlyName"),
+            "manufacturer": grab("manufacturer"),
+            "model": grab("modelName"),
+            "model_number": grab("modelNumber"),
+            "device_type": grab("deviceType"),
+            "services": services}
+
+
+async def ssdp_probe(host: str, port: int, timeout: float) -> dict | None:
+    """Unicast SSDP M-SEARCH (ssdp:all) over UDP. Collects the device's
+    responses for a short window and aggregates SERVER / LOCATION / ST / USN.
+    Returns {server, locations, sts, usns} or None when nothing answers."""
+    loop = asyncio.get_event_loop()
+    packets: list[bytes] = []
+
+    class _P(asyncio.DatagramProtocol):
+        def datagram_received(self, data, addr):  # noqa: ARG002
+            packets.append(data)
+
+        def error_received(self, exc):  # noqa: ARG002
+            pass
+
+    try:
+        transport, _ = await asyncio.wait_for(
+            loop.create_datagram_endpoint(_P, remote_addr=(host, port)),
+            timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        transport.sendto(_SSDP_MSEARCH)
+        await asyncio.sleep(min(timeout, 2.0))      # collect the response burst
+    finally:
+        transport.close()
+    server, locations, sts, usns = "", [], [], []
+    for p in packets:
+        text = p.decode("latin-1", "replace")
+        if not (text.upper().startswith("HTTP/") or text.upper().startswith("NOTIFY")):
+            continue
+        h = _ssdp_headers(text)
+        if h.get("server") and not server:
+            server = h["server"]
+        for key, bucket in (("location", locations), ("st", sts), ("usn", usns)):
+            v = h.get(key)
+            if v and v not in bucket:
+                bucket.append(v)
+    if not (server or locations or sts):
+        return None
+    return {"server": server, "locations": locations, "sts": sts, "usns": usns}
+
+
+async def ssdp_describe(host: str, location: str, timeout: float) -> dict:
+    """Fetch and parse the UPnP device-description XML named by a LOCATION URL,
+    read-only, keeping the scanned host (adopting only the URL's port/path/
+    scheme). Returns a parsed dict, or {} on any failure."""
+    parts = _ssdp_location_parts(location)
+    if not parts:
+        return {}
+    path, dport, tls = parts
+    r = await _http_get_once(host, dport, path, timeout, tls)
+    if not r or r[0] != 200:
+        return {}
+    return _parse_upnp_desc(r[2].decode("latin-1", "replace"))
+
+
+# ---------------------------------------------------------------------------
 # gRPC (HTTP/2). Modern device/service control planes expose gRPC; nmap usually
 # leaves these ports unidentified ("tcpwrapped"). Detection is dependency-free:
 # over TLS we offer ALPN and check for a negotiated "h2"; cleartext we send the
@@ -3297,6 +3410,66 @@ async def run_exposure_checks(cfg: ScanConfig, host: str,
                 "Request); cipher suite 0 was refused. Note BMCs are also exposed "
                 "to the IPMI 2.0 RAKP password-hash disclosure -- restrict UDP 623 "
                 "to a management network and use strong BMC passwords."})
+
+    # Host-level SSDP/UPnP (UDP 1900, unicast M-SEARCH). UPnP discovery is
+    # unauthenticated by design, so this is INFORMATIONAL enumeration (device
+    # model/firmware for CVE anchoring + advertised service surface), never an
+    # unauth-access alert. An advertised Internet Gateway control service
+    # (WANIPConnection/WANPPPConnection) is called out as a hardening concern.
+    try:
+        ssdp = await ssdp_probe(host, 1900, min(cfg.timeout, 3.0))
+    except Exception:  # noqa: BLE001
+        ssdp = None
+    if ssdp:
+        svc = _udp_svc(1900, "upnp")
+        desc = {}
+        if ssdp["locations"]:
+            try:
+                desc = await ssdp_describe(host, ssdp["locations"][0],
+                                           min(cfg.timeout, 3.0))
+            except Exception:  # noqa: BLE001
+                desc = {}
+        label = " ".join(v for v in (desc.get("manufacturer"),
+                                      desc.get("model")) if v).strip()
+        if label and not svc.product:
+            svc.product = label
+        elif ssdp["server"] and not svc.product:
+            svc.product = ssdp["server"]
+        if desc.get("model_number") and not svc.version:
+            nv = _norm_ver(desc["model_number"])
+            if nv:
+                svc.version = nv
+                svc.cve_skip = False
+        igd = sorted({s for s in desc.get("services", [])
+                      if "WANIPConnection" in s or "WANPPPConnection" in s})
+        bits = []
+        if ssdp["server"]:
+            bits.append(f"SERVER: {ssdp['server']}")
+        if desc.get("friendly"):
+            bits.append(f"device: {desc['friendly']}")
+        if label:
+            bits.append("model: " + label
+                        + (f" {desc['model_number']}"
+                           if desc.get("model_number") else ""))
+        if ssdp["locations"]:
+            bits.append(f"LOCATION: {ssdp['locations'][0]}")
+        if desc.get("services"):
+            bits.append(f"{len(desc['services'])} UPnP services"
+                        + (f" incl. {', '.join(igd)}" if igd else ""))
+        elif ssdp["sts"]:
+            bits.append("ST: " + ", ".join(ssdp["sts"][:6]))
+        note = ("; ".join(bits)
+                + ". UPnP discovery is unauthenticated by design; this "
+                  "enumerates the device (model/firmware and advertised "
+                  "services) for attack-surface mapping.")
+        if igd:
+            note += (" The device advertises an Internet Gateway control "
+                     "service (WANIPConnection/WANPPPConnection): if this UPnP "
+                     "IGD is reachable from an untrusted network, clients can "
+                     "map arbitrary ports through the gateway -- restrict UPnP "
+                     "to the LAN.")
+        svc.scripts.append({"id": "ssdp-upnp", "output":
+            "SSDP/UPnP answered a unicast M-SEARCH (UDP 1900): " + note})
 
     hits = [s for s in services
             if any(sc.get("id", "") in EXPOSURE_ALERT_IDS for sc in s.scripts)]
