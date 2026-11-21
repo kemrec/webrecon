@@ -11,8 +11,7 @@ from . import fingerprint
 
 
 # script ids that are security findings, not informational -> red in console
-_ALERT_IDS = {"bindshell-detect", "redis-unauth", "memcached-unauth",
-              "mongodb-unauth"}
+_ALERT_IDS = {"bindshell-detect"} | fingerprint.EXPOSURE_ALERT_IDS
 
 
 def _sev_color(sev: str, score) -> str:

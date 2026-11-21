@@ -441,9 +441,161 @@ async def mongodb_probe(host: str, port: int, timeout: float):
     return None
 
 
+# --- HTTP(S)-based stores: Elasticsearch / CouchDB / Docker API / etcd / kubelet
+# All read-only GETs (no POST/PUT/DELETE), no redirects followed.
+async def _http_get_once(host: str, port: int, path: str, timeout: float,
+                         tls: bool = False, nbytes: int = 16384):
+    """Raw HTTP/1.0 GET. Returns (status:int, headers:dict, body:bytes) or None.
+    Strictly read-only; follows no redirects; TLS cert never verified."""
+    ctx = None
+    if tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    raw = b""
+    try:
+        req = (f"GET {path} HTTP/1.0\r\nHost: {host}\r\n"
+               f"User-Agent: servicescan\r\nAccept: */*\r\n"
+               f"Connection: close\r\n\r\n")
+        writer.write(req.encode())
+        await writer.drain()
+        try:
+            while len(raw) < nbytes:
+                chunk = await asyncio.wait_for(reader.read(nbytes), timeout=timeout)
+                if not chunk:
+                    break
+                raw += chunk
+        except asyncio.TimeoutError:
+            pass
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+    if not raw.startswith(b"HTTP/"):
+        return None
+    head, _, body = raw.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    try:
+        status = int(lines[0].split(b" ")[1])
+    except (IndexError, ValueError):
+        return None
+    headers = {}
+    for ln in lines[1:]:
+        k, _, v = ln.partition(b":")
+        if k:
+            headers[k.strip().lower().decode("latin-1", "replace")] = \
+                v.strip().decode("latin-1", "replace")
+    return status, headers, body
+
+
+def _json_ver(body: bytes, key: str) -> str:
+    m = re.search(rb'"' + re.escape(key.encode()) + rb'"\s*:\s*"([0-9][0-9.]+)',
+                  body)
+    return m.group(1).decode() if m else ""
+
+
+async def elasticsearch_probe(host: str, port: int, timeout: float, tls: bool):
+    """Elasticsearch root (read-only). ('open', version) / ('auth', '') / None."""
+    r = await _http_get_once(host, port, "/", timeout, tls)
+    if not r:
+        return None
+    status, _, body = r
+    low = body.lower()
+    if status == 200 and (b"you know, for search" in low
+                          or b'"cluster_name"' in low or b"lucene_version" in low):
+        return ("open", _json_ver(body, "number"))
+    if status in (401, 403):
+        return ("auth", "")
+    return None
+
+
+async def couchdb_probe(host: str, port: int, timeout: float, tls: bool):
+    """CouchDB welcome + /_all_dbs (read-only). ('open', v)/('auth','')/None."""
+    r = await _http_get_once(host, port, "/", timeout, tls)
+    if not r:
+        return None
+    status, _, body = r
+    if b'"couchdb"' not in body.lower() or b"welcome" not in body.lower():
+        if status in (401, 403):
+            return ("auth", "")
+        return None
+    ver = _json_ver(body, "version")
+    r2 = await _http_get_once(host, port, "/_all_dbs", timeout, tls)
+    if r2 and r2[0] == 200 and r2[2].lstrip().startswith(b"["):
+        return ("open", ver)
+    return ("auth", "")        # CouchDB confirmed, but listing refused
+
+
+async def docker_api_probe(host: str, port: int, timeout: float, tls: bool):
+    """Docker Engine API /version (read-only). ('open', v)/('auth','')/None."""
+    r = await _http_get_once(host, port, "/version", timeout, tls)
+    if not r:
+        return None
+    status, _, body = r
+    if status == 200 and b'"ApiVersion"' in body and b'"GoVersion"' in body:
+        return ("open", _json_ver(body, "Version"))
+    if status in (401, 403):
+        return ("auth", "")
+    return None
+
+
+async def etcd_probe(host: str, port: int, timeout: float, tls: bool):
+    """etcd /version + /v2/keys read (read-only). ('open', v)/('auth','')/None.
+    Only confirms exposure when the v2 keyspace is readable unauthenticated;
+    a v3-only (gRPC) node is left to nmap rather than guessed over HTTP."""
+    r = await _http_get_once(host, port, "/version", timeout, tls)
+    if not r or b'"etcdserver"' not in r[2]:
+        return None
+    ver = _json_ver(r[2], "etcdserver")
+    r2 = await _http_get_once(host, port, "/v2/keys/?recursive=false", timeout, tls)
+    if not r2:
+        return None
+    status, _, body = r2
+    if status == 200 and b'"action"' in body:
+        return ("open", ver)
+    if status in (401, 403):
+        return ("auth", "")
+    return None            # v2 disabled (404): cannot confirm over HTTP -> no claim
+
+
+async def kubelet_probe(host: str, port: int, timeout: float, tls: bool):
+    """kubelet /pods (read-only). ('open','') when anonymous auth is enabled
+    (PodList returned) / ('auth','') when refused / None."""
+    r = await _http_get_once(host, port, "/pods", timeout, tls)
+    if not r:
+        return None
+    status, _, body = r
+    if status == 200 and b'"kind"' in body and b'"PodList"' in body:
+        return ("open", "")
+    if status in (401, 403):
+        return ("auth", "")
+    return None
+
+
 _REDIS_PORTS = {6379, 6380}
 _MEMCACHED_PORTS = {11211}
 _MONGO_PORTS = {27017, 27018, 27019}
+_ES_PORTS = {9200, 9201}
+_COUCHDB_PORTS = {5984, 6984}
+_DOCKER_PORTS = {2375, 2376}
+_ETCD_PORTS = {2379, 4001}
+_KUBELET_PORTS = {10250, 10255}
+# ports that always speak TLS (the plaintext peer, when one exists, is elsewhere)
+_TLS_EXPOSURE_PORTS = {2376, 6984, 10250}
+
+# script ids that mark a confirmed unauthenticated/anonymous exposure (critical)
+EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
+                      "elasticsearch-unauth", "couchdb-unauth",
+                      "docker-api-unauth", "etcd-unauth", "kubelet-anon"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -461,7 +613,8 @@ def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
         svc.extrainfo = "UNAUTHENTICATED access"
         svc.scripts.append({"id": script_id, "output": crit_output})
     else:
-        svc.scripts.append({"id": script_id.replace("-unauth", "-auth"),
+        auth_id = script_id.replace("-unauth", "-auth").replace("-anon", "-auth")
+        svc.scripts.append({"id": auth_id,
                             "output": f"{product} detected; authentication is "
                                       "enforced (the read-only probe was refused "
                                       "without credentials)."})
@@ -505,6 +658,69 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 f"{port}.")
         return
 
+    # HTTP(S)-based stores. Use TLS when the cert was already grabbed or the
+    # port is TLS-only.
+    tls = bool(svc.tls) or port in _TLS_EXPOSURE_PORTS
+
+    if "elasticsearch" in name or port in _ES_PORTS:
+        res = await elasticsearch_probe(host, port, cfg.timeout, tls)
+        if res:
+            _mark_exposure(svc, "elasticsearch", "Elasticsearch", res[0], res[1],
+                "elasticsearch-unauth",
+                f"Elasticsearch reachable WITHOUT authentication (cluster root "
+                f"answered). An unauthenticated client can read every index and, "
+                f"via _search / _cat, dump all stored documents. Enable the "
+                f"security realm (xpack.security), bind to localhost, firewall "
+                f"{port}.")
+        return
+
+    if "couchdb" in name or port in _COUCHDB_PORTS:
+        res = await couchdb_probe(host, port, cfg.timeout, tls)
+        if res:
+            _mark_exposure(svc, "couchdb", "CouchDB", res[0], res[1],
+                "couchdb-unauth",
+                f"CouchDB reachable WITHOUT authentication (_all_dbs listed every "
+                f"database). An unauthenticated client can read and modify all "
+                f"documents; the Admin Party default also allows creating admin "
+                f"users. Require admin credentials, bind to localhost, firewall "
+                f"{port}.")
+        return
+
+    if "docker" in name or port in _DOCKER_PORTS:
+        res = await docker_api_probe(host, port, cfg.timeout, tls)
+        if res:
+            _mark_exposure(svc, "docker", "Docker Engine API", res[0], res[1],
+                "docker-api-unauth",
+                f"Docker Engine API reachable WITHOUT authentication (/version "
+                f"answered). This is equivalent to root on the host: an "
+                f"unauthenticated client can run a privileged container that mounts "
+                f"the host filesystem. Never expose the TCP socket unauthenticated; "
+                f"require TLS client certs (--tlsverify), firewall {port}.")
+        return
+
+    if "etcd" in name or port in _ETCD_PORTS:
+        res = await etcd_probe(host, port, cfg.timeout, tls)
+        if res:
+            _mark_exposure(svc, "etcd", "etcd", res[0], res[1],
+                "etcd-unauth",
+                f"etcd reachable WITHOUT authentication (v2 keyspace readable). "
+                f"etcd commonly stores Kubernetes cluster state and Secrets; an "
+                f"unauthenticated client can read and overwrite them. Enable client "
+                f"cert auth / RBAC, bind to localhost, firewall {port}.")
+        return
+
+    if "kubelet" in name or port in _KUBELET_PORTS:
+        res = await kubelet_probe(host, port, cfg.timeout, tls)
+        if res:
+            _mark_exposure(svc, "kubelet", "kubelet", res[0], res[1],
+                "kubelet-anon",
+                f"kubelet allows ANONYMOUS access (/pods returned the pod list). "
+                f"With anonymous auth enabled an attacker can enumerate pods and, "
+                f"via /exec and /run, run commands inside containers on this node. "
+                f"Set --anonymous-auth=false and --authorization-mode=Webhook, "
+                f"firewall {port}.")
+        return
+
 
 async def run_exposure_checks(cfg: ScanConfig, host: str,
                               services: list[Service]) -> None:
@@ -524,7 +740,7 @@ async def run_exposure_checks(cfg: ScanConfig, host: str,
 
     await asyncio.gather(*(one(s) for s in open_svcs))
     hits = [s for s in open_svcs
-            if any(sc.get("id", "").endswith("-unauth") for sc in s.scripts)]
+            if any(sc.get("id", "") in EXPOSURE_ALERT_IDS for sc in s.scripts)]
     if hits:
         utils.warn(f"UNAUTHENTICATED exposure on "
                    f"{', '.join(str(s.port) for s in hits)} "

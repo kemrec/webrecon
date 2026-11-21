@@ -124,3 +124,131 @@ def test_check_exposure_ignores_unrelated_service():
     svc = Service(port=0, name="ssh", state="open")
     _check(svc, _responder(b"SSH-2.0-OpenSSH_9.0\r\n"))
     assert svc.scripts == []
+
+
+# --- HTTP(S)-based stores ---------------------------------------------------
+def _probe4(handler, probe, timeout=0.5):
+    """Like _probe but for the HTTP probes whose signature is (h, p, t, tls)."""
+    return _probe(handler, lambda h, p, t: probe(h, p, t, False), timeout)
+
+
+def _resp(status_line: bytes, body: bytes = b"") -> bytes:
+    return (b"HTTP/1.0 " + status_line + b"\r\n"
+            b"Content-Type: application/json\r\nConnection: close\r\n\r\n" + body)
+
+
+def _router(routes: dict, default: bytes = None):
+    """HTTP handler that replies per request path (longest-prefix match)."""
+    if default is None:
+        default = _resp(b"404 Not Found", b"not found")
+    keys = sorted(routes, key=len, reverse=True)
+
+    async def handler(reader, writer):
+        try:
+            req = await reader.read(4096)
+        except Exception:
+            req = b""
+        path = "/"
+        try:
+            path = req.split(b"\r\n", 1)[0].decode("latin-1").split(" ")[1]
+        except Exception:
+            pass
+        resp = default
+        for k in keys:
+            if path == k or path.startswith(k):
+                resp = routes[k]
+                break
+        writer.write(resp)
+        await writer.drain()
+        writer.close()
+    return handler
+
+
+# Elasticsearch
+def test_elasticsearch_open_extracts_version():
+    body = (b'{"name":"n1","cluster_name":"es","version":{"number":"8.11.1",'
+            b'"lucene_version":"9.8.0"},"tagline":"You Know, for Search"}')
+    assert _probe4(_router({"/": _resp(b"200 OK", body)}),
+                   fp.elasticsearch_probe) == ("open", "8.11.1")
+
+
+def test_elasticsearch_auth_required():
+    assert _probe4(_router({"/": _resp(b"401 Unauthorized", b"")}),
+                   fp.elasticsearch_probe) == ("auth", "")
+
+
+def test_elasticsearch_non_es_is_none():
+    assert _probe4(_router({"/": _resp(b"200 OK", b"<html>hi</html>")}),
+                   fp.elasticsearch_probe) is None
+
+
+# CouchDB (two requests: / then /_all_dbs)
+def test_couchdb_open_when_all_dbs_listed():
+    welcome = _resp(b"200 OK", b'{"couchdb":"Welcome","version":"3.3.3"}')
+    alldbs = _resp(b"200 OK", b'["_users","_replicator","app"]')
+    r = _probe4(_router({"/_all_dbs": alldbs, "/": welcome}), fp.couchdb_probe)
+    assert r == ("open", "3.3.3")
+
+
+def test_couchdb_auth_when_all_dbs_refused():
+    welcome = _resp(b"200 OK", b'{"couchdb":"Welcome","version":"3.3.3"}')
+    r = _probe4(_router({"/_all_dbs": _resp(b"401 Unauthorized", b""),
+                         "/": welcome}), fp.couchdb_probe)
+    assert r == ("auth", "")
+
+
+# Docker Engine API
+def test_docker_open_extracts_version():
+    body = (b'{"Version":"24.0.7","ApiVersion":"1.43","GoVersion":"go1.20.10",'
+            b'"Os":"linux"}')
+    assert _probe4(_router({"/version": _resp(b"200 OK", body)}),
+                   fp.docker_api_probe) == ("open", "24.0.7")
+
+
+def test_docker_non_docker_is_none():
+    assert _probe4(_router({"/version": _resp(b"200 OK", b'{"foo":1}')}),
+                   fp.docker_api_probe) is None
+
+
+# etcd
+def test_etcd_open_when_v2_keys_readable():
+    ver = _resp(b"200 OK", b'{"etcdserver":"3.5.9","etcdcluster":"3.5.0"}')
+    keys = _resp(b"200 OK", b'{"action":"get","node":{"key":"/","dir":true}}')
+    r = _probe4(_router({"/v2/keys": keys, "/version": ver}), fp.etcd_probe)
+    assert r == ("open", "3.5.9")
+
+
+def test_etcd_v3_only_is_none():
+    # /version answers but v2 keyspace is disabled (404) -> no claim
+    ver = _resp(b"200 OK", b'{"etcdserver":"3.5.9","etcdcluster":"3.5.0"}')
+    r = _probe4(_router({"/version": ver}), fp.etcd_probe)   # /v2/keys -> 404
+    assert r is None
+
+
+# kubelet
+def test_kubelet_open_when_pods_listed():
+    body = b'{"kind":"PodList","apiVersion":"v1","items":[]}'
+    assert _probe4(_router({"/pods": _resp(b"200 OK", body)}),
+                   fp.kubelet_probe) == ("open", "")
+
+
+def test_kubelet_auth_when_forbidden():
+    assert _probe4(_router({"/pods": _resp(b"403 Forbidden", b"forbidden")}),
+                   fp.kubelet_probe) == ("auth", "")
+
+
+# check_exposure wiring (port-triggered) + the auth-id is not an alert
+def test_check_exposure_marks_docker_api_unauth():
+    svc = Service(port=0, name="docker", state="open")
+    body = _resp(b"200 OK",
+                 b'{"Version":"24.0.7","ApiVersion":"1.43","GoVersion":"go1","Os":"linux"}')
+    _check(svc, _router({"/version": body}))
+    assert "docker-api-unauth" in [sc["id"] for sc in svc.scripts]
+
+
+def test_kubelet_auth_id_is_not_an_alert():
+    svc = Service(port=0, name="kubelet", state="open")
+    _check(svc, _router({"/pods": _resp(b"401 Unauthorized", b"")}))
+    ids = [sc["id"] for sc in svc.scripts]
+    assert "kubelet-anon" not in ids and "kubelet-auth" in ids
+    assert "kubelet-auth" not in fp.EXPOSURE_ALERT_IDS

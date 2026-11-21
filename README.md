@@ -238,10 +238,14 @@ nmap's result and, for every under-identified port, adds:
   bindshell detection,
 - **unauthenticated-exposure checks** (read-only, run on every open port, not
   just the under-identified ones): Redis `INFO`, memcached `version`, MongoDB
-  `listDatabases` confirm whether a data store answers without credentials. An
-  open one is flagged as a critical finding (and the probe also recovers the
-  version); a password-protected one is reported as such. The probes send only
-  non-mutating commands and never write or delete.
+  `listDatabases`, Elasticsearch cluster root, CouchDB `/_all_dbs`, Docker
+  Engine API `/version`, etcd `/v2/keys`, and kubelet `/pods` (anonymous auth)
+  confirm whether a store or control-plane endpoint answers without
+  credentials. An open one is flagged as a critical finding (and, where
+  available, the probe also recovers the version); a credential-protected one
+  is reported as such. The probes send only non-mutating GET/commands and
+  never write or delete — e.g. etcd exposure is confirmed only when the v2
+  keyspace is actually readable, not from the always-public `/version`.
 
 Evidence is merged by confidence, so nmap's good answers are kept and only the
 gaps get filled. The result is strictly **≥ nmap** on version coverage — not a
