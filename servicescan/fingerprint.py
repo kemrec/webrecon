@@ -1871,6 +1871,39 @@ async def ws_stream_probe(host: str, port: int, timeout: float, tls: bool,
             pass
 
 
+# ttyd (a web-based terminal) also defaults to 7681 -- it serves an HTML page
+# over HTTP and a shell WebSocket at /ws. An exposed ttyd without authentication
+# is a browser shell = remote code execution, so it is far more severe than a
+# camera feed and must be told apart from the camera WebSocket on the same port.
+# Detection is strictly read-only: GET / (and, as a backstop, GET /token). We
+# NEVER open the /ws shell socket or send the init that spawns the PTY -- the
+# auth state of the HTTP layer is enough (ttyd gates with HTTP Basic via -c).
+async def ttyd_probe(host: str, port: int, timeout: float, tls: bool):
+    """Detect an exposed ttyd web terminal. {'auth': bool} or None. auth=True
+    when the HTTP layer demands credentials (401/403), False when it is open.
+
+    ttyd runs on libwebsockets and routes auth before any path, so with -c set
+    every path (including /) returns 401 with WWW-Authenticate: Basic
+    realm="ttyd" -- that realm is a strong signature for the auth-enforced case.
+    An open instance serves its terminal HTML (contains "ttyd"; we send no
+    Accept-Encoding so it is not gzipped) and answers /token with the
+    {"token": "<credential>"} JSON ("" when no -c), which is the backstop."""
+    r = await _http_get_once(host, port, "/", timeout, tls)
+    if not r:
+        return None
+    status, headers, body = r
+    sig = (b"ttyd" in body.lower()
+           or "ttyd" in headers.get("server", "").lower()
+           or 'realm="ttyd"' in headers.get("www-authenticate", "").lower())
+    if not sig:
+        # /token returns a small {"token": "..."} JSON on an open ttyd; with -c
+        # it is 401 too, so this backstop only fires for an unauthenticated one.
+        r2 = await _http_get_once(host, port, "/token", timeout, tls)
+        if not (r2 and r2[0] == 200 and b'"token"' in r2[2] and len(r2[2]) < 256):
+            return None
+    return {"auth": status in (401, 403)}
+
+
 # ---------------------------------------------------------------------------
 # WS-Discovery (ONVIF device discovery, UDP 3702). A unicast Probe for the ONVIF
 # NetworkVideoTransmitter type makes a camera/NVR answer with a ProbeMatch that
@@ -2400,7 +2433,7 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "ipmi-cipher-zero",
                       "prometheus-unauth", "consul-unauth", "rabbitmq-unauth",
                       "minio-unauth", "portainer-unauth", "zookeeper-unauth",
-                      "camera-ws-stream-unauth"}
+                      "camera-ws-stream-unauth", "ttyd-shell-unauth"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -2792,6 +2825,40 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 f"view) alongside the CVE-2017-7921 auth-bypass class on these "
                 f"devices. It should never be internet-facing; restrict {port} to "
                 f"a management network."})
+            return
+
+    # ttyd web terminal shares the camera default port 7681 (7682 for wss), but
+    # an exposed ttyd is a browser shell (remote code execution), not a video
+    # feed, so it is told apart BEFORE the camera WebSocket probe. Read-only HTTP
+    # signature only -- the /ws shell socket is never opened. Also runs when a
+    # prior phase already named the service "ttyd" (its Server header is ttyd/*).
+    if port in _WS_CAM_PORTS or "ttyd" in name or "ttyd" in (svc.product or "").lower():
+        tt_tls = (port == 7682 or is_tls_service(svc) or "wss" in name)
+        tt = await ttyd_probe(host, port, cfg.timeout, tt_tls)
+        if tt is not None:
+            if not svc.name:
+                svc.name = "ttyd"
+            if not svc.product:
+                svc.product = "ttyd"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            if tt["auth"]:
+                svc.scripts.append({"id": "ttyd-shell-auth", "output":
+                    f"ttyd web terminal detected on {port}; the HTTP layer "
+                    f"requires authentication (the read-only request was refused "
+                    f"without credentials). The /ws shell socket was not opened."})
+            else:
+                svc.confidence = "high"
+                svc.extrainfo = "UNAUTHENTICATED web shell"
+                svc.scripts.append({"id": "ttyd-shell-unauth", "output":
+                    f"ttyd web terminal is exposed WITHOUT authentication on "
+                    f"{port}: the HTTP layer served the terminal page/token with "
+                    f"no credentials, so anyone who can reach {port} gets an "
+                    f"interactive shell in the browser (remote code execution). "
+                    f"Detection stayed on the HTTP layer -- the /ws shell socket "
+                    f"was never opened. Put ttyd behind authentication "
+                    f"(ttyd -c user:pass, or a fronting proxy) and restrict "
+                    f"{port} to trusted networks."})
             return
 
     # Camera WebSocket video preview (Hikvision ws 7681 / wss 7682, or any

@@ -336,6 +336,16 @@ nmap's result and, for every under-identified port, adds:
   anonymous playback *not* claimed — a device needing an in-band token won't
   stream here); a refused upgrade (401/403) is noted as auth-enforced. The alert
   fires only on observed unauthenticated video bytes, never on a guessed stream.
+- **ttyd web terminal** (shares the camera default `7681`, `7682` for `wss`, or a
+  `ttyd`-named service): `ttyd` serves an interactive shell in the browser, so an
+  instance with no authentication is a **browser shell = remote code execution** —
+  checked **before** the camera WebSocket probe so the two are never confused.
+  Detection stays strictly on the HTTP layer (`GET /`, `GET /token`, and the
+  `WWW-Authenticate: Basic realm="ttyd"` signature) and **never opens the `/ws`
+  shell socket** or spawns a PTY. An unauthenticated instance (page/token served
+  with no credentials) is **critical**, `ttyd-shell-unauth`; one that demands
+  Basic auth (`ttyd -c`) is reported informationally as auth-enforced
+  (`ttyd-shell-auth`, not an alert).
 - **gRPC / HTTP2** (dedicated gRPC ports — 50051/6565/9090/… — or a `grpc`-named
   service): dependency-free detection (TLS ALPN `h2`, or the cleartext h2c
   preface → SETTINGS frame). The real finding is **server reflection enabled
