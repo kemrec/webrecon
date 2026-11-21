@@ -276,9 +276,22 @@ nmap's result and, for every under-identified port, adds:
   factory-default list via a WS-UsernameToken `PasswordDigest`; an accepted
   default exposes the camera's management API (media URIs, users, PTZ) and is
   critical. Once access is confirmed (either way), read-only `GetUsers` lists the
-  device's accounts and privilege levels and `GetProfiles` lists the media
-  profiles (stream name, resolution, codec) — the media endpoint is discovered
-  via `GetServices`. Read-only SOAP calls only.
+  device's accounts and privilege levels, and `GetProfiles` + `GetStreamUri` +
+  `GetSnapshotUri` list the media profiles (stream name, resolution, codec) with
+  the **actual stream/snapshot URIs** the device serves (these frequently embed
+  the stream credentials in clear) — the media endpoint is discovered via
+  `GetServices`. Read-only SOAP calls only.
+- **Unauth JPEG snapshot** (any camera-signalled web port): most IP cameras
+  expose a still-frame URL (`/snapshot.jpg`, `/axis-cgi/jpg/image.cgi`,
+  `/ISAPI/Streaming/channels/101/picture`, …). A single read-only `GET` that
+  returns a JPEG of the live view is a direct **critical** confirmation that the
+  feed is viewable without credentials. Gated to a camera signal (vendor banner /
+  ONVIF present / camera port) so unrelated web servers are never probed.
+- **ONVIF WS-Discovery** (UDP 3702): a unicast `Probe` for the ONVIF
+  `NetworkVideoTransmitter` type makes a camera/NVR answer — without auth — with
+  its Types, Scopes (`onvif://…/name|hardware|location`) and the `device_service`
+  XAddr. Run once per host (one datagram, unicast only), so it surfaces cameras a
+  default TCP scan misses.
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully

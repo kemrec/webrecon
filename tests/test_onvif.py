@@ -56,6 +56,20 @@ _PROFILES = (
     '</tt:Resolution></tt:VideoEncoderConfiguration></trt:Profiles>'
     '</trt:GetProfilesResponse></s:Body></s:Envelope>')
 
+_STREAM_URI = (
+    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>'
+    '<trt:GetStreamUriResponse xmlns:trt="http://www.onvif.org/ver10/media/wsdl">'
+    '<trt:MediaUri xmlns:tt="http://www.onvif.org/ver10/schema">'
+    '<tt:Uri>rtsp://cam/Streaming/Channels/101?token=abc</tt:Uri>'
+    '</trt:MediaUri></trt:GetStreamUriResponse></s:Body></s:Envelope>')
+
+_SNAP_URI = (
+    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>'
+    '<trt:GetSnapshotUriResponse xmlns:trt="http://www.onvif.org/ver10/media/wsdl">'
+    '<trt:MediaUri xmlns:tt="http://www.onvif.org/ver10/schema">'
+    '<tt:Uri>http://cam/onvif-http/snapshot</tt:Uri>'
+    '</trt:MediaUri></trt:GetSnapshotUriResponse></s:Body></s:Envelope>')
+
 
 def _http(status, body):
     b = body.encode()
@@ -104,6 +118,16 @@ def _make_server(mode):
         elif "GetProfiles" in text:
             if mode == "enum-unauth" or (mode == "enum-digest" and gated):
                 out = _http("200 OK", _PROFILES)
+            else:
+                out = _http("400 Bad Request", _FAULT)
+        elif "GetStreamUri" in text:
+            if mode == "enum-unauth" or (mode == "enum-digest" and gated):
+                out = _http("200 OK", _STREAM_URI)
+            else:
+                out = _http("400 Bad Request", _FAULT)
+        elif "GetSnapshotUri" in text:
+            if mode == "enum-unauth" or (mode == "enum-digest" and gated):
+                out = _http("200 OK", _SNAP_URI)
             else:
                 out = _http("400 Bad Request", _FAULT)
         else:
@@ -214,6 +238,16 @@ def test_onvif_unauth_enumerates_users_and_profiles():
     assert "mainStream" in out["onvif-media-profiles"]
     assert "1920x1080" in out["onvif-media-profiles"]
     assert "H264" in out["onvif-media-profiles"]
+    # GetStreamUri / GetSnapshotUri recovered the real media endpoints
+    assert "stream=rtsp://cam/Streaming/Channels/101" in out["onvif-media-profiles"]
+    assert "snapshot=http://cam/onvif-http/snapshot" in out["onvif-media-profiles"]
+
+
+def test_onvif_first_uri_parses_mediauri():
+    assert fp._onvif_first_uri(_STREAM_URI.encode()) == (
+        "rtsp://cam/Streaming/Channels/101?token=abc")
+    assert fp._onvif_first_uri(_SNAP_URI.encode()) == (
+        "http://cam/onvif-http/snapshot")
 
 
 def test_onvif_default_creds_then_enumerates():

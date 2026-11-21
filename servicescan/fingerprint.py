@@ -788,6 +788,8 @@ _ONVIF_PATH = "/onvif/device_service"
 _ONVIF_PORTS = {8000, 8899, 2020, 8081, 10080}   # common ONVIF-only HTTP ports
 _ONVIF_DEV_NS = "http://www.onvif.org/ver10/device/wsdl"
 _ONVIF_MEDIA_NS = "http://www.onvif.org/ver10/media/wsdl"
+_ONVIF_SCHEMA_NS = "http://www.onvif.org/ver10/schema"
+_ONVIF_URI_RX = re.compile(r"<(?:\w+:)?Uri>\s*([^<][^<]*?)\s*</(?:\w+:)?Uri>", re.I)
 _ONVIF_DEVINFO_RX = {
     "manufacturer": re.compile(r"<[^>]*Manufacturer>([^<]+)<", re.I),
     "model": re.compile(r"<[^>]*Model>([^<]+)<", re.I),
@@ -995,6 +997,11 @@ def _parse_onvif_profiles(body: bytes) -> list[dict]:
     return out
 
 
+def _onvif_first_uri(body: bytes) -> str:
+    m = _ONVIF_URI_RX.search(body.decode("latin-1", "replace"))
+    return m.group(1).strip() if m else ""
+
+
 def _parse_xaddr(xaddr: str, default_port: int, default_tls: bool):
     """(path, port, tls) from a service XAddr URL. We keep the scanned host and
     only adopt the XAddr's path/port/scheme, so enumeration never pivots to a
@@ -1036,17 +1043,53 @@ async def _onvif_media_endpoint(host: str, port: int, timeout: float,
     return _ONVIF_PATH, port, tls
 
 
-async def onvif_get_profiles(host: str, port: int, timeout: float,
-                             tls: bool = False, mksec=None) -> list[dict]:
-    path, mport, mtls = await _onvif_media_endpoint(host, port, timeout, tls, mksec)
-    body = _onvif_envelope(f'<GetProfiles xmlns="{_ONVIF_MEDIA_NS}"/>',
-                           mksec() if mksec else "")
-    r = await _http_post_once(host, mport, path, body, timeout, mtls)
-    if (not r or r[0] != 200) and (path, mport, mtls) != (_ONVIF_PATH, port, tls):
-        body = _onvif_envelope(f'<GetProfiles xmlns="{_ONVIF_MEDIA_NS}"/>',
-                               mksec() if mksec else "")
-        r = await _http_post_once(host, port, _ONVIF_PATH, body, timeout, tls)
-    return _parse_onvif_profiles(r[2]) if r and r[0] == 200 else []
+async def onvif_get_media(host: str, port: int, timeout: float,
+                          tls: bool = False, mksec=None,
+                          max_profiles: int = 3) -> list[dict]:
+    """GetProfiles + per-profile GetStreamUri/GetSnapshotUri (read-only). The
+    stream/snapshot URIs are the exact media endpoints the device will serve and
+    frequently embed the stream credentials, so they are high-value on an exposed
+    camera. All GetProfiles/GetStreamUri/GetSnapshotUri calls are pinned to the
+    media endpoint that actually answered (discovered one, else device_service)."""
+    cand = await _onvif_media_endpoint(host, port, timeout, tls, mksec)
+    dev_ep = (_ONVIF_PATH, port, tls)
+    endpoints = [cand] if cand == dev_ep else [cand, dev_ep]
+
+    async def media_post(inner, ep):
+        return await _http_post_once(host, ep[1], ep[0],
+            _onvif_envelope(inner, mksec() if mksec else ""), timeout, ep[2])
+
+    body, won = None, None
+    for ep in endpoints:
+        r = await media_post(f'<GetProfiles xmlns="{_ONVIF_MEDIA_NS}"/>', ep)
+        if r and r[0] == 200:
+            body, won = r[2], ep
+            break
+    if not body:
+        return []
+    profiles = _parse_onvif_profiles(body)
+    for prof in profiles[:max_profiles]:
+        tok = prof.get("token")
+        if not tok:
+            continue
+        su = (f'<GetStreamUri xmlns="{_ONVIF_MEDIA_NS}"><StreamSetup>'
+              f'<Stream xmlns="{_ONVIF_SCHEMA_NS}">RTP-Unicast</Stream>'
+              f'<Transport xmlns="{_ONVIF_SCHEMA_NS}"><Protocol>RTSP</Protocol>'
+              f'</Transport></StreamSetup><ProfileToken>{tok}</ProfileToken>'
+              f'</GetStreamUri>')
+        r = await media_post(su, won)
+        if r and r[0] == 200:
+            uri = _onvif_first_uri(r[2])
+            if uri:
+                prof["stream_uri"] = uri
+        sn = (f'<GetSnapshotUri xmlns="{_ONVIF_MEDIA_NS}">'
+              f'<ProfileToken>{tok}</ProfileToken></GetSnapshotUri>')
+        r = await media_post(sn, won)
+        if r and r[0] == 200:
+            uri = _onvif_first_uri(r[2])
+            if uri:
+                prof["snapshot_uri"] = uri
+    return profiles
 
 
 async def _onvif_enum_scripts(svc, host: str, port: int, timeout: float,
@@ -1060,7 +1103,7 @@ async def _onvif_enum_scripts(svc, host: str, port: int, timeout: float,
                 u["name"] + (f" [{u['level']}]" if u["level"] else "")
                 for u in users) + ". Enumerated user names narrow a credential "
             "attack and confirm which accounts hold admin rights."})
-    profiles = await onvif_get_profiles(host, port, timeout, tls, mksec)
+    profiles = await onvif_get_media(host, port, timeout, tls, mksec)
     if profiles:
         def fmt(p):
             bits = [p.get("name") or p.get("token") or "?"]
@@ -1068,11 +1111,17 @@ async def _onvif_enum_scripts(svc, host: str, port: int, timeout: float,
                 bits.append(p["resolution"])
             if p.get("encoding"):
                 bits.append(p["encoding"])
-            return " ".join(bits)
+            line = " ".join(bits)
+            if p.get("stream_uri"):
+                line += f" stream={p['stream_uri']}"
+            if p.get("snapshot_uri"):
+                line += f" snapshot={p['snapshot_uri']}"
+            return line
         svc.scripts.append({"id": "onvif-media-profiles", "output":
-            "ONVIF media profiles (GetProfiles): " +
+            "ONVIF media profiles (GetProfiles/GetStreamUri/GetSnapshotUri): " +
             "; ".join(fmt(p) for p in profiles) + ". Each profile maps to a live "
-            "stream the camera will serve to an authorized client."})
+            "stream/snapshot the camera serves; the returned URIs often embed the "
+            "stream credentials in clear."})
 
 
 def _utcnow_iso() -> str:
@@ -1081,12 +1130,125 @@ def _utcnow_iso() -> str:
         "%Y-%m-%dT%H:%M:%SZ")
 
 
+# ---------------------------------------------------------------------------
+# Unauthenticated JPEG snapshot. Most IP cameras expose a still-frame URL over
+# HTTP; when it is reachable without credentials, a single GET returns a JPEG of
+# the live view -- a direct confirmation that the feed is viewable unauth. Gated
+# to a camera signal (vendor banner / ONVIF present / camera port) so we never
+# spray these paths across unrelated web servers. Read-only GET; stops on the
+# first JPEG.
+# ---------------------------------------------------------------------------
+_CAMERA_PORTS = _RTSP_PORTS | _RTSPS_PORTS | _ONVIF_PORTS
+_CAMERA_VENDOR_RX = re.compile(
+    r"hikvision|dahua|axis|reolink|hanwha|wisenet|foscam|dlink|d-link|vivotek|"
+    r"amcrest|uniview|geovision|mobotix|bosch\s*(security|ip)|ubiquiti|unifi.?video|"
+    r"onvif|ip\s*camera|ipcam|netcam|network\s*camera|nvr|dvr|web\s*service",
+    re.I)
+_CAMERA_SNAPSHOT_PATHS = [
+    "/snapshot.jpg", "/onvif-http/snapshot", "/onvifsnapshot/media_service/snapshot",
+    "/axis-cgi/jpg/image.cgi", "/cgi-bin/snapshot.cgi",
+    "/ISAPI/Streaming/channels/101/picture",         # Hikvision
+    "/cgi-bin/api.cgi?cmd=Snap&channel=0",            # Reolink
+    "/tmpfs/auto.jpg", "/image/jpeg.cgi", "/jpg/image.jpg",
+]
+
+
+def _looks_like_camera(svc) -> bool:
+    """A camera signal on this service: vendor string in product/banner/server,
+    a camera-ish service name, or a canonical camera port."""
+    hay = " ".join((svc.product or "", svc.name or "", svc.banner or "",
+                    (svc.http or {}).get("server", ""),
+                    (svc.http or {}).get("title", ""))).lower()
+    return bool(_CAMERA_VENDOR_RX.search(hay)) or svc.port in _CAMERA_PORTS
+
+
+async def camera_snapshot_probe(host: str, port: int, timeout: float,
+                                tls: bool = False) -> str | None:
+    """GET the common snapshot paths; return the first that answers 200 with a
+    JPEG (magic FF D8 FF, or an image/jpeg content-type). Read-only."""
+    for path in _CAMERA_SNAPSHOT_PATHS:
+        r = await _http_get_once(host, port, path, timeout, tls)
+        if not r or r[0] != 200:
+            continue
+        status, headers, body = r
+        ctype = headers.get("content-type", "").lower()
+        if body[:3] == b"\xff\xd8\xff" or "image/jpeg" in ctype:
+            return path
+    return None
+
+
+# ---------------------------------------------------------------------------
+# WS-Discovery (ONVIF device discovery, UDP 3702). A unicast Probe for the ONVIF
+# NetworkVideoTransmitter type makes a camera/NVR answer with a ProbeMatch that
+# names its Types, Scopes (onvif:// name / hardware / location) and the XAddrs of
+# its device_service -- no authentication. Run once per host (active recon, one
+# datagram); unicast only, so it never leaves the scanned host.
+# ---------------------------------------------------------------------------
+_WSD_PORTS = {3702}
+
+
+def _parse_wsd(text: str) -> dict:
+    def grab(tag):
+        m = re.search(rf"<(?:\w+:)?{tag}>(.*?)</(?:\w+:)?{tag}>", text, re.I | re.S)
+        return " ".join(m.group(1).split()) if m else ""
+    return {"types": grab("Types"), "scopes": grab("Scopes"),
+            "xaddrs": grab("XAddrs")}
+
+
+async def wsdiscovery_probe(host: str, port: int, timeout: float) -> dict | None:
+    """Unicast WS-Discovery Probe. Returns {types, scopes, xaddrs} on a
+    ProbeMatch, else None."""
+    import uuid
+    probe = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" '
+        'xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing" '
+        'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" '
+        'xmlns:dn="http://www.onvif.org/ver10/network/wsdl">'
+        f'<e:Header><w:MessageID>urn:uuid:{uuid.uuid4()}</w:MessageID>'
+        '<w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>'
+        '<w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>'
+        '</e:Header><e:Body><d:Probe>'
+        '<d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe>'
+        '</e:Body></e:Envelope>').encode()
+    loop = asyncio.get_event_loop()
+    got = loop.create_future()
+
+    class _P(asyncio.DatagramProtocol):
+        def datagram_received(self, data, addr):
+            if not got.done():
+                got.set_result(data)
+
+        def error_received(self, exc):  # noqa: ARG002
+            pass
+
+    try:
+        transport, _ = await asyncio.wait_for(
+            loop.create_datagram_endpoint(_P, remote_addr=(host, port)),
+            timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        transport.sendto(probe)
+        try:
+            data = await asyncio.wait_for(got, timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+    finally:
+        transport.close()
+    text = data.decode("latin-1", "replace")
+    if "ProbeMatch" not in text:
+        return None
+    return _parse_wsd(text)
+
+
 # script ids that mark a confirmed unauthenticated/anonymous exposure (critical)
 EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "elasticsearch-unauth", "couchdb-unauth",
                       "docker-api-unauth", "etcd-unauth", "kubelet-anon",
                       "rtsp-unauth", "rtsp-default-creds",
-                      "onvif-unauth", "onvif-default-creds"}
+                      "onvif-unauth", "onvif-default-creds",
+                      "camera-snapshot-unauth"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -1264,7 +1426,8 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
     # is checked on any web service or a known ONVIF-only port. A single SOAP
     # POST to /onvif/device_service confirms or rules it out.
     if is_web_service(svc) or port in _ONVIF_PORTS:
-        info = await onvif_probe(host, port, cfg.timeout, tls=is_tls_service(svc))
+        otls = is_tls_service(svc)
+        info = await onvif_probe(host, port, cfg.timeout, tls=otls)
         if info is not None:
             if not svc.name:
                 svc.name = "onvif"
@@ -1277,7 +1440,6 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 svc.version = _norm_ver(dev["firmware"]) or svc.version
             if "exposure" not in svc.sources:
                 svc.sources.append("exposure")
-            otls = is_tls_service(svc)
             if info["unauth"]:
                 svc.confidence = "high"
                 svc.extrainfo = "UNAUTHENTICATED ONVIF device info"
@@ -1319,6 +1481,21 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 svc.scripts.append({"id": "onvif-info", "output":
                     "ONVIF device_service detected (GetSystemDateAndTime "
                     "answered); device-info access undetermined."})
+        # unauth JPEG snapshot -- ONVIF present, or any camera signal on this
+        # web port (catches standalone HTTP cameras with no ONVIF).
+        if info is not None or _looks_like_camera(svc):
+            snap = await camera_snapshot_probe(host, port, cfg.timeout, otls)
+            if snap:
+                svc.confidence = "high"
+                if "exposure" not in svc.sources:
+                    svc.sources.append("exposure")
+                if not svc.extrainfo:
+                    svc.extrainfo = "UNAUTHENTICATED camera snapshot"
+                svc.scripts.append({"id": "camera-snapshot-unauth", "output":
+                    f"Live camera snapshot retrievable WITHOUT authentication: "
+                    f"GET {snap} returned a JPEG of the current view. Anyone who "
+                    f"can reach {port} can watch stills of the feed. Require "
+                    f"authentication and restrict {port} to trusted networks."})
         return
 
 
@@ -1339,7 +1516,33 @@ async def run_exposure_checks(cfg: ScanConfig, host: str,
                 utils.debug(f"exposure :{svc.port} err {e}")
 
     await asyncio.gather(*(one(s) for s in open_svcs))
-    hits = [s for s in open_svcs
+
+    # Host-level ONVIF WS-Discovery (UDP 3702, active unicast Probe). Runs once
+    # per host regardless of whether 3702 was port-scanned, so it surfaces
+    # cameras/NVRs that a default TCP scan would miss. Read-only; a non-answer
+    # just times out. A hit lands on the udp/3702 service (created if absent).
+    try:
+        wsd = await wsdiscovery_probe(host, 3702, min(cfg.timeout, 3.0))
+    except Exception:  # noqa: BLE001
+        wsd = None
+    if wsd:
+        svc = next((s for s in services
+                    if s.port == 3702 and s.proto == "udp"), None)
+        if svc is None:
+            svc = Service(port=3702, proto="udp", state="open", name="ws-discovery")
+            services.append(svc)
+        if "exposure" not in svc.sources:
+            svc.sources.append("exposure")
+        bits = [f"Types: {wsd['types']}" if wsd["types"] else "",
+                f"Scopes: {wsd['scopes']}" if wsd["scopes"] else "",
+                f"XAddrs: {wsd['xaddrs']}" if wsd["xaddrs"] else ""]
+        svc.scripts.append({"id": "ws-discovery", "output":
+            "ONVIF WS-Discovery answered a unicast Probe (UDP 3702): "
+            + "; ".join(b for b in bits if b)
+            + ". The device advertises its type/name/location and the "
+              "device_service URL without authentication."})
+
+    hits = [s for s in services
             if any(sc.get("id", "") in EXPOSURE_ALERT_IDS for sc in s.scripts)]
     if hits:
         utils.warn(f"UNAUTHENTICATED exposure on "

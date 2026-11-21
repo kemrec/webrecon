@@ -72,13 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "versions then land in the summary and CVE correlation")
     fp.add_argument("--no-cam-creds", "--no-rtsp-creds", action="store_true",
                     dest="no_cam_creds",
-                    help="camera recon (RTSP/RTSPS OPTIONS/DESCRIBE + ONVIF "
-                         "GetSystemDateAndTime/GetDeviceInformation, plus "
-                         "GetUsers/GetProfiles once access is confirmed) stays "
-                         "read-only; this disables the one active step -- trying "
-                         "factory-default creds on a gated stream/device "
-                         "(admin:admin, root:root, ...). --no-rtsp-creds is a "
-                         "back-compat alias")
+                    help="camera recon (RTSP/RTSPS DESCRIBE, ONVIF device/media "
+                         "enum incl. GetUsers/GetProfiles/GetStreamUri, unauth "
+                         "JPEG snapshot, WS-Discovery) stays read-only; this "
+                         "disables the one active step -- trying factory-default "
+                         "creds on a gated stream/device (admin:admin, "
+                         "root:root, ...). --no-rtsp-creds is a back-compat alias")
 
     cv = p.add_argument_group("cve")
     cv.add_argument("--no-cve", action="store_true", help="skip CVE correlation")
