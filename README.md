@@ -469,6 +469,19 @@ nmap's result and, for every under-identified port, adds:
   read its files, and write to them if the module is not read-only (**alert**,
   `rsync-anon-module`). Protocol 29 is negotiated so no digest list is needed,
   and no rsync options are sent after `OK`, so no file transfer occurs.
+- **WinRM / WS-Management** (TCP `5985` HTTP, `5986` HTTPS, endpoint `/wsman`):
+  dependency-free, no credentials are ever sent. An unauthenticated WS-Management
+  **Identify** (MS-WSMV `<wsmid:Identify/>`) confirms the service and leaks the
+  vendor + WSMan stack version (`winrm-identify`, informational; the OS build is
+  withheld in the unauthenticated response by design). The offered auth schemes
+  are read from the `401` challenge (`winrm-auth-methods`), and when `Negotiate`
+  is offered the NTLM type-2 challenge on `/wsman` discloses the host OS build +
+  AD/NetBIOS identity (`winrm-ntlm-info`, informational recon). The **alert** is
+  `Basic` offered over **plaintext** `5985` (`AllowUnencrypted`): credentials are
+  sent base64-encoded with no transport encryption, so any on-path observer
+  captures them and a valid WinRM credential grants remote PowerShell = host
+  takeover (`winrm-basic-cleartext`). `Basic` over TLS (`5986`) is informational
+  (`winrm-basic-tls`). All operations are reads.
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully

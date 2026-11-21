@@ -2483,6 +2483,179 @@ async def http_ntlm_probe(host: str, port: int, timeout: float, tls: bool):
 
 
 # ---------------------------------------------------------------------------
+# WinRM / WS-Management (TCP 5985 plaintext, 5986 TLS; endpoint /wsman).
+# Dependency-free, read-only posture -- NO credentials are ever transmitted:
+#   * WS-Management Identify (MS-WSMV / DMTF DSP0226): an unauthenticated POST
+#     carrying <wsmid:Identify/> is answered with an IdentifyResponse naming
+#     ProductVendor + protocol/stack version. This confirms the service IS
+#     WinRM and leaks the WSMan stack version unauthenticated (the OS build is
+#     withheld -- zeroed -- in the unauthenticated response by design).
+#   * Auth-scheme enumeration: an unauthenticated request to /wsman is refused
+#     with 401 and ONE WWW-Authenticate header per offered scheme (Negotiate /
+#     Kerberos / CredSSP / Basic / NTLM). http.sys emits a SEPARATE header line
+#     per scheme, so the raw response is parsed here -- the shared dict parser
+#     would keep only the last one.
+#   * If Basic is offered over PLAINTEXT 5985 the listener accepts base64
+#     (cleartext) credentials over an unencrypted channel: any on-path observer
+#     captures them, and a valid WinRM credential grants remote PowerShell =
+#     full host takeover. Default WinRM requires Negotiate + message encryption
+#     and refuses Basic/AllowUnencrypted, so this is an explicit misconfig ->
+#     ALERT. Basic over TLS (5986) is protected in transit -> informational.
+#   * If Negotiate/NTLM is offered, the shared NTLM primitive is applied to
+#     /wsman to read the type-2 challenge (OS build + AD/NetBIOS identity) with
+#     no credentials -> informational host-identity leak.
+# Sources: MS-WSMV; WS-Management (DMTF DSP0226/DSP0227); Microsoft WinRM docs
+# (Identify request/response XML); RFC 7617 (Basic = base64, not encryption).
+# ---------------------------------------------------------------------------
+_WINRM_PORTS = {5985, 5986}
+_WINRM_IDENTIFY = (
+    b'<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+    b'xmlns:wsmid="http://schemas.dmtf.org/wbem/wsman/identity/1/'
+    b'wsmanidentity.xsd"><s:Header/><s:Body><wsmid:Identify/>'
+    b'</s:Body></s:Envelope>')
+
+
+async def _winrm_request(host: str, port: int, timeout: float, tls: bool,
+                         body: bytes, auth: str | None = None):
+    """Raw HTTP/1.0 POST /wsman. Returns (status:int, headers:dict,
+    www_authenticate:list[str], body:bytes) or None. Read-only; no redirects;
+    TLS never verified. Preserves EVERY WWW-Authenticate header (one per offered
+    scheme); other headers are first-wins."""
+    ctx = None
+    if tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    raw = b""
+    try:
+        extra = f"Authorization: {auth}\r\n" if auth else ""
+        req = (f"POST /wsman HTTP/1.0\r\nHost: {host}:{port}\r\n"
+               f"User-Agent: servicescan\r\n"
+               f"Content-Type: application/soap+xml;charset=UTF-8\r\n"
+               f"{extra}Content-Length: {len(body)}\r\n"
+               f"Connection: close\r\n\r\n").encode() + body
+        writer.write(req)
+        await writer.drain()
+        try:
+            while len(raw) < 16384:
+                chunk = await asyncio.wait_for(reader.read(16384), timeout=timeout)
+                if not chunk:
+                    break
+                raw += chunk
+        except asyncio.TimeoutError:
+            pass
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+    if not raw.startswith(b"HTTP/"):
+        return None
+    head, _, bdy = raw.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    try:
+        status = int(lines[0].split(b" ")[1])
+    except (IndexError, ValueError):
+        return None
+    headers, www = {}, []
+    for ln in lines[1:]:
+        k, _, v = ln.partition(b":")
+        if not k:
+            continue
+        key = k.strip().lower().decode("latin-1", "replace")
+        val = v.strip().decode("latin-1", "replace")
+        if key == "www-authenticate":
+            www.append(val)
+        else:
+            headers.setdefault(key, val)
+    return status, headers, www, bdy
+
+
+def _winrm_schemes(www_auth: list) -> list:
+    """Ordered, de-duplicated auth schemes from the WWW-Authenticate header(s).
+    The scheme is the leading token of each value (http.sys sends one per
+    line, but a combined comma-separated value is handled too)."""
+    out = []
+    for v in www_auth:
+        for part in v.split(","):
+            tok = part.strip().split(" ", 1)[0].strip()
+            if tok and tok not in out:
+                out.append(tok)
+    return out
+
+
+def _parse_winrm_identify(body: bytes) -> dict:
+    """ProductVendor / ProductVersion / ProtocolVersion out of an
+    IdentifyResponse (namespace-prefix agnostic)."""
+    text = body.decode("latin-1", "replace")
+    info = {}
+    for tag, key in (("ProductVendor", "vendor"),
+                     ("ProductVersion", "product_version"),
+                     ("ProtocolVersion", "protocol")):
+        m = re.search(rf"<(?:\w+:)?{tag}>\s*(.*?)\s*</(?:\w+:)?{tag}>",
+                      text, re.S)
+        if m and m.group(1).strip():
+            info[key] = " ".join(m.group(1).split())
+    return info
+
+
+async def winrm_probe(host: str, port: int, timeout: float, tls: bool):
+    """Unauthenticated WinRM/WS-Management posture. Returns a dict
+    {identify, schemes, server, ntlm} or None when the endpoint is not
+    WS-Management. No credentials are ever sent."""
+    import base64
+
+    r = await _winrm_request(host, port, timeout, tls, _WINRM_IDENTIFY)
+    if not r:
+        return None
+    status, headers, www, body = r
+    ident = (_parse_winrm_identify(body)
+             if status == 200 and b"IdentifyResponse" in body else {})
+    schemes = _winrm_schemes(www) if status == 401 else []
+    if not schemes:
+        # Identify was answered (200) or refused without a challenge; force a
+        # 401 with an unauthenticated empty request to read the offered schemes.
+        r2 = await _winrm_request(host, port, timeout, tls, b"")
+        if r2 and r2[0] == 401:
+            schemes = _winrm_schemes(r2[2])
+            if not headers.get("server"):
+                headers = r2[1]
+
+    server = headers.get("server", "")
+    low = [s.lower() for s in schemes]
+    is_wsman = (bool(ident) or "microsoft-httpapi" in server.lower()
+                or any(s in ("negotiate", "kerberos", "credssp") for s in low))
+    if not is_wsman:
+        return None
+
+    ntlm = {}
+    if "negotiate" in low or "ntlm" in low:
+        use_nego = "negotiate" in low
+        token = _spnego_ntlm(_ntlm_type1()) if use_nego else _ntlm_type1()
+        auth = ("Negotiate " if use_nego else "NTLM ") + \
+            base64.b64encode(token).decode()
+        rc = await _winrm_request(host, port, timeout, tls, b"", auth=auth)
+        if rc and rc[2]:
+            m = re.search(r"(?:NTLM|Negotiate)\s+([A-Za-z0-9+/=]{16,})",
+                          " ".join(rc[2]))
+            if m:
+                try:
+                    ntlm = _parse_ntlm_type2(base64.b64decode(m.group(1)))
+                except Exception:  # noqa: BLE001
+                    ntlm = {}
+    return {"identify": ident, "schemes": schemes, "server": server,
+            "ntlm": ntlm}
+
+
+# ---------------------------------------------------------------------------
 # NFS / rpcbind (TCP 111). Dependency-free ONC RPC: a portmap DUMP (proc 4)
 # enumerates the registered RPC programs, and if mountd (100005) is present its
 # EXPORT (proc 5) lists the NFS exports and the hosts each is shared with. An
@@ -3308,7 +3481,7 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "camera-ws-stream-unauth", "ttyd-shell-unauth",
                       "mqtt-unauth", "smbv1-enabled", "smb-signing-not-required",
                       "nfs-export-world", "ldap-anonymous-read",
-                      "rsync-anon-module"}
+                      "rsync-anon-module", "winrm-basic-cleartext"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -3436,6 +3609,73 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                             f"candidates for the --web pivot (mapped to this IP), "
                             f"surfacing internal hostnames that exist only in the "
                             f"certificate."})
+        return
+
+    # WinRM / WS-Management (5985 plaintext / 5986 TLS, endpoint /wsman).
+    # Unauthenticated posture: Identify (vendor/stack), offered auth schemes,
+    # and -- via the NTLM primitive on /wsman -- the host identity. The only
+    # alert is Basic offered over plaintext (cleartext credential capture);
+    # everything else is informational. Returns so the generic web-NTLM
+    # enrichment below does not double-probe /wsman.
+    if port in _WINRM_PORTS or "wsman" in name or "winrm" in name:
+        wtls = port == 5986 or bool(svc.tls) or is_tls_service(svc)
+        res = await winrm_probe(host, port, cfg.timeout, wtls)
+        if res:
+            if not svc.name:
+                svc.name = "wsman"
+            if not svc.product:
+                svc.product = "Microsoft WinRM"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            ident, schemes, ntlm = res["identify"], res["schemes"], res["ntlm"]
+            low = [s.lower() for s in schemes]
+            if ident:
+                parts = [f"{lbl} {ident[k]}" for k, lbl in
+                         (("vendor", "vendor"), ("product_version", "product"),
+                          ("protocol", "protocol")) if ident.get(k)]
+                svc.scripts.append({"id": "winrm-identify", "output":
+                    "WinRM/WS-Management answered an unauthenticated Identify: "
+                    + "; ".join(parts) + ". Confirms the WS-Management stack "
+                    "(MS-WSMV Identify is answerable without credentials; the OS "
+                    "build is withheld in the unauthenticated response)."})
+            if schemes:
+                svc.scripts.append({"id": "winrm-auth-methods", "output":
+                    f"WinRM accepts authentication scheme(s): "
+                    f"{', '.join(schemes)}."})
+            if ntlm:
+                recon = [f"{lbl} {ntlm[k]}" for k, lbl in (
+                    ("dns_domain", "AD domain"),
+                    ("nb_domain", "NetBIOS/workgroup"),
+                    ("dns_computer", "host"), ("nb_computer", "NetBIOS name"),
+                    ("os", "OS build")) if ntlm.get(k)]
+                if ntlm.get("os") and not svc.version:
+                    svc.version = ntlm["os"]
+                    svc.cve_skip = False
+                if not svc.product or svc.product == "Microsoft WinRM":
+                    svc.product = "Microsoft WinRM"
+                if recon:
+                    svc.scripts.append({"id": "winrm-ntlm-info", "output":
+                        "WinRM /wsman Negotiate challenge disclosed host identity "
+                        "WITHOUT authentication: " + "; ".join(recon) + " (NTLM "
+                        "type-2 challenge; no credentials sent)."})
+            plaintext = not (port == 5986 or bool(svc.tls) or is_tls_service(svc))
+            if "basic" in low and plaintext:
+                svc.confidence = "high"
+                svc.extrainfo = "WinRM Basic over cleartext"
+                svc.scripts.append({"id": "winrm-basic-cleartext", "output":
+                    "WinRM offers HTTP Basic authentication over PLAINTEXT 5985 "
+                    "(AllowUnencrypted). Credentials are sent base64-encoded with "
+                    "no transport encryption, so any on-path observer captures "
+                    "them, and a valid WinRM credential grants remote PowerShell "
+                    "= full host takeover. Disable Basic and AllowUnencrypted; "
+                    "require Negotiate/Kerberos with message encryption, or move "
+                    "to HTTPS on 5986."})
+            elif "basic" in low:
+                svc.scripts.append({"id": "winrm-basic-tls", "output":
+                    "WinRM offers HTTP Basic authentication, but over TLS (5986) "
+                    "so credentials are encrypted in transit. Prefer "
+                    "Negotiate/Kerberos and restrict Basic to limit credential "
+                    "replay exposure."})
         return
 
     # HTTP(S)-based stores. Use TLS when the cert was already grabbed or the
