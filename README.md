@@ -311,6 +311,18 @@ nmap's result and, for every under-identified port, adds:
   fed to CVE correlation) is **critical**. The cred test is self-limiting — a path
   the device doesn't implement `404`s, so defaults are only tried against the API
   the device actually speaks — and is governed by the same `--no-cam-creds` switch.
+- **Vendor private binary protocols** (device-management control channels, read-only
+  detection): **Dahua DVRIP/DHIP** (TCP 37777) — sends the *pre-auth realm request*
+  (no credentials, no login completed; just the step that asks the device for its
+  login challenge) and confirms the DVRIP/DHIP response, recovering the realm
+  string (which often carries the device serial); **Hikvision SDK / HCNetSDK**
+  (TCP 8000) — the device greets on connect with a fixed 16-byte handshake, so the
+  probe sends *nothing* and reads it (the nmap “Hikvision IPCam control port”
+  signature). Both ports are auth-gated for actual control, so a hit is reported
+  as an informational device identification (and a CVE anchor for Dahua/Hikvision
+  — e.g. the CVE-2021-33044/33045 and CVE-2017-7921 classes), not an
+  unauthenticated-access alert. 8000 is shared with HTTP/ONVIF, so a non-SDK
+  service there falls through to the ONVIF/web checks.
 - **gRPC / HTTP2** (dedicated gRPC ports — 50051/6565/9090/… — or a `grpc`-named
   service): dependency-free detection (TLS ALPN `h2`, or the cleartext h2c
   preface → SETTINGS frame). The real finding is **server reflection enabled

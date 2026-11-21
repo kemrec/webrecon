@@ -1673,6 +1673,62 @@ async def vendor_cgi_probe(host: str, port: int, timeout: float,
 
 
 # ---------------------------------------------------------------------------
+# Vendor private binary protocols (device management channels, read-only detect).
+#   Dahua DVRIP/DHIP (TCP 37777): the NetSDK control channel. We send the pre-auth
+#     realm request (NO credentials, no login completed -- the first step that
+#     asks the device for its login challenge) and confirm a DVRIP/DHIP response;
+#     the realm string frequently carries the device serial.
+#   Hikvision SDK (TCP 8000): the HCNetSDK control channel. The device greets on
+#     connect with a fixed 16-byte handshake, so we send NOTHING and just read it
+#     (the nmap "Hikvision IPCam control port" NULL-probe signature).
+# Both ports are auth-gated for actual control, so a hit is an informational
+# device identification (and a CVE anchor), not an unauth-access alert.
+# ---------------------------------------------------------------------------
+_DAHUA_DVRIP_PORTS = {37777}
+_HIK_SDK_PORTS = {8000}
+# DVRIP realm request: type a0 01 00 00, 20 zero bytes, trailer 05 02 01 01 ..a1aa
+_DVRIP_REALM_REQ = (b"\xa0\x01\x00\x00" + b"\x00" * 20
+                    + b"\x05\x02\x01\x01\x00\x00\xa1\xaa")
+_DVRIP_REALM_RX = re.compile(rb"Realm:([^\r\n]*)")
+_DVRIP_RANDOM_RX = re.compile(rb"Random:([^\r\n]*)")
+
+
+def _parse_dvrip(data: bytes):
+    """Confirm a Dahua DVRIP/DHIP response and pull the realm (often the device
+    serial/name). Returns {realm, random} or None. Recv headers begin 0xb0
+    (binary) or 0xf6 (JSON); older firmware answers the realm request in text."""
+    if len(data) < 4:
+        return None
+    rm = _DVRIP_REALM_RX.search(data)
+    rnd = _DVRIP_RANDOM_RX.search(data)
+    if not (data[0] in (0xB0, 0xF6) or rm or b"Dahua" in data):
+        return None
+    return {"realm": rm.group(1).decode("latin-1", "replace").strip() if rm else "",
+            "random": rnd.group(1).decode("latin-1", "replace").strip() if rnd else ""}
+
+
+async def dahua_dvrip_probe(host: str, port: int, timeout: float):
+    """Pre-auth DVRIP realm request (no credentials). {realm, random}/None."""
+    data = await _read_once(host, port, _DVRIP_REALM_REQ, min(timeout, 3.0))
+    return _parse_dvrip(data) if data else None
+
+
+def _hik_sdk_handshake(data: bytes) -> bool:
+    """Hikvision SDK control-port greeting: 16 bytes
+    00 00 00 10  00 00 00 XX  00 00 00 XX  00 00 00 00  (XX = 0x1e or 0x0d seen
+    in the wild; we accept any equal XX pair for forward tolerance)."""
+    return (len(data) >= 16 and data[:4] == b"\x00\x00\x00\x10"
+            and data[4:7] == b"\x00\x00\x00" and data[8:11] == b"\x00\x00\x00"
+            and data[7] == data[11] and data[12:16] == b"\x00\x00\x00\x00")
+
+
+async def hikvision_sdk_probe(host: str, port: int, timeout: float) -> bool:
+    """Connect and read the greeting (send nothing). True on the SDK handshake."""
+    data = await _read_once(host, port, b"", min(timeout, 3.0))
+    return _hik_sdk_handshake(data)
+
+
+# ---------------------------------------------------------------------------
 # WS-Discovery (ONVIF device discovery, UDP 3702). A unicast Probe for the ONVIF
 # NetworkVideoTransmitter type makes a camera/NVR answer with a ProbeMatch that
 # names its Types, Scopes (onvif:// name / hardware / location) and the XAddrs of
@@ -2551,6 +2607,48 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
             return
         # not gRPC (e.g. a plain HTTP app sharing a gRPC-ish port): fall through
         # so the ops/ONVIF HTTP checks still get a chance on this port.
+
+    # Dahua DVRIP/DHIP management channel (TCP 37777). Read-only pre-auth realm
+    # request; a hit identifies the device (and often its serial).
+    if "dahua" in name or "dvrip" in name or port in _DAHUA_DVRIP_PORTS:
+        dv = await dahua_dvrip_probe(host, port, cfg.timeout)
+        if dv is not None:
+            if not svc.name:
+                svc.name = "dvrip"
+            if not svc.product:
+                svc.product = "Dahua"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            realm = dv.get("realm")
+            extra = f' Realm/serial "{realm}".' if realm else ""
+            svc.scripts.append({"id": "dahua-dvrip", "output":
+                f"Dahua DVRIP/DHIP device-management service detected on {port} "
+                f"(private binary protocol; answered the pre-auth realm request)."
+                f"{extra} This is the NetSDK control channel (login, config, PTZ, "
+                f"stream) and a frequent target of Dahua authentication-bypass CVEs "
+                f"(e.g. CVE-2021-33044 / CVE-2021-33045). It should never be "
+                f"internet-facing; restrict {port} to a management network."})
+            return
+
+    # Hikvision SDK / HCNetSDK control channel (TCP 8000). The device greets on
+    # connect, so we send nothing. 8000 is also an HTTP-alt / ONVIF port, so on a
+    # miss we fall through to the web/ONVIF branch below.
+    if "hikvision" in name or port in _HIK_SDK_PORTS:
+        if await hikvision_sdk_probe(host, port, cfg.timeout):
+            if not svc.name:
+                svc.name = "hikvision-sdk"
+            if not svc.product:
+                svc.product = "Hikvision"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            svc.scripts.append({"id": "hikvision-sdk", "output":
+                f"Hikvision SDK / control service detected on {port} (private "
+                f"binary protocol; the device sent its HCNetSDK handshake on "
+                f"connect). This is the control channel (login, config, live "
+                f"view) alongside the CVE-2017-7921 auth-bypass class on these "
+                f"devices. It should never be internet-facing; restrict {port} to "
+                f"a management network."})
+            return
 
     # ONVIF rides HTTP (no dedicated port of its own in most deployments), so it
     # is checked on any web service or a known ONVIF-only port. A single SOAP
