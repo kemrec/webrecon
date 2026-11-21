@@ -320,8 +320,14 @@ nmap's result and, for every under-identified port, adds:
   service names come back in the response DATA frame (protobuf), not the HPACK
   headers, so only HPACK *encoding* (literals, no Huffman) plus a tiny protobuf
   reader are needed — no gRPC library. `grpcurl`/`grpcio` are used only as an
-  optional fallback if the native client can't complete the exchange. Scoped to
-  gRPC ports so HTTPS/2 web ports are never mislabelled. Read-only (list only).
+  optional fallback if the native client can't complete the exchange. When
+  reflection is open, it then drills into the **method surface** natively via
+  `file_containing_symbol`: the returned `FileDescriptorProto` is parsed (package
+  + `ServiceDescriptorProto` → `MethodDescriptorProto`) to list the exact RPC
+  method names per service — the call surface a client needs to invoke them
+  without a `.proto`. Bounded to a capped number of symbols so a large surface
+  can't fan out into unbounded connections. Scoped to gRPC ports so HTTPS/2 web
+  ports are never mislabelled. Read-only (list/describe only).
 - **Ops / control-plane HTTP services** (read-only GETs, each gated to its port
   or a matching service name): **Prometheus** (`/-/healthy` + `buildinfo`; no
   auth by design, so network-reachable = **critical** metrics/topology

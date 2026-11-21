@@ -1936,10 +1936,75 @@ def _parse_reflection_services(data: bytes) -> list[str]:
     return out
 
 
+def _pb_varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | 0x80 if n else b)
+        if not n:
+            return bytes(out)
+
+
+def _grpc_symbol_msg(symbol: str) -> bytes:
+    """gRPC-framed ServerReflectionRequest{ file_containing_symbol: <symbol> }
+    (field 4, wiretype 2) -- asks the server for the descriptor that defines a
+    given service, which carries its methods."""
+    s = symbol.encode()
+    inner = b"\x22" + _pb_varint(len(s)) + s          # tag (4<<3)|2 = 0x22
+    return b"\x00" + len(inner).to_bytes(4, "big") + inner
+
+
+def _parse_fdp_services(fdp: bytes) -> dict:
+    """FileDescriptorProto -> {full_service_name: [method_name, ...]}. Fields:
+    2=package, 6=repeated ServiceDescriptorProto; service 1=name, 2=repeated
+    MethodDescriptorProto; method 1=name."""
+    pkg, raw = "", []
+    for fn, wt, val in _pb_fields(fdp):
+        if fn == 2 and wt == 2:
+            pkg = val.decode("utf-8", "replace")
+        elif fn == 6 and wt == 2:
+            sname, methods = "", []
+            for f2, w2, v2 in _pb_fields(val):
+                if f2 == 1 and w2 == 2:
+                    sname = v2.decode("utf-8", "replace")
+                elif f2 == 2 and w2 == 2:
+                    for f3, w3, v3 in _pb_fields(v2):
+                        if f3 == 1 and w3 == 2:
+                            methods.append(v3.decode("utf-8", "replace"))
+            if sname:
+                raw.append((sname, methods))
+    return {f"{pkg}.{s}" if pkg else s: m for s, m in raw}
+
+
+def _parse_reflection_file_response(data: bytes) -> dict:
+    """Strip gRPC frame(s) and merge the service->methods map out of every
+    ServerReflectionResponse (field 4 = FileDescriptorResponse, whose field 1 is
+    a repeated bytes file_descriptor_proto)."""
+    out, i = {}, 0
+    while i + 5 <= len(data):
+        mlen = int.from_bytes(data[i + 1:i + 5], "big")
+        msg = data[i + 5:i + 5 + mlen]
+        if len(msg) < mlen:
+            break
+        for fn, wt, val in _pb_fields(msg):
+            if fn == 4 and wt == 2:
+                for f2, w2, v2 in _pb_fields(val):
+                    if f2 == 1 and w2 == 2:
+                        for name, methods in _parse_fdp_services(v2).items():
+                            dst = out.setdefault(name, [])
+                            for m in methods:
+                                if m not in dst:
+                                    dst.append(m)
+        i += 5 + mlen
+    return out
+
+
 async def _reflect_once(host: str, port: int, timeout: float, tls: bool,
-                        path: str):
-    """One HTTP/2 reflection exchange on a fresh connection. Returns
-    (spoke_grpc, services)."""
+                        path: str, req_msg: bytes = _GRPC_REFLECT_MSG):
+    """One HTTP/2 reflection exchange on a fresh connection. Sends `req_msg`
+    (default: list_services) and returns (spoke_grpc, raw_data_payload); the
+    caller parses the payload for service names or file descriptors."""
     ctx = None
     if tls:
         ctx = ssl.create_default_context()
@@ -1967,7 +2032,7 @@ async def _reflect_once(host: str, port: int, timeout: float, tls: bool,
         _safe_write(_H2_PREFACE + _h2_frame(0x04, 0))              # preface+SETTINGS
         _safe_write(_h2_frame(0x01, 1, _hpack_request(host, port, path, tls),
                               flags=0x04))                          # HEADERS END_HEADERS
-        _safe_write(_h2_frame(0x00, 1, _GRPC_REFLECT_MSG, flags=0x01))  # DATA END_STREAM
+        _safe_write(_h2_frame(0x00, 1, req_msg, flags=0x01))      # DATA END_STREAM
         try:
             await writer.drain()
         except Exception:  # noqa: BLE001
@@ -1997,20 +2062,20 @@ async def _reflect_once(host: str, port: int, timeout: float, tls: bool,
                     spoke = True
                     data_payload += payload
                     if fflags & 0x01:                              # END_STREAM
-                        return True, _parse_reflection_services(data_payload)
+                        return True, data_payload
                 elif ftype == 0x01 and fstream == 1:               # HEADERS / trailers
                     spoke = True
                     if fflags & 0x01:
-                        return True, _parse_reflection_services(data_payload)
+                        return True, data_payload
                 elif ftype == 0x07:                                # GOAWAY
-                    return spoke, _parse_reflection_services(data_payload)
+                    return spoke, data_payload
             try:
                 await writer.drain()
             except Exception:  # noqa: BLE001
                 pass
-        return spoke, _parse_reflection_services(data_payload)
+        return spoke, data_payload
     except Exception:  # noqa: BLE001
-        return spoke, _parse_reflection_services(data_payload)
+        return spoke, data_payload
     finally:
         try:
             writer.close()
@@ -2026,11 +2091,36 @@ async def grpc_reflect_native(host: str, port: int, timeout: float,
     exchange; (True, []) => reflection is disabled/auth-gated."""
     spoke_any = False
     for path in _REFLECT_PATHS:
-        spoke, svcs = await _reflect_once(host, port, timeout, tls, path)
+        spoke, payload = await _reflect_once(host, port, timeout, tls, path)
+        svcs = _parse_reflection_services(payload)
         if spoke and svcs:
             return True, svcs
         spoke_any = spoke_any or spoke
     return spoke_any, []
+
+
+async def grpc_reflect_methods_native(host: str, port: int, timeout: float,
+                                      tls: bool, services: list,
+                                      max_services: int = 10) -> dict:
+    """Fetch per-service method descriptors via reflection file_containing_symbol
+    (native, dependency-free). Returns {full_service_name: [method, ...]}; empty
+    when the server doesn't return descriptors. Bounded to `max_services` symbols
+    so a huge surface can't fan out into unbounded connections."""
+    out: dict = {}
+    for sym in services[:max_services]:
+        for path in _REFLECT_PATHS:
+            spoke, payload = await _reflect_once(host, port, timeout, tls, path,
+                                                 _grpc_symbol_msg(sym))
+            if spoke and payload:
+                fr = _parse_reflection_file_response(payload)
+                if fr:
+                    for name, methods in fr.items():
+                        dst = out.setdefault(name, [])
+                        for m in methods:
+                            if m not in dst:
+                                dst.append(m)
+                    break          # got this symbol's descriptors; next service
+    return out
 
 
 def _parse_grpcurl_list(text: str) -> list[str]:
@@ -2431,6 +2521,24 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                     f"full service/method surface is enumerable. Services: "
                     f"{', '.join(refl['services'])}. Disable reflection on "
                     f"exposed deployments and require per-RPC authentication."})
+                # drill into the method surface (native file_containing_symbol).
+                try:
+                    methods = await grpc_reflect_methods_native(
+                        host, port, cfg.timeout, tlsd, refl["services"])
+                except Exception:  # noqa: BLE001
+                    methods = {}
+                if methods:
+                    def _fmt(ms):
+                        shown = ", ".join(ms[:20])
+                        return (shown + (" ..." if len(ms) > 20 else "")
+                                if ms else "(no methods)")
+                    listing = "; ".join(f"{s} [{_fmt(methods[s])}]"
+                                        for s in sorted(methods))
+                    svc.scripts.append({"id": "grpc-methods", "output":
+                        f"gRPC method descriptors recovered via reflection "
+                        f"(file_containing_symbol): {listing}. Each is a callable "
+                        f"RPC on the unauthenticated surface -- the exact method "
+                        f"names a client needs to invoke them without a .proto."})
             else:
                 if refl is not None:
                     note = ("server reflection is disabled or requires "
