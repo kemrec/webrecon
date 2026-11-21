@@ -358,16 +358,26 @@ async def query_nvd(http, cfg: ScanConfig, cpe: str | None,
                             f"capped fetch at {fetch_cap}")
             break
 
-    # keyword results are NOT scoped by NVD to our product or version -> prune
-    # with a strict product+range gate (drops wrong-product and wrong-version
-    # hits). Runs even without a version, to drop cross-product keyword bleed.
-    if keyword and not cpe and products:
+    # NVD does not scope keyword results to our product/version at all, and even
+    # a cpeName+isVulnerable lookup has been seen to return nodes whose version
+    # range does not actually include ours (CPE range-boundary slips). Re-check
+    # every result against our own range matcher:
+    #   * keyword hits -> STRICT gate: drop a hit whose CPEs never mention our
+    #     product (the main cross-product FP killer).
+    #   * cpe hits -> CONSERVATIVE gate (defense in depth): keep a hit when our
+    #     product is absent (a vendor/product-name mismatch must never drop a
+    #     real CPE-anchored hit); drop only a listed-product row whose every node
+    #     excludes our version. Never removes a correctly-scoped CVE.
+    if products:
         before = vulns
+        strict = bool(keyword and not cpe)
         vulns = [it for it in before
                  if version_applies(it.get("cve", {}), products, want_version,
-                                    require_product=True)]
+                                    require_product=strict)]
         if len(vulns) != len(before):
-            utils.debug(f"nvd kw: product/version-filtered {len(before)}->{len(vulns)}")
+            mode = "kw" if strict else "cpe"
+            utils.debug(f"nvd {mode}: product/version-filtered "
+                        f"{len(before)}->{len(vulns)}")
 
     try:
         return parse_nvd({"vulnerabilities": vulns})

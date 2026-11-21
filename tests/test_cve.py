@@ -1,4 +1,8 @@
+import asyncio
+import json
+
 from servicescan import cve
+from servicescan.config import ScanConfig
 
 
 def test_normalize_version():
@@ -66,3 +70,63 @@ def test_version_applies_wrong_product_keyword_mode_drops():
     assert cve.version_applies(obj, {"grafana"}, "9.0", require_product=True) is False
     # conservative CPE-anchored mode: can't disprove -> keep
     assert cve.version_applies(obj, {"grafana"}, "9.0", require_product=False) is True
+
+
+class _NvdResp:
+    def __init__(self, text):
+        self.text = text
+        self.status = 200
+        self.ok = True
+
+
+class _NvdHTTP:
+    """Returns one canned NVD payload for any fetch (single page)."""
+    def __init__(self, payload):
+        self._text = json.dumps(payload)
+
+    async def fetch(self, url, method="GET", headers=None, read_body=True):
+        return _NvdResp(self._text)
+
+
+def _nvd_payload(*cves):
+    vulns = [{"cve": {"id": cid, "descriptions": [], "metrics": {},
+                      "configurations": confs}} for cid, confs in cves]
+    return {"totalResults": len(vulns), "vulnerabilities": vulns}
+
+
+def _conf(criteria, **bounds):
+    m = {"vulnerable": True, "criteria": criteria}
+    m.update(bounds)
+    return [{"nodes": [{"cpeMatch": [m]}]}]
+
+
+def test_query_nvd_cpe_path_prunes_wrong_version_defense_in_depth():
+    # A cpeName+isVulnerable lookup for http_server 2.4.49 returns two CVEs; NVD
+    # mis-included one whose only node starts at 2.5.0. The conservative cpe gate
+    # must drop that one while keeping the correctly-scoped hit.
+    keep = ("CVE-KEEP",
+            _conf("cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*"))
+    drop = ("CVE-DROP",
+            _conf("cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+                  versionStartIncluding="2.5.0"))
+    http = _NvdHTTP(_nvd_payload(keep, drop))
+    cfg = ScanConfig(target="x")
+    out = asyncio.run(cve.query_nvd(
+        http, cfg, cpe="cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
+        keyword=None, products={"http_server"}, want_version="2.4.49"))
+    ids = {c.id for c in out}
+    assert "CVE-KEEP" in ids
+    assert "CVE-DROP" not in ids
+
+
+def test_query_nvd_cpe_path_keeps_product_absent():
+    # conservative cpe gate must NOT drop a hit whose CPEs never mention our
+    # product (a vendor/product-name mismatch, not a wrong-version row).
+    other = ("CVE-OTHER",
+             _conf("cpe:2.3:a:other:thing:1.0:*:*:*:*:*:*:*"))
+    http = _NvdHTTP(_nvd_payload(other))
+    cfg = ScanConfig(target="x")
+    out = asyncio.run(cve.query_nvd(
+        http, cfg, cpe="cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
+        keyword=None, products={"http_server"}, want_version="2.4.49"))
+    assert {c.id for c in out} == {"CVE-OTHER"}
