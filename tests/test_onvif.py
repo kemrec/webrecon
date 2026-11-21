@@ -260,3 +260,119 @@ def test_onvif_default_creds_then_enumerates():
     out = {s["id"]: s["output"] for s in svc.scripts}
     assert "admin" in out["onvif-users"]
     assert "subStream" in out["onvif-media-profiles"]
+
+
+# --- PTZ / events enumeration ----------------------------------------------
+_PTZ_CONFIGS = (
+    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+    ' xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body>'
+    '<tptz:GetConfigurationsResponse xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">'
+    '<tptz:PTZConfiguration token="PTZCfg_1"><tt:Name>PTZ Main</tt:Name>'
+    '</tptz:PTZConfiguration></tptz:GetConfigurationsResponse>'
+    '</s:Body></s:Envelope>')
+
+_EVENT_PROPS = (
+    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>'
+    '<tev:GetEventPropertiesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl">'
+    '<wstop:TopicSet xmlns:wstop="http://docs.oasis-open.org/wsn/t-1"'
+    ' xmlns:tns1="http://www.onvif.org/ver10/topics">'
+    '<tns1:VideoSource><MotionAlarm wstop:topic="true"/></tns1:VideoSource>'
+    '<tns1:RuleEngine><CellMotionDetector>'
+    '<Motion wstop:topic="true"/></CellMotionDetector></tns1:RuleEngine>'
+    '</wstop:TopicSet></tev:GetEventPropertiesResponse></s:Body></s:Envelope>')
+
+
+def test_parse_onvif_ptz_direct():
+    ptz = fp._parse_onvif_ptz(_PTZ_CONFIGS.encode())
+    assert [p["token"] for p in ptz] == ["PTZCfg_1"]
+    assert ptz[0]["name"] == "PTZ Main"
+
+
+def test_parse_onvif_event_topics_direct():
+    topics = fp._parse_onvif_event_topics(_EVENT_PROPS.encode())
+    assert "MotionAlarm" in topics and "Motion" in topics
+
+
+def _ptz_events_server(holder):
+    """Advertises PTZ + events in GetServices (XAddr -> this very port) and
+    answers GetConfigurations / GetEventProperties; faults everything else."""
+    def services_xml(p):
+        xa = f"http://127.0.0.1:{p}/onvif/device_service"
+        return (
+            '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>'
+            '<tds:GetServicesResponse xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+            f'<tds:Service><tds:Namespace>http://www.onvif.org/ver20/ptz/wsdl'
+            f'</tds:Namespace><tds:XAddr>{xa}</tds:XAddr></tds:Service>'
+            f'<tds:Service><tds:Namespace>http://www.onvif.org/ver10/events/wsdl'
+            f'</tds:Namespace><tds:XAddr>{xa}</tds:XAddr></tds:Service>'
+            '</tds:GetServicesResponse></s:Body></s:Envelope>')
+
+    async def handler(reader, writer):
+        try:
+            data = await asyncio.wait_for(reader.read(8192), timeout=2.0)
+        except Exception:
+            data = b""
+        text = data.decode("latin-1", "replace")
+        if "GetServices" in text:
+            out = _http("200 OK", services_xml(holder["port"]))
+        elif "GetConfigurations" in text:
+            out = _http("200 OK", _PTZ_CONFIGS)
+        elif "GetEventProperties" in text:
+            out = _http("200 OK", _EVENT_PROPS)
+        else:
+            out = _http("400 Bad Request", _FAULT)
+        try:
+            writer.write(out)
+            await writer.drain()
+        except Exception:
+            pass
+        writer.close()
+    return handler
+
+
+def test_onvif_ptz_and_events_enumerated_end_to_end():
+    async def run():
+        holder = {}
+        server = await asyncio.start_server(_ptz_events_server(holder),
+                                            "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        holder["port"] = port
+        try:
+            ptz = await fp.onvif_get_ptz("127.0.0.1", port, 2.0)
+            topics = await fp.onvif_get_events("127.0.0.1", port, 2.0)
+            # the script wrapper too (unauth path: mksec=None)
+            svc = Service(port=port, name="onvif", state="open")
+            await fp._onvif_enum_scripts(svc, "127.0.0.1", port, 2.0, False, None)
+        finally:
+            server.close()
+            await server.wait_closed()
+        return ptz, topics, svc
+
+    ptz, topics, svc = asyncio.run(run())
+    assert ptz and ptz[0]["name"] == "PTZ Main"
+    assert "MotionAlarm" in topics
+    ids = {s["id"] for s in svc.scripts}
+    assert "onvif-ptz" in ids and "onvif-events" in ids
+    out = {s["id"]: s["output"] for s in svc.scripts}
+    assert "PTZ Main" in out["onvif-ptz"]
+    assert "MotionAlarm" in out["onvif-events"]
+
+
+def test_onvif_ptz_absent_when_service_not_advertised():
+    # a device that faults GetServices (no PTZ/events listed) yields nothing
+    async def run():
+        async def handler(reader, writer):
+            await reader.read(4096)
+            writer.write(_http("400 Bad Request", _FAULT))
+            await writer.drain()
+            writer.close()
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            return (await fp.onvif_get_ptz("127.0.0.1", port, 2.0),
+                    await fp.onvif_get_events("127.0.0.1", port, 2.0))
+        finally:
+            server.close()
+            await server.wait_closed()
+    ptz, topics = asyncio.run(run())
+    assert ptz == [] and topics == []

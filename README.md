@@ -267,7 +267,11 @@ nmap's result and, for every under-identified port, adds:
   (`401` → the auth scheme/realm is recorded). On a gated stream it also tries a
   tiny list of factory-default credentials (`admin:admin`, `root:root`, …) over
   Basic **and** Digest; an accepted default is a critical finding. RTSPS runs the
-  identical recon over a TLS transport. Nothing is ever `PLAY`ed or recorded.
+  identical recon over a TLS transport, and additionally grabs the TLS
+  certificate: its subject CN / SAN names (often internal-only hostnames that
+  exist nowhere else) are stored on the service and harvested by the `--web`
+  chain as cert-only vhost candidates mapped to the scanned IP — the same SAN
+  pivot the HTTPS ports already feed. Nothing is ever `PLAY`ed or recorded.
 - **ONVIF camera checks** (any web port or a common ONVIF port): a SOAP
   `GetSystemDateAndTime` (unauthenticated by spec) confirms an ONVIF
   `device_service` and reads the device clock; an unauthenticated
@@ -280,7 +284,13 @@ nmap's result and, for every under-identified port, adds:
   `GetSnapshotUri` list the media profiles (stream name, resolution, codec) with
   the **actual stream/snapshot URIs** the device serves (these frequently embed
   the stream credentials in clear) — the media endpoint is discovered via
-  `GetServices`. Read-only SOAP calls only.
+  `GetServices`. When the device advertises a **PTZ** service, `GetConfigurations`
+  confirms the camera is motorized (an attacker with this access can aim it —
+  `ContinuousMove`/`AbsoluteMove`/`GotoPreset` — to look away or track); when it
+  advertises an **events** service, `GetEventProperties` lists the topic set
+  (motion/tamper/analytics/I/O) a client could subscribe to. PTZ/events are
+  claimed only when `GetServices` actually lists them, so a fixed camera never
+  produces a false positive. Read-only SOAP calls only — no move is ever issued.
 - **Unauth JPEG snapshot** (any camera-signalled web port): most IP cameras
   expose a still-frame URL (`/snapshot.jpg`, `/axis-cgi/jpg/image.cgi`,
   `/ISAPI/Streaming/channels/101/picture`, …). A single read-only `GET` that

@@ -207,11 +207,14 @@ def _selfsigned():
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
     now = datetime.datetime.now(datetime.timezone.utc)
+    # a SAN that exists ONLY in the cert -- the internal vhost the pivot surfaces
+    san = x509.SubjectAlternativeName([x509.DNSName("cam.internal.local")])
     cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
             .not_valid_before(now - datetime.timedelta(days=1))
             .not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(san, critical=False)
             .sign(key, hashes.SHA256()))
     d = tempfile.mkdtemp()
     cp, kp = os.path.join(d, "c.pem"), os.path.join(d, "k.pem")
@@ -248,6 +251,14 @@ def test_rtsps_tls_unauthenticated_stream_end_to_end():
     assert "rtsp-unauth" in _ids(svc)
     assert svc.name == "rtsps"
     assert "RTSPS" in svc.extrainfo
+    # RTSPS cert/SAN pivot: the cert was grabbed onto svc.tls and surfaced
+    assert "rtsps-cert" in _ids(svc)
+    assert "cam.internal.local" in svc.tls.get("sans", [])
+    out = {s["id"]: s["output"] for s in svc.scripts}
+    assert "cam.internal.local" in out["rtsps-cert"]
+    # and the web-chain SAN harvester picks that cert-only name up for the pivot
+    from servicescan import chain
+    assert "cam.internal.local" in chain.harvest_sans([svc])
 
 
 def test_non_rtsp_port_emits_nothing():

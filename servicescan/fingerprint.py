@@ -1115,6 +1115,8 @@ _ONVIF_PATH = "/onvif/device_service"
 _ONVIF_PORTS = {8000, 8899, 2020, 8081, 10080}   # common ONVIF-only HTTP ports
 _ONVIF_DEV_NS = "http://www.onvif.org/ver10/device/wsdl"
 _ONVIF_MEDIA_NS = "http://www.onvif.org/ver10/media/wsdl"
+_ONVIF_PTZ_NS = "http://www.onvif.org/ver20/ptz/wsdl"
+_ONVIF_EVENT_NS = "http://www.onvif.org/ver10/events/wsdl"
 _ONVIF_SCHEMA_NS = "http://www.onvif.org/ver10/schema"
 _ONVIF_URI_RX = re.compile(r"<(?:\w+:)?Uri>\s*([^<][^<]*?)\s*</(?:\w+:)?Uri>", re.I)
 _ONVIF_DEVINFO_RX = {
@@ -1349,10 +1351,12 @@ async def onvif_get_users(host: str, port: int, timeout: float,
     return _parse_onvif_users(r[2]) if r and r[0] == 200 else []
 
 
-async def _onvif_media_endpoint(host: str, port: int, timeout: float,
-                                tls: bool, mksec=None):
-    """Discover the media-service endpoint via GetServices; fall back to the
-    device_service endpoint when it is absent."""
+async def _onvif_service_endpoint(host: str, port: int, timeout: float,
+                                  tls: bool, mksec, marker: str):
+    """Find one ONVIF sub-service endpoint by its wsdl namespace marker (e.g.
+    'ver10/media/wsdl', 'ver20/ptz/wsdl', 'ver10/events/wsdl') via GetServices.
+    Returns (path, port, tls) only when the device advertises that service, else
+    None -- so a fixed (non-PTZ) camera never produces a false PTZ/events claim."""
     sec = mksec() if mksec else ""
     r = await _http_post_once(host, port, _ONVIF_PATH,
         _onvif_envelope(
@@ -1363,11 +1367,19 @@ async def _onvif_media_endpoint(host: str, port: int, timeout: float,
         text = r[2].decode("latin-1", "replace")
         for blk in re.findall(r"<(?:\w+:)?Service>(.*?)</(?:\w+:)?Service>",
                               text, re.I | re.S):
-            if "ver10/media/wsdl" in blk:
+            if marker in blk:
                 xa = re.search(r"<(?:\w+:)?XAddr>([^<]+)<", blk, re.I)
                 if xa:
                     return _parse_xaddr(xa.group(1).strip(), port, tls)
-    return _ONVIF_PATH, port, tls
+    return None
+
+
+async def _onvif_media_endpoint(host: str, port: int, timeout: float,
+                                tls: bool, mksec=None):
+    """Media endpoint via GetServices; fall back to device_service when absent."""
+    ep = await _onvif_service_endpoint(host, port, timeout, tls, mksec,
+                                       "ver10/media/wsdl")
+    return ep or (_ONVIF_PATH, port, tls)
 
 
 async def onvif_get_media(host: str, port: int, timeout: float,
@@ -1419,10 +1431,79 @@ async def onvif_get_media(host: str, port: int, timeout: float,
     return profiles
 
 
+def _parse_onvif_ptz(body: bytes) -> list[dict]:
+    """PTZ configurations/nodes -> [{token, name}]. Accepts either the
+    GetConfigurations (PTZConfiguration) or GetNodes (PTZNode) shape."""
+    text = body.decode("latin-1", "replace")
+    out = []
+    for tag in ("PTZConfiguration", "PTZNode"):
+        for m in re.finditer(
+                rf"<(?:\w+:)?{tag}\b([^>]*)>(.*?)</(?:\w+:)?{tag}>",
+                text, re.I | re.S):
+            attrs, blk = m.group(1), m.group(2)
+            tok = re.search(r'token\s*=\s*"([^"]+)"', attrs, re.I)
+            name = re.search(r"<(?:\w+:)?Name>([^<]+)<", blk, re.I)
+            out.append({"token": tok.group(1).strip() if tok else "",
+                        "name": name.group(1).strip() if name else ""})
+        if out:
+            break
+    return out
+
+
+def _parse_onvif_event_topics(body: bytes) -> list[str]:
+    """Topic leaves out of a GetEventProperties TopicSet. ONVIF marks topic
+    elements with wstop:topic="true"; we collect their local names."""
+    text = body.decode("latin-1", "replace")
+    if "TopicSet" not in text:
+        return []
+    topics = []
+    for m in re.finditer(r"<(?:\w+:)?(\w+)\b[^>]*\btopic\s*=\s*\"true\"",
+                         text, re.I):
+        t = m.group(1)
+        if t not in topics:
+            topics.append(t)
+    return topics or ["(topic set available)"]
+
+
+async def onvif_get_ptz(host: str, port: int, timeout: float,
+                        tls: bool = False, mksec=None) -> list[dict]:
+    """PTZ GetConfigurations on the advertised PTZ endpoint (read-only). Empty
+    unless the device lists a PTZ service and returns at least one config."""
+    ep = await _onvif_service_endpoint(host, port, timeout, tls, mksec,
+                                       "ver20/ptz/wsdl")
+    if ep is None:
+        return []
+    sec = mksec() if mksec else ""
+    r = await _http_post_once(host, ep[1], ep[0],
+        _onvif_envelope(f'<GetConfigurations xmlns="{_ONVIF_PTZ_NS}"/>', sec),
+        timeout, ep[2])
+    if not (r and r[0] == 200):
+        return []
+    return _parse_onvif_ptz(r[2])
+
+
+async def onvif_get_events(host: str, port: int, timeout: float,
+                           tls: bool = False, mksec=None) -> list[str]:
+    """Events GetEventProperties on the advertised events endpoint (read-only).
+    Returns the topic leaves, or empty when the device lists no events service."""
+    ep = await _onvif_service_endpoint(host, port, timeout, tls, mksec,
+                                       "ver10/events/wsdl")
+    if ep is None:
+        return []
+    sec = mksec() if mksec else ""
+    r = await _http_post_once(host, ep[1], ep[0],
+        _onvif_envelope(f'<GetEventProperties xmlns="{_ONVIF_EVENT_NS}"/>', sec),
+        timeout, ep[2])
+    if not (r and r[0] == 200):
+        return []
+    return _parse_onvif_event_topics(r[2])
+
+
 async def _onvif_enum_scripts(svc, host: str, port: int, timeout: float,
                               tls: bool, mksec) -> None:
-    """Append onvif-users / onvif-media-profiles info scripts when the read-only
-    GetUsers / GetProfiles calls return data (best effort; silent on failure)."""
+    """Append onvif-users / onvif-media-profiles / onvif-ptz / onvif-events info
+    scripts when the read-only Get* calls return data (best effort; silent on
+    failure)."""
     users = await onvif_get_users(host, port, timeout, tls, mksec)
     if users:
         svc.scripts.append({"id": "onvif-users", "output":
@@ -1449,6 +1530,23 @@ async def _onvif_enum_scripts(svc, host: str, port: int, timeout: float,
             "; ".join(fmt(p) for p in profiles) + ". Each profile maps to a live "
             "stream/snapshot the camera serves; the returned URIs often embed the "
             "stream credentials in clear."})
+    ptz = await onvif_get_ptz(host, port, timeout, tls, mksec)
+    if ptz:
+        names = ", ".join((p["name"] or p["token"] or "?") for p in ptz)
+        svc.scripts.append({"id": "onvif-ptz", "output":
+            f"ONVIF PTZ control available (GetConfigurations returned "
+            f"{len(ptz)} configuration(s): {names}). With this access an attacker "
+            f"can aim the camera -- ContinuousMove / AbsoluteMove / GotoPreset -- "
+            f"to point it away from an area or track a target. (Read-only: no move "
+            f"was issued.)"})
+    topics = await onvif_get_events(host, port, timeout, tls, mksec)
+    if topics:
+        svc.scripts.append({"id": "onvif-events", "output":
+            "ONVIF event service exposed (GetEventProperties): topics include "
+            + ", ".join(topics[:12])
+            + ". The event/notification surface reveals motion, tamper, analytics "
+              "and digital-I/O state and lets a client subscribe to the camera's "
+              "real-time events."})
 
 
 def _utcnow_iso() -> str:
@@ -2121,6 +2219,25 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                     f"RTSP server detected{banner}{tlsnote}. Methods: "
                     f"{info['public'] or 'n/a'}. No stream at common paths and no "
                     f"401, so the unauth status is undetermined."})
+            # RTSPS cert/SAN pivot: grab the TLS cert so its subject/SAN names
+            # (frequently internal-only hostnames) are stored on svc.tls and
+            # harvested by the --web chain, mapped to this IP as vhost candidates.
+            if rtsp_tls and not svc.tls:
+                t = await tls_info(host, port, cfg.timeout)
+                if t:
+                    svc.tls.update(t)
+                    names = list(dict.fromkeys(
+                        n for n in ([t.get("subject_cn", "")]
+                                    + list(t.get("sans", []) or [])) if n))
+                    if names:
+                        svc.scripts.append({"id": "rtsps-cert", "output":
+                            f"RTSPS TLS certificate on {port} "
+                            f"(issuer {t.get('issuer_cn') or 'n/a'}, "
+                            f"{t.get('tls_version') or 'TLS'}): subject/SAN names "
+                            f"{', '.join(names)}. Harvested as cert-only vhost "
+                            f"candidates for the --web pivot (mapped to this IP), "
+                            f"surfacing internal hostnames that exist only in the "
+                            f"certificate."})
         return
 
     # HTTP(S)-based stores. Use TLS when the cert was already grabbed or the
