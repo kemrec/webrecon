@@ -436,6 +436,14 @@ nmap's result and, for every under-identified port, adds:
   packet (`smb-ntlm-info`, informational recon that also anchors CVE
   correlation to the Windows build). Signing *required* is reported as good
   posture.
+- **NTLM over HTTP** (any web port): IIS/Exchange/RDWeb endpoints that offer
+  `WWW-Authenticate: NTLM`/`Negotiate` leak the same host identity as SMB. A
+  `GET` carrying only an NTLM `NEGOTIATE` (no credentials) makes the server
+  answer `401` with an NTLM `CHALLENGE` naming the OS build and AD/NetBIOS
+  domain and computer — reported informationally (`http-ntlm-info`, also
+  anchoring CVE correlation). `/` is always checked; the Exchange/RDWeb paths
+  (`/ews/`, `/rpc/`, `/autodiscover/…`, `/RDWeb/`, …) are swept only when the
+  server banner looks like Microsoft-IIS, so generic web ports cost one request.
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully

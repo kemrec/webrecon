@@ -2418,6 +2418,71 @@ async def smb_probe(host: str, port: int, timeout: float):
 
 
 # ---------------------------------------------------------------------------
+# NTLM over HTTP (IIS/Exchange/RDWeb). Endpoints that offer `WWW-Authenticate:
+# NTLM`/`Negotiate` leak the same host identity as SMB: a GET carrying only an
+# NTLM NEGOTIATE (type 1) makes the server answer 401 with an NTLM CHALLENGE
+# (type 2) naming the OS build + AD/NetBIOS domain and computer. No credentials
+# are sent (no type 3), so no authentication is attempted -- informational
+# recon that also anchors CVE correlation. Reuses the SMB NTLM primitives.
+# ---------------------------------------------------------------------------
+_HTTP_NTLM_PATHS = ("/ews/", "/rpc/", "/autodiscover/autodiscover.xml",
+                    "/oab/", "/mapi/", "/powershell/", "/RDWeb/",
+                    "/EWS/Exchange.asmx", "/aspnet_client/")
+
+
+async def http_ntlm_probe(host: str, port: int, timeout: float, tls: bool):
+    """Read an HTTP NTLM type-2 challenge (no credentials) to disclose OS build
+    + AD/NetBIOS names. Returns (path, info) or None. Checks '/' first and only
+    sweeps the IIS/Exchange paths when the server banner looks like Microsoft."""
+    import base64
+
+    async def challenge(path: str, wa: str):
+        if "ntlm" in wa:
+            auth = "NTLM " + base64.b64encode(_ntlm_type1()).decode()
+        else:
+            auth = "Negotiate " + base64.b64encode(
+                _spnego_ntlm(_ntlm_type1())).decode()
+        r2 = await _http_get_once(host, port, path, timeout, tls,
+                                  extra_headers={"Authorization": auth})
+        if not r2:
+            return None
+        m = re.search(r"(?:NTLM|Negotiate)\s+([A-Za-z0-9+/=]{16,})",
+                      r2[1].get("www-authenticate", ""))
+        if not m:
+            return None
+        try:
+            blob = base64.b64decode(m.group(1))
+        except Exception:  # noqa: BLE001
+            return None
+        info = _parse_ntlm_type2(blob)
+        return (path, info) if info else None
+
+    r = await _http_get_once(host, port, "/", timeout, tls)
+    if not r:
+        return None
+    status, headers, _ = r
+    wa = headers.get("www-authenticate", "").lower()
+    if status == 401 and ("ntlm" in wa or "negotiate" in wa):
+        res = await challenge("/", wa)
+        if res:
+            return res
+    server = headers.get("server", "").lower()
+    if not ("iis" in server or "microsoft" in server):
+        return None
+    for path in _HTTP_NTLM_PATHS:
+        r = await _http_get_once(host, port, path, timeout, tls)
+        if not r:
+            continue
+        st, h, _ = r
+        w = h.get("www-authenticate", "").lower()
+        if st == 401 and ("ntlm" in w or "negotiate" in w):
+            res = await challenge(path, w)
+            if res:
+                return res
+    return None
+
+
+# ---------------------------------------------------------------------------
 # gRPC (HTTP/2). Modern device/service control planes expose gRPC; nmap usually
 # leaves these ports unidentified ("tcpwrapped"). Detection is dependency-free:
 # over TLS we offer ALPN and check for a negotiated "h2"; cleartext we send the
@@ -3015,6 +3080,38 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
     # HTTP(S)-based stores. Use TLS when the cert was already grabbed or the
     # port is TLS-only.
     tls = bool(svc.tls) or port in _TLS_EXPOSURE_PORTS
+
+    # NTLM-over-HTTP identity leak (IIS/Exchange/RDWeb). Enrichment, not an alert:
+    # a GET carrying only an NTLM NEGOTIATE makes the server disclose its OS build
+    # + AD/NetBIOS names in the 401 challenge (no credentials sent). Non-returning
+    # so the dedicated store/web checks below still run.
+    if is_web_service(svc):
+        htls = is_tls_service(svc) or bool(svc.tls)
+        try:
+            hit = await http_ntlm_probe(host, port, cfg.timeout, htls)
+        except Exception:  # noqa: BLE001
+            hit = None
+        if hit:
+            hpath, ntlm = hit
+            if ntlm.get("os") and not svc.version:
+                svc.version = ntlm["os"]
+                svc.cve_skip = False
+            if not svc.product and (ntlm.get("os") or ntlm.get("nb_domain")):
+                svc.product = "Windows"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            recon = [f"{lbl} {ntlm[k]}" for k, lbl in (
+                        ("dns_domain", "AD domain"),
+                        ("nb_domain", "NetBIOS/workgroup"),
+                        ("dns_computer", "host"),
+                        ("nb_computer", "NetBIOS name"),
+                        ("os", "OS build")) if ntlm.get(k)]
+            svc.scripts.append({"id": "http-ntlm-info", "output":
+                f"HTTP NTLM endpoint {hpath} disclosed host identity WITHOUT "
+                "authentication: " + "; ".join(recon) + ". The server answered an "
+                "unauthenticated NTLM negotiate with a type-2 challenge naming its "
+                "OS build and AD/NetBIOS identity (no credentials sent) -- typical "
+                "of IIS/Exchange/RDWeb. Restrict or front these endpoints."})
 
     if "elasticsearch" in name or port in _ES_PORTS:
         res = await elasticsearch_probe(host, port, cfg.timeout, tls)
