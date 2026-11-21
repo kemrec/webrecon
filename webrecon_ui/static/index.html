@@ -71,6 +71,23 @@
   .empty { color:var(--muted); padding:20px; text-align:center; }
   .dl { display:flex; gap:10px; margin-top:10px; }
   details summary { cursor:pointer; color:var(--muted); font-size:12px; }
+  /* accordion: one summary row per service, detail revealed on toggle */
+  tr.svc { cursor:default; }
+  tr.svc.toggle { cursor:pointer; }
+  tr.svc.toggle:hover td { background:var(--panel2); }
+  .caret { display:inline-block; width:12px; color:var(--muted); font-size:11px;
+           margin-right:5px; user-select:none; }
+  .summary { display:flex; flex-wrap:wrap; gap:6px 8px; align-items:center; margin-top:5px; }
+  .chip { font-size:11px; padding:1px 7px; border-radius:10px;
+          background:var(--panel2); border:1px solid var(--line); color:var(--muted);
+          white-space:nowrap; }
+  .chip.sev-CRITICAL { color:var(--crit); border-color:var(--crit); }
+  .chip.sev-HIGH { color:var(--high); border-color:var(--high); }
+  .chip.sev-MEDIUM { color:var(--med); }
+  .chip.alert { background:var(--alert); color:#fff; border-color:var(--alert); font-weight:700; }
+  .chip.secret { color:var(--alert); border-color:var(--alert); font-weight:700; }
+  .detail { display:none; }
+  tr.svc.open .detail { display:block; }
 </style>
 </head>
 <body>
@@ -229,19 +246,87 @@ function cveDispSev(c) {
   return c.effective_severity || c.severity || "";
 }
 
-function renderService(svc) {
-  const tr = el("tr");
-  const idv = [svc.product, svc.version].filter(Boolean).join(" ") || svc.name || "—";
-  tr.appendChild(Object.assign(el("td", "port"), { textContent: `${svc.port}/${svc.proto}` }));
-  tr.appendChild(el("td", null, svc.name || "—"));
-  const idTd = el("td");
-  idTd.appendChild(el("span", null, idv));
-  if (svc.extrainfo) { idTd.appendChild(document.createTextNode(" ")); idTd.appendChild(el("span", "muted", "· " + svc.extrainfo)); }
+// --- per-service expand/collapse state ------------------------------------
+// Each service renders as one summary row; its scripts/CVEs/web detail is
+// revealed on click. Exposure-ALERT services open by default (the dangerous
+// ones are visible at a glance); the user can still collapse them. State is
+// keyed by host:port so it survives the live re-renders (host/web-chain events).
+const EXPANDED = new Set();   // user explicitly opened
+const COLLAPSED = new Set();  // user explicitly closed
+const svcKey = (ip, svc) => `${ip}:${svc.port}/${svc.proto}`;
+function svcIsOpen(key, hasAlert) {
+  if (EXPANDED.has(key)) return true;
+  if (COLLAPSED.has(key)) return false;
+  return hasAlert;            // default: alerts open, everything else closed
+}
+function applySvcState(tr, open, caret) {
+  tr.classList.toggle("open", open);
+  if (caret) caret.textContent = open ? "▾" : "▸";
+}
+function toggleSvc(key, hasAlert, tr, caret) {
+  const open = svcIsOpen(key, hasAlert);
+  if (open) { COLLAPSED.add(key); EXPANDED.delete(key); }
+  else { EXPANDED.add(key); COLLAPSED.delete(key); }
+  applySvcState(tr, !open, caret);
+}
 
-  // scripts (exposure alerts highlighted)
-  if (svc.scripts && svc.scripts.length) {
+const SEV_RANK = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1, "": 0 };
+
+function renderService(svc, hostIp) {
+  const tr = el("tr", "svc");
+  const idv = [svc.product, svc.version].filter(Boolean).join(" ") || svc.name || "—";
+
+  const cves = (svc.cves || []).slice().sort((a, b) => (cveDispScore(b) || 0) - (cveDispScore(a) || 0));
+  const scripts = svc.scripts || [];
+  const hasAlert = scripts.some((sc) => ALERT_IDS.has(sc.id));
+  const hasWeb = !!(svc.web && svc.web.url);
+  const hasDetail = cves.length || scripts.length || hasWeb;
+  const key = svcKey(hostIp, svc);
+
+  // -- port cell (with a caret when there's a detail block to toggle) --
+  const portTd = el("td", "port");
+  const caret = el("span", "caret", hasDetail ? "▸" : "");
+  portTd.appendChild(caret);
+  portTd.appendChild(document.createTextNode(`${svc.port}/${svc.proto}`));
+  tr.appendChild(portTd);
+
+  tr.appendChild(el("td", null, svc.name || "—"));
+
+  // -- service / findings cell: ident + always-visible summary + detail --
+  const idTd = el("td");
+  const ident = el("div");
+  ident.appendChild(el("span", null, idv));
+  if (svc.extrainfo) { ident.appendChild(document.createTextNode(" ")); ident.appendChild(el("span", "muted", "· " + svc.extrainfo)); }
+  idTd.appendChild(ident);
+
+  // summary chips (compact counts, shown whether or not the row is expanded)
+  if (hasDetail) {
+    const sum = el("div", "summary");
+    if (cves.length) {
+      let maxSev = "";
+      for (const c of cves) { const s = cveDispSev(c); if ((SEV_RANK[s] || 0) > (SEV_RANK[maxSev] || 0)) maxSev = s; }
+      const label = `${cves.length} CVE${cves.length > 1 ? "s" : ""}` + (maxSev ? ` · ${maxSev}` : "");
+      sum.appendChild(Object.assign(el("span", "chip sev-" + maxSev), { textContent: label }));
+      const kev = cves.filter((c) => c.kev).length;
+      if (kev) sum.appendChild(Object.assign(el("span", "chip secret"), { textContent: `${kev} KEV` }));
+    }
+    if (scripts.length)
+      sum.appendChild(Object.assign(el("span", "chip" + (hasAlert ? " alert" : "")),
+        { textContent: `${scripts.length} script${scripts.length > 1 ? "s" : ""}` + (hasAlert ? " · ALERT" : "") }));
+    if (hasWeb) {
+      const w = svc.web;
+      sum.appendChild(Object.assign(el("span", "chip" + (w.secrets ? " secret" : "")),
+        { textContent: w.secrets ? `web · ${w.secrets} secrets` : `web · ${w.pages || 0} pages` }));
+    }
+    idTd.appendChild(sum);
+  }
+
+  // detail block (hidden unless the row is open)
+  const detail = el("div", "detail");
+
+  if (scripts.length) {
     const ul = el("ul", "scripts");
-    for (const sc of svc.scripts) {
+    for (const sc of scripts) {
       const isAlert = ALERT_IDS.has(sc.id);
       const li = el("li", isAlert ? "alert" : null);
       li.appendChild(Object.assign(el("span", "id"), { textContent: sc.id }));
@@ -249,11 +334,9 @@ function renderService(svc) {
       if (isAlert) li.appendChild(Object.assign(el("span", "badge alert"), { textContent: "ALERT" }));
       ul.appendChild(li);
     }
-    idTd.appendChild(ul);
+    detail.appendChild(ul);
   }
 
-  // CVEs
-  const cves = (svc.cves || []).slice().sort((a, b) => (cveDispScore(b) || 0) - (cveDispScore(a) || 0));
   if (cves.length) {
     const ul = el("ul", "cves");
     for (const c of cves) {
@@ -270,11 +353,10 @@ function renderService(svc) {
       }
       ul.appendChild(li);
     }
-    idTd.appendChild(ul);
+    detail.appendChild(ul);
   }
 
-  // web-chain summary (populated after the --web crawl enriches the service)
-  if (svc.web && svc.web.url) {
+  if (hasWeb) {
     const w = svc.web;
     const div = el("div", "web");
     div.appendChild(Object.assign(el("span", "lead"), { textContent: "web chain → " }));
@@ -289,12 +371,23 @@ function renderService(svc) {
       div.appendChild(document.createTextNode(` · ${w.vhosts.length} vhosts`));
     if (w.tech && w.tech.length)
       div.appendChild(document.createTextNode(" · tech: " + w.tech.slice(0, 6).join(", ")));
-    idTd.appendChild(div);
+    detail.appendChild(div);
   }
-
+  idTd.appendChild(detail);
   tr.appendChild(idTd);
+
   tr.appendChild(Object.assign(el("td", "conf-" + (svc.confidence || "low")), { textContent: svc.confidence || "low" }));
   tr.appendChild(el("td", "muted", (svc.sources || []).join("+")));
+
+  // wire the toggle (only when there's something to reveal)
+  if (hasDetail) {
+    tr.classList.add("toggle");
+    applySvcState(tr, svcIsOpen(key, hasAlert), caret);
+    tr.addEventListener("click", (e) => {
+      if (e.target.closest("a")) return;   // let CVE links through
+      toggleSvc(key, hasAlert, tr, caret);
+    });
+  }
   return tr;
 }
 
@@ -321,7 +414,7 @@ function render(result) {
     for (const c of ["Port", "Name", "Service / findings", "Conf", "Src"]) htr.appendChild(el("th", null, c));
     thead.appendChild(htr); table.appendChild(thead);
     const tb = el("tbody");
-    for (const svc of (h.services || [])) tb.appendChild(renderService(svc));
+    for (const svc of (h.services || [])) tb.appendChild(renderService(svc, h.ip || h.hostname || h.target));
     table.appendChild(tb);
     card.appendChild(table);
     root.appendChild(card);
@@ -370,6 +463,7 @@ function doScan(ev) {
   $("go").disabled = true;
   $("downloads").hidden = true;
   $("results").innerHTML = "";
+  EXPANDED.clear(); COLLAPSED.clear();   // fresh expand/collapse state per scan
   const hosts = [];
   let expected = null;
   const t0 = Date.now();

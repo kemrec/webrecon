@@ -792,12 +792,16 @@ python -m webrecon_ui --port 9000
 ```
 
 Opening `http://127.0.0.1:8787/` serves a single, self-contained **vanilla
-HTML/JS page** (no framework, no build step): a target + options form, a
-per-host service table with CVEs, unauthenticated-exposure findings highlighted
-in red (the page pulls the alert-id list from `/api/alert-ids` so it never
-drifts from the engine), and a **Download** control with a format picker
-(scan.json, SARIF, CSV, JSONL, HTML report, nuclei target lists, …). Scans run
-**live** over SSE, so each host appears as it finishes rather than after the
+HTML/JS page** (no framework, no build step): a target + options form, and a
+per-host service table. Each service is a **collapsible row** — a compact
+summary (CVE count + top severity, KEV, script/ALERT, web chips) that expands on
+click to the full CVE / exposure / web-chain detail; services with an
+unauthenticated-exposure **ALERT open by default** (expansion state is kept per
+host:port across live re-renders). Exposure findings are highlighted in red (the
+page pulls the alert-id list from `/api/alert-ids` so it never drifts from the
+engine). A **Download** control offers a format picker (scan.json, SARIF, CSV,
+JSONL, HTML report, nuclei target lists, …) plus **Download all (zip)**. Scans
+run **live** over SSE, so each host appears as it finishes rather than after the
 whole scan.
 
 It binds to **localhost** on purpose: the API launches scans against whatever
