@@ -822,12 +822,17 @@ rendered from that same scan via `report.write_all` (reusing every existing
 writer verbatim — no re-scan, no duplicated formatting logic). The cache is a
 small bounded LRU, fitting the single-operator, localhost nature of the tool.
 
-The POST body is a JSON object. Only an allowlisted subset of options is
-honoured — `target` (required; string or list), `ports`, `use_nmap`,
-`top_ports`, `udp`, `nse`, `fingerprint`, `fp_all`, `cve`, `min_cvss`,
-`kev_high_only`, `exploits`, `timeout`, `concurrency`. Local-only knobs
-(`nmap_path`, `nmap_args`, `outdir`, `realm`, …) are deliberately **not**
-reachable from the web surface.
+The POST body is a JSON object (the SSE endpoint takes the same keys as query
+params). Only an allowlisted subset of options is honoured — `target`
+(required; string or list), `ports`, `use_nmap`, `top_ports`, `udp`, `nse`,
+`fingerprint`, `fp_all`, `render`, `realm`, `scan_rate`, `cve`, `min_cvss`,
+`kev_high_only`, `exploits`, `timeout`, `concurrency`, and the `--web` crawl
+chain (`web`, `web_render`, `web_depth`, `web_max_pages`). These are all scan
+*semantics*; host-filesystem / subprocess-path knobs (`nmap_path`, `nmap_args`,
+`outdir`) are deliberately **not** reachable from the web surface. With the web
+chain enabled, each web port's crawl summary (pages / urls / params / secrets /
+tech) is shown inline on the service and the crawl output is written under
+`servicescan-out/` as usual.
 
 ```bash
 curl -s -XPOST http://127.0.0.1:8787/api/scan \

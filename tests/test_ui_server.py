@@ -51,14 +51,42 @@ def test_build_config_maps_allowlisted_fields_with_coercion():
 
 
 def test_build_config_ignores_non_allowlisted_keys():
-    # nmap_path / nmap_args / outdir / realm must not be reachable from the web.
+    # nmap_path / nmap_args / outdir (host-filesystem / subprocess-path knobs)
+    # must not be reachable from the web.
     cfg = server.build_config({
         "target": "h", "nmap_path": "/evil/nmap", "outdir": "/tmp/x",
-        "realm": "CORP.LOCAL", "nmap_args": ["--script", "x"],
+        "nmap_args": ["--script", "x"],
     })
     assert cfg.nmap_path == ScanConfig().nmap_path   # unchanged default
     assert cfg.nmap_args == []
-    assert cfg.realm is None
+    assert cfg.outdir == ScanConfig().outdir
+
+
+def test_build_config_maps_scan_knobs():
+    # scan semantics that were previously CLI-only: rate / render / realm / web chain
+    cfg = server.build_config({
+        "target": "h", "scan_rate": "5000", "render": "true",
+        "realm": "CORP.LOCAL", "web": "yes", "web_render": "1",
+        "web_depth": "3", "web_max_pages": "200",
+    })
+    assert cfg.scan_rate == 5000
+    assert cfg.render is True
+    assert cfg.realm == "CORP.LOCAL"
+    assert cfg.web is True
+    assert cfg.web_render is True
+    assert cfg.web_depth == 3
+    assert cfg.web_max_pages == 200
+
+
+def test_build_config_realm_blank_is_none_and_overlong_rejected():
+    assert server.build_config({"target": "h", "realm": "  "}).realm is None
+    with pytest.raises(server.BadRequest):
+        server.build_config({"target": "h", "realm": "A" * 300})
+
+
+def test_build_config_web_depth_floor_is_one():
+    cfg = server.build_config({"target": "h", "web": True, "web_depth": "0"})
+    assert cfg.web_depth == 1
 
 
 def test_build_config_bad_number_is_bad_request():

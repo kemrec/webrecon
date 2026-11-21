@@ -102,6 +102,11 @@ async def run(cfg: ScanConfig, on_event=None) -> ScanResult:
         from . import chain
         utils.info("web chain: handing discovered web ports to webrecon")
         await chain.run_web_chain(cfg, result)
+        # the chain enriches services with a `web` summary AFTER the per-host
+        # events above were emitted, so push the enriched hosts once more for
+        # any live consumer to replace what it rendered.
+        _emit({"type": "update",
+               "hosts": [h.to_dict() for h in hosts if h.services]})
 
     return result
 

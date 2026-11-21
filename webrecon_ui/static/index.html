@@ -63,6 +63,9 @@
   .sev-CRITICAL,.score.CRITICAL { color:var(--crit); } .sev-HIGH,.score.HIGH { color:var(--high); }
   .sev-MEDIUM,.score.MEDIUM { color:var(--med); } .sev-LOW,.score.LOW { color:var(--low); }
   .kev { background:var(--alert); color:#fff; font-size:10px; font-weight:700; padding:0 5px; border-radius:3px; }
+  .web { margin:6px 0 0; font-size:12px; color:var(--muted); }
+  .web .lead { color:var(--accent); font-weight:600; }
+  .web .secret { color:var(--alert); font-weight:700; }
   a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
   .muted { color:var(--muted); }
   .empty { color:var(--muted); padding:20px; text-align:center; }
@@ -88,6 +91,12 @@
         <label>min CVSS
           <input type="number" id="min_cvss" min="0" max="10" step="0.1" value="0">
         </label>
+        <label>nmap min-rate
+          <input type="number" id="rate" min="0" step="1" placeholder="pkts/s">
+        </label>
+        <label>Kerberos realm
+          <input type="text" id="realm" placeholder="CORP.LOCAL (TCP-88)">
+        </label>
       </div>
       <div class="row">
         <label class="inline"><input type="checkbox" id="use_nmap" checked> use nmap</label>
@@ -96,6 +105,17 @@
         <label class="inline"><input type="checkbox" id="udp"> UDP (needs root)</label>
         <label class="inline"><input type="checkbox" id="cve" checked> CVE correlation</label>
         <label class="inline"><input type="checkbox" id="exploits"> map exploits</label>
+        <label class="inline"><input type="checkbox" id="render"> render web roots (JS)</label>
+      </div>
+      <div class="row">
+        <label class="inline"><input type="checkbox" id="web"> web chain (crawl web ports)</label>
+        <label class="inline"><input type="checkbox" id="web_render"> chain JS render</label>
+        <label>depth
+          <input type="number" id="web_depth" min="1" step="1" placeholder="1">
+        </label>
+        <label>max pages
+          <input type="number" id="web_max_pages" min="1" step="1" placeholder="60">
+        </label>
       </div>
       <div class="row">
         <button type="submit" id="go">Scan</button>
@@ -153,8 +173,22 @@ function buildQuery() {
   p.set("udp", $("udp").checked);
   p.set("cve", $("cve").checked);
   p.set("exploits", $("exploits").checked);
+  p.set("render", $("render").checked);
   const mc = parseFloat($("min_cvss").value);
   if (!isNaN(mc) && mc > 0) p.set("min_cvss", mc);
+  const rate = parseInt($("rate").value, 10);
+  if (!isNaN(rate) && rate > 0) p.set("scan_rate", rate);
+  const realm = $("realm").value.trim();
+  if (realm) p.set("realm", realm);
+  // --web crawl chain
+  if ($("web").checked) {
+    p.set("web", true);
+    p.set("web_render", $("web_render").checked);
+    const wd = parseInt($("web_depth").value, 10);
+    if (!isNaN(wd) && wd > 0) p.set("web_depth", wd);
+    const wm = parseInt($("web_max_pages").value, 10);
+    if (!isNaN(wm) && wm > 0) p.set("web_max_pages", wm);
+  }
   return p.toString();
 }
 
@@ -207,6 +241,25 @@ function renderService(svc) {
       ul.appendChild(li);
     }
     idTd.appendChild(ul);
+  }
+
+  // web-chain summary (populated after the --web crawl enriches the service)
+  if (svc.web && svc.web.url) {
+    const w = svc.web;
+    const div = el("div", "web");
+    div.appendChild(Object.assign(el("span", "lead"), { textContent: "web chain → " }));
+    const bits = [`${w.pages || 0} pages`, `${w.urls || 0} urls`,
+                  `${w.endpoints || 0} endpoints`, `${w.params || 0} params`];
+    div.appendChild(document.createTextNode(bits.join(" · ")));
+    if (w.secrets) {
+      div.appendChild(document.createTextNode(" · "));
+      div.appendChild(Object.assign(el("span", "secret"), { textContent: `${w.secrets} secrets` }));
+    }
+    if (w.vhosts && w.vhosts.length)
+      div.appendChild(document.createTextNode(` · ${w.vhosts.length} vhosts`));
+    if (w.tech && w.tech.length)
+      div.appendChild(document.createTextNode(" · tech: " + w.tech.slice(0, 6).join(", ")));
+    idTd.appendChild(div);
   }
 
   tr.appendChild(idTd);
@@ -304,6 +357,12 @@ function doScan(ev) {
       render({ hosts });                       // incremental re-render
       const done = hosts.length + (expected ? "/" + expected : "");
       setStatus(`Scanning ${target} … ${done} host(s) done`);
+    } else if (msg.type === "update") {
+      // web chain enriched the hosts after their first render; replace them
+      hosts.length = 0;
+      for (const h of (msg.hosts || [])) hosts.push(h);
+      render({ hosts });
+      setStatus(`Scanning ${target} … web chain done`);
     } else if (msg.type === "done") {
       scanId = msg.scan_id || null;
       if (!hosts.length) render({ hosts: [], errors: msg.errors });

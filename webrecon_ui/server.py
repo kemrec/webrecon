@@ -108,7 +108,8 @@ def render_export(result, fmt: str) -> bytes | None:
 
 # JSON request field -> (ScanConfig attribute, coercer). Anything not listed is
 # ignored, so the web surface can never reach sensitive/local-only config such
-# as nmap_path, nmap_args, outdir, or realm injection.
+# as nmap_path, nmap_args, or outdir. The exposed fields are all scan *semantics*
+# (what/how to scan), never host-filesystem or subprocess-path knobs.
 def _as_bool(v) -> bool:
     if isinstance(v, bool):
         return v
@@ -123,20 +124,43 @@ def _as_ports(v) -> str:
     return s or "-"
 
 
+def _as_int_or_none(v):
+    return int(v) if v not in (None, "") else None
+
+
+def _as_realm(v):
+    # AD/Kerberos realm for the TCP-88 AS-REQ posture check. A plain string that
+    # becomes a DER KerberosString in the probe (no shell, no path); empty -> None.
+    s = str(v).strip()
+    if not s:
+        return None
+    if len(s) > 255:
+        raise ValueError("realm too long")
+    return s
+
+
 _ALLOWED = {
-    "ports":       ("ports", _as_ports),
-    "use_nmap":    ("use_nmap", _as_bool),
-    "top_ports":   ("top_ports", lambda v: int(v) if v not in (None, "") else None),
-    "udp":         ("udp", _as_bool),
-    "nse":         ("nse", _as_bool),
-    "fingerprint": ("fingerprint", _as_bool),
-    "fp_all":      ("fp_all", _as_bool),
-    "cve":         ("cve", _as_bool),
-    "min_cvss":    ("min_cvss", lambda v: float(v) if v not in (None, "") else 0.0),
+    "ports":         ("ports", _as_ports),
+    "use_nmap":      ("use_nmap", _as_bool),
+    "top_ports":     ("top_ports", _as_int_or_none),
+    "udp":           ("udp", _as_bool),
+    "nse":           ("nse", _as_bool),
+    "fingerprint":   ("fingerprint", _as_bool),
+    "fp_all":        ("fp_all", _as_bool),
+    "render":        ("render", _as_bool),
+    "realm":         ("realm", _as_realm),
+    "scan_rate":     ("scan_rate", _as_int_or_none),
+    "cve":           ("cve", _as_bool),
+    "min_cvss":      ("min_cvss", lambda v: float(v) if v not in (None, "") else 0.0),
     "kev_high_only": ("kev_high_only", _as_bool),
-    "exploits":    ("exploits", _as_bool),
-    "timeout":     ("timeout", lambda v: float(v)),
-    "concurrency": ("concurrency", lambda v: int(v)),
+    "exploits":      ("exploits", _as_bool),
+    "timeout":       ("timeout", lambda v: float(v)),
+    "concurrency":   ("concurrency", lambda v: int(v)),
+    # --web crawl chain: hand discovered web ports to webrecon
+    "web":           ("web", _as_bool),
+    "web_render":    ("web_render", _as_bool),
+    "web_depth":     ("web_depth", lambda v: max(1, int(v))),
+    "web_max_pages": ("web_max_pages", lambda v: max(1, int(v))),
 }
 
 
