@@ -2616,6 +2616,135 @@ async def nfs_probe(host: str, port: int, timeout: float):
 
 
 # ---------------------------------------------------------------------------
+# LDAP (TCP 389, 636 over TLS). Dependency-free BER (reusing the SNMP encoders).
+# An anonymous simple bind (empty DN + empty password) that succeeds, followed
+# by a rootDSE read, is standard AD recon: it names the directory's naming
+# contexts (the domain DN), the DC hostname, and the forest/domain functional
+# levels -- informational. The alert is when an anonymous subtree search of a
+# naming context actually returns directory objects: anonymous directory reads
+# are enabled, so anyone can enumerate users/computers without credentials.
+# All operations are reads (bind + search); nothing is written. Wire per
+# RFC 4511 (LDAPv3).
+# ---------------------------------------------------------------------------
+_LDAP_PORTS = {389}
+_LDAPS_PORTS = {636}
+_ROOTDSE_ATTRS = ("namingContexts", "defaultNamingContext", "dnsHostName",
+                  "serverName", "domainFunctionality", "forestFunctionality",
+                  "domainControllerFunctionality", "supportedLDAPVersion",
+                  "rootDomainNamingContext", "vendorName", "vendorVersion")
+
+
+def _ldap_bind_anon(msgid: int = 1) -> bytes:
+    bind = _ber_int(3) + _ber_tlv(0x04, b"") + _ber_tlv(0x80, b"")  # v3, "", simple ""
+    return _ber_tlv(0x30, _ber_int(msgid) + _ber_tlv(0x60, bind))
+
+
+def _ldap_search(msgid: int, base: bytes, scope: int, attrs, sizelimit: int) -> bytes:
+    body = (_ber_tlv(0x04, base)
+            + _ber_tlv(0x0a, bytes([scope]))     # scope: 0 base, 1 one, 2 subtree
+            + _ber_tlv(0x0a, b"\x00")            # derefAliases: never
+            + _ber_int(sizelimit)
+            + _ber_int(5)                        # timeLimit 5s
+            + _ber_tlv(0x01, b"\x00")            # typesOnly false
+            + _ber_tlv(0x87, b"objectClass")     # filter: present (objectClass=*)
+            + _ber_tlv(0x30, b"".join(_ber_tlv(0x04, a.encode()) for a in attrs)))
+    return _ber_tlv(0x30, _ber_int(msgid) + _ber_tlv(0x63, body))
+
+
+async def _ldap_read_msg(reader, timeout: float):
+    """Read one LDAPMessage (BER SEQUENCE). Returns (protocol_op_tag, op_bytes,
+    msg_content) or (None, b'', b'')."""
+    try:
+        hdr = await asyncio.wait_for(reader.readexactly(2), timeout)
+        if hdr[0] != 0x30:
+            return None, b"", b""
+        l = hdr[1]
+        if l & 0x80:
+            ext = await asyncio.wait_for(reader.readexactly(l & 0x7f), timeout)
+            l = int.from_bytes(ext, "big")
+        content = await asyncio.wait_for(reader.readexactly(l), timeout)
+    except Exception:  # noqa: BLE001
+        return None, b"", b""
+    kids = _ber_split(content)
+    if len(kids) < 2:
+        return None, b"", content
+    return kids[1][0], kids[1][1], content
+
+
+def _parse_ldap_entry(op: bytes) -> dict:
+    """SearchResultEntry -> {attrType: [values]} (objectName ignored)."""
+    kids = _ber_split(op)
+    out = {}
+    if len(kids) < 2:
+        return out
+    for _, attr in _ber_split(kids[1][1]):            # PartialAttributeList
+        ak = _ber_split(attr)
+        if len(ak) < 2:
+            continue
+        atype = ak[0][1].decode("latin-1", "replace")
+        vals = [v.decode("latin-1", "replace") for _, v in _ber_split(ak[1][1])]
+        out[atype] = vals
+    return out
+
+
+async def ldap_probe(host: str, port: int, timeout: float, tls: bool):
+    """Anonymous LDAP bind + rootDSE + a naming-context read probe. Returns
+    {anon_bind, rootdse:{attr:[vals]}, anon_read:bool} or None (not LDAP)."""
+    ctx = None
+    if tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        writer.write(_ldap_bind_anon(1))
+        await writer.drain()
+        tag, op, _ = await _ldap_read_msg(reader, timeout)
+        if tag != 0x61:                               # not a BindResponse
+            return None
+        rc = _ber_split(op)
+        bind_ok = bool(rc and rc[0][1] and rc[0][1][0] == 0)
+        if not bind_ok:
+            return {"anon_bind": False, "rootdse": {}, "anon_read": False}
+        # rootDSE (base-object search)
+        writer.write(_ldap_search(2, b"", 0, _ROOTDSE_ATTRS, 0))
+        await writer.drain()
+        rootdse = {}
+        for _ in range(8):
+            t, o, _c = await _ldap_read_msg(reader, timeout)
+            if t == 0x64:
+                rootdse.update(_parse_ldap_entry(o))
+            elif t == 0x65 or t is None:              # SearchResultDone / EOF
+                break
+        # anonymous directory read? one-level search of a naming context
+        nc = rootdse.get("defaultNamingContext") or rootdse.get("namingContexts")
+        anon_read = False
+        if nc:
+            base = (nc[0] if isinstance(nc, list) else nc).encode()
+            writer.write(_ldap_search(3, base, 1, (), 3))
+            await writer.drain()
+            for _ in range(8):
+                t, o, _c = await _ldap_read_msg(reader, timeout)
+                if t == 0x64:
+                    anon_read = True
+                elif t == 0x65 or t is None:
+                    break
+        return {"anon_bind": True, "rootdse": rootdse, "anon_read": anon_read}
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ---------------------------------------------------------------------------
 # gRPC (HTTP/2). Modern device/service control planes expose gRPC; nmap usually
 # leaves these ports unidentified ("tcpwrapped"). Detection is dependency-free:
 # over TLS we offer ALPN and check for a negotiated "h2"; cleartext we send the
@@ -3081,7 +3210,7 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "minio-unauth", "portainer-unauth", "zookeeper-unauth",
                       "camera-ws-stream-unauth", "ttyd-shell-unauth",
                       "mqtt-unauth", "smbv1-enabled", "smb-signing-not-required",
-                      "nfs-export-world"}
+                      "nfs-export-world", "ldap-anonymous-read"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -3547,6 +3676,65 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                         "exported no_root_squash, write as root = host "
                         "compromise. Restrict exports to specific hosts/subnets "
                         "and keep root_squash enabled."})
+        return
+
+    if port in _LDAP_PORTS or port in _LDAPS_PORTS or "ldap" in name:
+        ltls = (port in _LDAPS_PORTS or is_tls_service(svc)
+                or "ldaps" in name or "ssl" in name)
+        res = await ldap_probe(host, port, cfg.timeout, ltls)
+        if res:
+            rd = res["rootdse"]
+
+            def _first(k):
+                v = rd.get(k)
+                if isinstance(v, list):
+                    return v[0] if v else ""
+                return v or ""
+
+            if not svc.name:
+                svc.name = "ldaps" if ltls else "ldap"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            is_ad = bool(rd.get("domainControllerFunctionality")
+                         or rd.get("forestFunctionality"))
+            if not svc.product:
+                svc.product = "Active Directory" if is_ad else "LDAP"
+            if not res["anon_bind"]:
+                svc.scripts.append({"id": "ldap-bind-refused", "output":
+                    f"LDAP on {port} refused an anonymous simple bind "
+                    "(authentication is enforced)."})
+            else:
+                nc = (rd.get("namingContexts")
+                      or ([rd["defaultNamingContext"]]
+                          if rd.get("defaultNamingContext") else []))
+                bits = []
+                if nc:
+                    bits.append("naming contexts "
+                                + ", ".join(nc if isinstance(nc, list) else [nc]))
+                if _first("dnsHostName"):
+                    bits.append("DC " + _first("dnsHostName"))
+                for fl, lbl in (("domainControllerFunctionality", "DC"),
+                                ("forestFunctionality", "forest"),
+                                ("domainFunctionality", "domain")):
+                    if _first(fl):
+                        bits.append(f"{lbl} func-level {_first(fl)}")
+                svc.scripts.append({"id": "ldap-rootdse", "output":
+                    "Anonymous LDAP bind accepted; rootDSE readable WITHOUT "
+                    "credentials: "
+                    + ("; ".join(bits) if bits else "(rootDSE present)")
+                    + ". This maps the directory (domain DN, DC, functional "
+                    "levels) to any unauthenticated client."})
+                if res["anon_read"]:
+                    svc.confidence = "high"
+                    svc.extrainfo = "anonymous LDAP directory read"
+                    svc.scripts.append({"id": "ldap-anonymous-read", "output":
+                        "Anonymous LDAP directory READ is enabled: an "
+                        "unauthenticated subtree search of a naming context "
+                        "returned directory objects. Anyone who can reach the "
+                        "server can enumerate users, groups and computers (a "
+                        "prime source for password-spray / Kerberoast "
+                        "targeting). Disable anonymous reads (AD: dsHeuristics "
+                        "bit; OpenLDAP: tighten the anonymous ACL)."})
         return
 
     # gRPC / HTTP2 on a dedicated gRPC port (or a `grpc`-named service). Scoped

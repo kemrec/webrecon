@@ -452,6 +452,16 @@ nmap's result and, for every under-identified port, adds:
   is reachable by any client — mountable and readable, and with `no_root_squash`
   writable as root — a **world-readable export alert** (`nfs-export-world`). All
   calls are read-only query procedures; nothing is mounted.
+- **LDAP** (TCP `389`, `636` over TLS): dependency-free BER. An **anonymous
+  simple bind** (empty DN + password) that succeeds, followed by a rootDSE read,
+  is AD recon — it names the naming contexts (domain DN), the DC hostname and
+  the forest/domain functional levels (`ldap-rootdse`, informational; also sets
+  the product to Active Directory). The **alert** is when an anonymous
+  one-level search of a naming context actually returns directory objects:
+  anonymous directory reads are enabled, so anyone can enumerate users, groups
+  and computers without credentials — a prime password-spray / Kerberoast
+  target list (`ldap-anonymous-read`). A refused anonymous bind is noted as good
+  posture. All operations are reads.
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully
