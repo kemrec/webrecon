@@ -492,6 +492,12 @@ nmap's result and, for every under-identified port, adds:
   means auth is enforced (`postgres-auth`, informational; a cleartext-password
   demand is flagged). No query is ever issued — the session is dropped at
   `AuthenticationOk`.
+- **MySQL / MariaDB** (TCP `3306`): the server sends its `HandshakeV10` greeting
+  the instant the socket opens, so reading it — **nothing is ever sent** — leaks
+  the server version (a CVE anchor), the default auth plugin and the TLS
+  capability (`CLIENT_SSL`). Reported informationally (`mysql-handshake`); a
+  server that does not advertise TLS is flagged (clients not forcing SSL would
+  send credentials in cleartext). No login is attempted.
 - **Kerberos KDC** (TCP `88`): dependency-free ASN.1/DER per RFC 4120. For a
   small built-in set of default principals an **AS-REQ with no pre-authentication**
   is sent; the KDC's reply classifies each account without ever sending a

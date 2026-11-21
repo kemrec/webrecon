@@ -517,6 +517,74 @@ async def postgres_probe(host: str, port: int, timeout: float):
     return info or None
 
 
+# MySQL / MariaDB (TCP 3306). The server sends its HandshakeV10 greeting the
+# instant the TCP connection opens -- before the client writes anything -- so
+# reading it leaks the server version (CVE anchor), the default auth plugin and
+# the TLS capability (CLIENT_SSL) without any authentication being attempted.
+# Informational only (no credential is ever sent, no login completed). Packet:
+# 3-byte little-endian length + 1-byte sequence + payload; payload = protocol
+# version (0x0A) + NUL server version + conn-id(4) + auth-data-1(8) + filler(1)
+# + cap-lower(2) [+ charset(1) + status(2) + cap-upper(2) + auth-data-len(1) +
+# reserved(10) + auth-data-2 + plugin-name]. Layout per the MySQL/MariaDB
+# client-server protocol; CLIENT_SSL=0x800, SECURE_CONNECTION=0x8000,
+# PLUGIN_AUTH=0x80000.
+async def mysql_probe(host: str, port: int, timeout: float):
+    """Read the server-initiated MySQL/MariaDB handshake (nothing is sent).
+    Returns {version, plugin, tls, err} or None."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        data = await asyncio.wait_for(reader.read(1024), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        data = b""
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+    if len(data) < 5:
+        return None
+    plen = int.from_bytes(data[0:3], "little")
+    payload = data[4:4 + plen] if plen else data[4:]
+    if not payload:
+        return None
+    if payload[0] == 0xFF:                       # ERR packet (policy refusal)
+        return {"err": payload[3:].decode("latin-1", "replace").strip("\x00")}
+    if payload[0] != 0x0A:
+        return None
+    end = payload.find(b"\x00", 1)
+    if end < 0:
+        return None
+    version = payload[1:end].decode("latin-1", "replace")
+    if not any(ch.isdigit() for ch in version):
+        return None
+    out = {"version": version, "plugin": "", "tls": None}
+    try:
+        i = end + 1 + 4 + 8 + 1                   # conn-id, auth-data-1, filler
+        cap = int.from_bytes(payload[i:i + 2], "little")
+        i += 2
+        if len(payload) >= i + 5:
+            i += 1 + 2                            # charset, status
+            cap |= int.from_bytes(payload[i:i + 2], "little") << 16
+            i += 2
+            apd_len = payload[i]
+            i += 1 + 10                           # auth-data-len, reserved(10)
+            if cap & 0x8000:                      # SECURE_CONNECTION
+                i += max(13, apd_len - 8)
+            if cap & 0x80000:                     # PLUGIN_AUTH
+                z = payload.find(b"\x00", i)
+                out["plugin"] = payload[i:(z if z >= 0 else len(payload))] \
+                    .decode("latin-1", "replace")
+        out["tls"] = bool(cap & 0x800)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 # --- HTTP(S)-based stores: Elasticsearch / CouchDB / Docker API / etcd / kubelet
 # All read-only GETs (no POST/PUT/DELETE), no redirects followed.
 async def _http_get_once(host: str, port: int, path: str, timeout: float,
@@ -1111,6 +1179,7 @@ _REDIS_PORTS = {6379, 6380}
 _MEMCACHED_PORTS = {11211}
 _MONGO_PORTS = {27017, 27018, 27019}
 _POSTGRES_PORTS = {5432, 5433}
+_MYSQL_PORTS = {3306}
 _ES_PORTS = {9200, 9201}
 _COUCHDB_PORTS = {5984, 6984}
 _DOCKER_PORTS = {2375, 2376}
@@ -3857,6 +3926,45 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                     "unauthenticated StartupMessage was refused"
                     + (f" [{res['sqlstate']}]" if res.get("sqlstate") else "")
                     + ". Good posture."})
+        return
+
+    if "mysql" in name or "mariadb" in name or port in _MYSQL_PORTS:
+        res = await mysql_probe(host, port, cfg.timeout)
+        if res:
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            if res.get("err"):
+                if not svc.name:
+                    svc.name = "mysql"
+                svc.scripts.append({"id": "mysql-info", "output":
+                    "MySQL/MariaDB present but refused the connection by policy: "
+                    + res["err"] + " (no authentication attempted)."})
+            elif res.get("version"):
+                ver = res["version"]
+                # MariaDB 10.x advertises a legacy "5.5.5-" prefix; the real
+                # version follows it.
+                disp = ver[6:] if ver.startswith("5.5.5-") else ver
+                is_maria = "mariadb" in ver.lower()
+                if not svc.name:
+                    svc.name = "mysql"
+                if not svc.product:
+                    svc.product = "MariaDB" if is_maria else "MySQL"
+                if not svc.version:
+                    svc.version = disp
+                    svc.cve_skip = False
+                if res.get("tls") is True:
+                    tlsnote = "advertises TLS (CLIENT_SSL)"
+                elif res.get("tls") is False:
+                    tlsnote = ("does NOT advertise TLS (CLIENT_SSL) -- clients "
+                               "that do not force SSL send credentials in cleartext")
+                else:
+                    tlsnote = "TLS capability unknown"
+                plug = f"; default auth plugin {res['plugin']}" if res.get("plugin") else ""
+                svc.scripts.append({"id": "mysql-handshake", "output":
+                    f"{'MariaDB' if is_maria else 'MySQL'} {disp}{plug}; "
+                    f"{tlsnote}. The server-initiated handshake was read WITHOUT "
+                    f"sending anything -- version anchors CVE correlation; no "
+                    f"authentication was attempted."})
         return
 
     if "rtsp" in name or port in _RTSP_PORTS or port in _RTSPS_PORTS:
