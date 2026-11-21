@@ -250,14 +250,19 @@ def _sarif_results(result):
             yield rule, _result(sid, "error", sc.get("output", sid))
 
 
-def write_sarif(outdir: str, result) -> None:
+def build_sarif(result) -> dict:
+    """Build the SARIF 2.1.0 document in memory (no filesystem).
+
+    Shared by write_sarif() and the web UI's SARIF download endpoint so both
+    emit byte-identical reports.
+    """
     rules: dict = {}
     results = []
     for rule, res in _sarif_results(result):
         rules.setdefault(rule["id"], rule)        # one rule object per ruleId
         results.append(res)
 
-    doc = {
+    return {
         "$schema": _SARIF_SCHEMA,
         "version": "2.1.0",
         "runs": [{
@@ -269,6 +274,10 @@ def write_sarif(outdir: str, result) -> None:
             "results": results,
         }],
     }
+
+
+def write_sarif(outdir: str, result) -> None:
+    doc = build_sarif(result)
     with open(os.path.join(outdir, "scan.sarif"), "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=2, ensure_ascii=False)
 

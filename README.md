@@ -772,6 +772,44 @@ lists, written with absolute paths (and `2>/dev/null` to drop the Go
 
 ---
 
+## Web UI (`webrecon_ui`)
+
+A minimal, **dependency-free** local console for servicescan, built on the
+standard-library `http.server` (no FastAPI/Flask, no npm). The scan engine, CVE
+correlation and exposure/SARIF logic are reused unchanged; this is only a thin
+HTTP layer that maps a JSON request to a `ScanConfig`, runs one scan, and
+returns the result.
+
+```bash
+# start the console (binds 127.0.0.1 by default)
+python -m webrecon_ui                 # http://127.0.0.1:8787
+python -m webrecon_ui --port 9000
+```
+
+It binds to **localhost** on purpose: the API launches scans against whatever
+target the caller names, so it must not be reachable by untrusted clients. A
+non-loopback `--host` prints a warning.
+
+API:
+
+- `GET  /api/health` → `{"ok": true, "service": "webrecon-ui"}`
+- `POST /api/scan` → `scan.json`-shaped result (`ScanResult.to_dict()`)
+- `POST /api/scan.sarif` → SARIF 2.1.0 document (same as `scan.sarif`)
+
+The POST body is a JSON object. Only an allowlisted subset of options is
+honoured — `target` (required; string or list), `ports`, `use_nmap`,
+`top_ports`, `udp`, `nse`, `fingerprint`, `fp_all`, `cve`, `min_cvss`,
+`kev_high_only`, `exploits`, `timeout`, `concurrency`. Local-only knobs
+(`nmap_path`, `nmap_args`, `outdir`, `realm`, …) are deliberately **not**
+reachable from the web surface.
+
+```bash
+curl -s -XPOST http://127.0.0.1:8787/api/scan \
+  -d '{"target":"10.0.0.5","fp_all":true,"min_cvss":7.0}' | jq .
+```
+
+---
+
 ## Notes
 
 - TLS verification is **off** by default for recon (`--verify-tls` to enable).
