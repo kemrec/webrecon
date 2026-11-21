@@ -514,6 +514,13 @@ nmap's result and, for every under-identified port, adds:
   server accepts pre-authentication connections, widening exposure to
   credential-capture and BlueKeep-class pre-auth RCE. Dependency-free per
   MS-RDPBCGR; no credentials are sent.
+- **VNC / RFB** (TCP `5900`-`5903`): after the RFB version handshake the server
+  lists the security types it will accept. Security type **`None` (1)** means the
+  server grants a full remote-desktop session with **no authentication** — anyone
+  who can reach the port gets keyboard/mouse/screen control: an **alert**
+  (`vnc-none-auth`; the offered types are also listed via `vnc-security-types`).
+  The probe only reads the offered types per RFC 6143 — it never selects one, so
+  no session is taken.
 - **Kerberos KDC** (TCP `88`): dependency-free ASN.1/DER per RFC 4120. For a
   small built-in set of default principals an **AS-REQ with no pre-authentication**
   is sent; the KDC's reply classifies each account without ever sending a

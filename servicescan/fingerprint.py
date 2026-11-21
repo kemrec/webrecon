@@ -687,6 +687,63 @@ async def rdp_probe(host: str, port: int, timeout: float):
     return {"kind": "none"}                 # legacy: standard RDP security only
 
 
+# VNC / RFB (TCP 5900-5903). The server opens with a 12-byte ProtocolVersion
+# ("RFB 003.008\n"); after the client echoes a version the server lists the
+# security types it will accept (RFB 3.7+: a count byte + that many type bytes;
+# RFB 3.3: a single 4-byte type). Security type 1 == None means the server
+# grants a full remote-desktop session with NO authentication -> anyone who can
+# reach the port gets keyboard/mouse/screen control (an alert). The probe only
+# READS the offered types; it never selects one, so no session is taken. Wire
+# format per RFC 6143 (7.1.1 version, 7.1.2 security). Type names from the IANA
+# RFB registry.
+_VNC_PORTS = {5900, 5901, 5902, 5903}
+_VNC_SECTYPES = {0: "Invalid", 1: "None", 2: "VNC-auth", 5: "RA2", 6: "RA2ne",
+                 16: "Tight", 17: "Ultra", 18: "TLS", 19: "VeNCrypt",
+                 20: "SASL", 30: "Apple-ARD"}
+
+
+async def vnc_probe(host: str, port: int, timeout: float):
+    """Read the RFB security types offered (no type is ever selected). Returns
+    {version, types:[int]} or None."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    out = None
+    try:
+        ver = await asyncio.wait_for(reader.readexactly(12), timeout=timeout)
+        if not ver.startswith(b"RFB "):
+            return None
+        try:
+            major, minor = int(ver[4:7]), int(ver[8:11])
+        except ValueError:
+            return None
+        writer.write(ver)                   # echo the server's version
+        await writer.drain()
+        version = f"{major}.{minor}"
+        if minor >= 7:                       # count byte + list
+            n = (await asyncio.wait_for(reader.readexactly(1), timeout))[0]
+            if n == 0:
+                out = {"version": version, "types": []}   # server refused
+            else:
+                body = await asyncio.wait_for(reader.readexactly(n), timeout)
+                out = {"version": version, "types": list(body)}
+        else:                                # RFB 3.3: single 4-byte type
+            t = int.from_bytes(
+                await asyncio.wait_for(reader.readexactly(4), timeout), "big")
+            out = {"version": version, "types": [t] if t else []}
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+    return out
+
+
 # --- HTTP(S)-based stores: Elasticsearch / CouchDB / Docker API / etcd / kubelet
 # All read-only GETs (no POST/PUT/DELETE), no redirects followed.
 async def _http_get_once(host: str, port: int, path: str, timeout: float,
@@ -3927,7 +3984,8 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "mqtt-unauth", "smbv1-enabled", "smb-signing-not-required",
                       "nfs-export-world", "ldap-anonymous-read",
                       "rsync-anon-module", "winrm-basic-cleartext",
-                      "krb-asrep-roastable", "postgres-trust-unauth"}
+                      "krb-asrep-roastable", "postgres-trust-unauth",
+                      "vnc-none-auth"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -4163,6 +4221,35 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                     "RDP did not offer enhanced security (TLS/CredSSP) -- legacy "
                     "standard RDP security only, so Network Level Authentication "
                     "is unavailable. Enable NLA / update the host."})
+        return
+
+    if port in _VNC_PORTS or "vnc" in name:
+        res = await vnc_probe(host, port, cfg.timeout)
+        if res:
+            if not svc.name:
+                svc.name = "vnc"
+            if not svc.product:
+                svc.product = "VNC"
+            if res.get("version") and not svc.extrainfo:
+                svc.extrainfo = f"RFB {res['version']}"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            types = res["types"]
+            labels = ", ".join(f"{_VNC_SECTYPES.get(t, '?')}({t})" for t in types)
+            if types:
+                svc.scripts.append({"id": "vnc-security-types", "output":
+                    f"VNC/RFB {res['version']} offered security type(s): "
+                    f"{labels}."})
+            if 1 in types:                   # None -> unauthenticated desktop
+                svc.confidence = "high"
+                svc.extrainfo = "UNAUTHENTICATED access"
+                svc.scripts.append({"id": "vnc-none-auth", "output":
+                    "VNC offers security type 'None' (1): the server grants a "
+                    "full remote-desktop session with NO authentication. Anyone "
+                    "who can reach the port gets keyboard/mouse/screen control. "
+                    "Set a VNC password or require VeNCrypt/TLS, bind to "
+                    f"localhost, firewall {port}. (The probe only read the "
+                    "offered types; no session was taken.)"})
         return
 
     if "rtsp" in name or port in _RTSP_PORTS or port in _RTSPS_PORTS:
