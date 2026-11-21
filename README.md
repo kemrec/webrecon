@@ -479,7 +479,15 @@ Every scan writes, alongside `scan.json`: `services.txt`, `cves.txt`,
 target lists (`nuclei-targets.txt` = web `scheme://host:port`, and
 `nuclei-targets-net.txt` = non-web `host:port` for network/ssl templates), and a
 standalone `report.html` (summary cards + per-host service/CVE tables with CVSS
-colouring and KEV/exploit badges). `scripts.txt` is added when `--nse` ran.
+colouring and KEV/exploit badges), and `scan.sarif` (SARIF 2.1.0). `scripts.txt`
+is added when `--nse` ran.
+
+`scan.sarif` is for CI / GitHub code-scanning ingestion: every CVE and every
+unauthenticated-exposure alert becomes a SARIF result, located by a
+`host:port/proto` locator, with the rule's `security-severity` taken from the
+CVSS score (so GitHub ranks them correctly) and a stable `partialFingerprint`
+per `host:port:rule` for cross-run de-duplication. Informational scripts
+(enumeration detail) are not emitted — only actionable findings.
 
 ### Web chain (`--web`): scan, then crawl every web port
 
@@ -544,6 +552,11 @@ symlink (so re-scans never overwrite); `--flat` writes straight into `-o`
 - `services.txt` — `port/proto  state  name  product version  [conf]  (sources)`
 - `cves.txt` — `score  severity  CVE-ID  port/ident  epss=  KEV  source  url`
   (score-sorted)
+- `scan.sarif` — SARIF 2.1.0 for CI / GitHub code scanning: each CVE and each
+  unauthenticated-exposure alert as a result, `security-severity` from CVSS,
+  `host:port/proto` locator, stable per-finding `partialFingerprints`
+- `services.csv` / `cves.csv` / `scan.jsonl` — spreadsheet / line-oriented views
+- `report.html` — standalone summary (cards + per-host service/CVE tables)
 - `nuclei-targets.txt` — every open **HTTP(S)** service as one `scheme://host:port`
   per line (hostname preferred over IP, TLS detected by name/cert/port), ready
   for `nuclei -l nuclei-targets.txt` (also fine for httpx / katana / feroxbuster)

@@ -160,7 +160,121 @@ def write_html(outdir: str, result) -> None:
         fh.write("".join(parts))
 
 
+# ---------------------------------------------------------------------------
+# SARIF 2.1.0 (static-analysis results interchange format) -- for CI / GitHub
+# code-scanning ingestion. Two kinds of result: a CVE on a service, and an
+# unauthenticated-exposure alert (the critical scripts). Locations use a
+# host:port locator (there is no source file); GitHub reads rule severity from
+# properties["security-severity"].
+# ---------------------------------------------------------------------------
+_SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
+_INFO_URI = "https://github.com/kemrec/webrecon"
+
+
+def _sarif_level(sev, score) -> str:
+    s = (sev or "").upper()
+    if s in ("CRITICAL", "HIGH") or (score or 0) >= 7:
+        return "error"
+    if s == "MEDIUM" or (score or 0) >= 4:
+        return "warning"
+    return "note"
+
+
+def _sarif_sec_sev(score, sev) -> str:
+    if score is not None:
+        return f"{score:.1f}"
+    return {"CRITICAL": "9.5", "HIGH": "8.0", "MEDIUM": "5.5",
+            "LOW": "3.0"}.get((sev or "").upper(), "")
+
+
+def _sarif_results(result):
+    """Yield (rule_dict, result_dict) for every CVE and exposure-alert finding."""
+    from .fingerprint import EXPOSURE_ALERT_IDS
+    alert_ids = {"bindshell-detect"} | EXPOSURE_ALERT_IDS
+
+    for hid, _hn, s in _rows(result):
+        loc_uri = f"{hid}:{s.port}/{s.proto}"
+        svc_props = {"host": hid, "port": s.port, "proto": s.proto,
+                     "service": s.name or "", "product": s.product or "",
+                     "version": s.version or ""}
+
+        def _result(rule_id, level, text, extra=None):
+            props = dict(svc_props)
+            if extra:
+                props.update(extra)
+            return {
+                "ruleId": rule_id,
+                "level": level,
+                "message": {"text": text},
+                "locations": [{"physicalLocation": {
+                    "artifactLocation": {"uri": loc_uri}}}],
+                "partialFingerprints": {
+                    "servicescan/v1": f"{hid}:{s.port}:{rule_id}"},
+                "properties": props,
+            }
+
+        for c in s.cves:
+            score = c.disp_cvss()
+            sev = c.disp_severity()
+            rule = {
+                "id": c.id,
+                "name": c.id.replace("-", "_"),
+                "shortDescription": {"text": (c.disp_summary() or c.id)[:200]},
+                "helpUri": c.url or _INFO_URI,
+                "properties": {"tags": ["security", "cve"],
+                               "security-severity": _sarif_sec_sev(score, sev)},
+            }
+            score_s = f"{score:.1f}" if score is not None else "?"
+            prod = (f"{s.product} {s.version}".strip() or s.ident())
+            text = (f"{c.id} ({sev or 'unknown'}, CVSS {score_s}) affects "
+                    f"{prod} on {loc_uri}."
+                    + (f" {c.disp_summary()}" if c.disp_summary() else "")
+                    + (" [CISA KEV]" if c.kev else ""))
+            yield rule, _result(c.id, _sarif_level(sev, score), text,
+                                {"cvss": score, "kev": bool(c.kev),
+                                 "epss": c.epss})
+
+        for sc in getattr(s, "scripts", []):
+            sid = sc.get("id", "")
+            if sid not in alert_ids:
+                continue
+            rule = {
+                "id": sid,
+                "name": sid.replace("-", "_"),
+                "shortDescription": {
+                    "text": f"Unauthenticated exposure: {sid}"},
+                "helpUri": _INFO_URI,
+                "properties": {"tags": ["security", "exposure"],
+                               "security-severity": "9.0"},
+            }
+            yield rule, _result(sid, "error", sc.get("output", sid))
+
+
+def write_sarif(outdir: str, result) -> None:
+    rules: dict = {}
+    results = []
+    for rule, res in _sarif_results(result):
+        rules.setdefault(rule["id"], rule)        # one rule object per ruleId
+        results.append(res)
+
+    doc = {
+        "$schema": _SARIF_SCHEMA,
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "servicescan",
+                "informationUri": _INFO_URI,
+                "rules": list(rules.values()),
+            }},
+            "results": results,
+        }],
+    }
+    with open(os.path.join(outdir, "scan.sarif"), "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=2, ensure_ascii=False)
+
+
 def write_extra(outdir: str, result) -> None:
     write_csv(outdir, result)
     write_jsonl(outdir, result)
     write_html(outdir, result)
+    write_sarif(outdir, result)

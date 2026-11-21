@@ -125,7 +125,7 @@ def write_all(outdir: str, result: ScanResult,
     extra += " + nuclei-targets.txt" if nuclei else ""
     extra += " + nuclei-targets-net.txt" if nuclei_net else ""
     utils.good(f"output written to {outdir}/ (scan.json + services.txt + "
-               f"cves.txt{extra} + CSV + JSONL + report.html)")
+               f"cves.txt{extra} + CSV + JSONL + report.html + scan.sarif)")
 
 
 def _host_of(h) -> str:
