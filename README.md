@@ -320,6 +320,14 @@ nmap's result and, for every under-identified port, adds:
   recovered `sysDescr` is included. Run once per host (161 is rarely in a default
   TCP scan); the four attempts race so the probe is bounded by one short timeout.
   Read-only (`GET` only, never `SET`).
+- **IPMI cipher-zero** (UDP 623): an RMCP+ Open Session Request with every
+  algorithm (auth/integrity/confidentiality) set to 0. A BMC that answers with
+  status 0 accepts **cipher suite 0** — an administrative session with no
+  password, i.e. full out-of-band control of the server (power, serial-over-LAN,
+  virtual media, BMC user management): **critical**. A BMC that answers but
+  refuses it is still reported (with a note on the IPMI 2.0 RAKP hash-disclosure
+  exposure). Read-only — the probe never completes RAKP or issues a command, so
+  no session is actually established.
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully

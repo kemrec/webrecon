@@ -745,6 +745,54 @@ async def snmp_probe(host: str, port: int, timeout: float,
     return None
 
 
+# --- IPMI cipher-zero (UDP 623). IPMI v2.0 "cipher suite 0" disables all
+# authentication, integrity and confidentiality: a BMC that accepts an RMCP+
+# Open Session Request with every algorithm set to 0 lets anyone open an
+# administrative session with no password. We send that request and read the
+# Open Session Response status code. Read-only -- we never complete RAKP or
+# issue any command, so no session is actually established.
+_IPMI_CONSOLE_SESSION_ID = b"\xa4\xa3\xa2\xa0"
+_IPMI_OPEN_SESSION_REQ = (
+    b"\x06\x00\xff\x07"          # RMCP: version 6, reserved, seq 0xff, class IPMI
+    b"\x06"                      # auth type = RMCP+ (format 6)
+    b"\x10"                      # payload type = Open Session Request (0x10)
+    b"\x00\x00\x00\x00"          # session id   = 0
+    b"\x00\x00\x00\x00"          # session seq  = 0
+    b"\x20\x00"                  # payload length = 32 (little-endian)
+    b"\x00"                      # message tag
+    b"\x00"                      # requested max privilege (0 = pick highest)
+    b"\x00\x00"                  # reserved
+    + _IPMI_CONSOLE_SESSION_ID + # remote console session id
+    b"\x00\x00\x00\x08\x00\x00\x00\x00"   # auth payload:  algorithm 0 (none)
+    b"\x01\x00\x00\x08\x00\x00\x00\x00"   # integrity payload: algorithm 0 (none)
+    b"\x02\x00\x00\x08\x00\x00\x00\x00"   # confidentiality payload: algorithm 0
+)
+
+
+def _ipmi_parse_open_session(data: bytes):
+    """Read an RMCP+ Open Session Response. ('open', managed-session-id-hex)
+    when cipher-zero is accepted (status 0), ('auth', '') when a BMC answers but
+    refuses it (non-zero status), or None when it is not an IPMI response."""
+    if len(data) < 18 or data[:4] != b"\x06\x00\xff\x07":
+        return None
+    if data[5] != 0x11:                 # payload type: Open Session Response
+        return None
+    status = data[17]                   # RMCP+ status code (0 == no errors)
+    if status != 0x00:
+        return ("auth", "")
+    msid = data[24:28] if len(data) >= 28 else b""
+    return ("open", msid[::-1].hex())   # managed system session id (LE on wire)
+
+
+async def ipmi_cipher_zero_probe(host: str, port: int, timeout: float):
+    """Probe a BMC for IPMI 2.0 cipher-suite-0 auth bypass. Returns
+    ('open', msid) / ('auth', '') / None (see _ipmi_parse_open_session)."""
+    data = await _udp_query(host, port, _IPMI_OPEN_SESSION_REQ, min(timeout, 3.0))
+    if not data:
+        return None
+    return _ipmi_parse_open_session(data)
+
+
 _REDIS_PORTS = {6379, 6380}
 _MEMCACHED_PORTS = {11211}
 _MONGO_PORTS = {27017, 27018, 27019}
@@ -1846,7 +1894,8 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "onvif-unauth", "onvif-default-creds",
                       "camera-snapshot-unauth",
                       "cam-cgi-unauth", "cam-cgi-default-creds",
-                      "grpc-reflection-exposed", "snmp-unauth"}
+                      "grpc-reflection-exposed", "snmp-unauth",
+                      "ipmi-cipher-zero"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -2244,6 +2293,34 @@ async def run_exposure_checks(cfg: ScanConfig, host: str,
             f"credentials -- is readable, and a writable community additionally "
             f"allows configuration changes. Change the community strings, restrict "
             f"SNMP to a management network, or move to SNMPv3 with auth+priv."})
+
+    # Host-level IPMI cipher-zero (UDP 623). A BMC that accepts cipher suite 0
+    # grants an administrative session with no password -- full out-of-band
+    # control of the server (power, serial-over-LAN, virtual media).
+    try:
+        ipmi = await ipmi_cipher_zero_probe(host, 623, cfg.timeout)
+    except Exception:  # noqa: BLE001
+        ipmi = None
+    if ipmi:
+        svc = _udp_svc(623, "asf-rmcp")
+        if not svc.product:
+            svc.product = "IPMI/BMC"
+        if ipmi[0] == "open":
+            svc.confidence = "high"
+            svc.extrainfo = "IPMI cipher-zero auth bypass"
+            svc.scripts.append({"id": "ipmi-cipher-zero", "output":
+                "IPMI 2.0 BMC accepts cipher suite 0 (an RMCP+ Open Session "
+                "Request with all algorithms set to 0 returned status 0): an "
+                "attacker can open an ADMINISTRATOR session with no password and "
+                "gain full out-of-band control -- power cycling, serial-over-LAN, "
+                "virtual media (boot an attacker ISO), and BMC user management. "
+                "Disable cipher suite 0 (list only 3/17), firewall UDP 623."})
+        else:
+            svc.scripts.append({"id": "ipmi-detected", "output":
+                "IPMI 2.0 BMC detected on UDP 623 (answered an RMCP+ Open Session "
+                "Request); cipher suite 0 was refused. Note BMCs are also exposed "
+                "to the IPMI 2.0 RAKP password-hash disclosure -- restrict UDP 623 "
+                "to a management network and use strong BMC passwords."})
 
     hits = [s for s in services
             if any(sc.get("id", "") in EXPOSURE_ALERT_IDS for sc in s.scripts)]
