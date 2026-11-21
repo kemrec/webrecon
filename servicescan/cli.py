@@ -86,6 +86,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="NVD API key (or env NVD_API_KEY)")
     cv.add_argument("--min-cvss", type=float, default=0.0,
                     help="drop CVEs below this base score")
+    cv.add_argument("--kev-high", action="store_true",
+                    help="focus the console/cves.txt/CSV/HTML reports on CVEs "
+                         "that are in CISA KEV or rated HIGH/CRITICAL "
+                         "(CVSS >= 7.0); scan.json still keeps the full set")
     cv.add_argument("--no-cache", action="store_true",
                     help="disable the on-disk CVE/enrichment cache")
     cv.add_argument("--cache-ttl", type=int, default=86400,
@@ -168,6 +172,7 @@ def cfg_from_args(a: argparse.Namespace) -> ScanConfig:
         exploits=a.exploits,
         nvd_api_key=a.nvd_api_key,
         min_cvss=a.min_cvss,
+        kev_high_only=a.kev_high,
         cve_cache=not a.no_cache,
         cache_ttl=a.cache_ttl,
         web=a.web or a.full,
@@ -206,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         utils.warn("interrupted")
         return 130
 
-    report.write_all(cfg.outdir, result)
+    report.write_all(cfg.outdir, result, kev_high_only=cfg.kev_high_only)
     if not cfg.quiet:
         report.console_summary(result, cfg.outdir)
     return 0

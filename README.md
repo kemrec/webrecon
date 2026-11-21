@@ -303,6 +303,7 @@ servicescan 10.0.0.5 --top-ports 1000 --rate 2000
 servicescan host --fp-all                 # fingerprint every open port, not just gaps
 servicescan host --no-cve                 # service/version detection only
 servicescan host --min-cvss 7             # only show CVSS >= 7.0
+servicescan host --kev-high               # reports show only KEV or HIGH/CRITICAL (scan.json keeps all)
 servicescan host --no-epss --no-kev       # CVEs only, skip risk enrichment
 servicescan host --no-nmap -p 80,443,8080 # fingerprint-only, no nmap
 servicescan host --exploits               # map CVEs to public exploits/PoCs
@@ -364,7 +365,7 @@ each host gets its own `web/<ip>/<port>-<scheme>/` output subtree.
 Key flags: `-iL/--target-file`, `-p/--ports`, `--top-ports`, `--rate` (nmap `--min-rate`),
 `--no-nmap`, `--udp`, `--nse`, `--nse-scripts`, `--fp-all`, `--render`, `--no-cve`,
 `--no-nvd`, `--no-osv`, `--no-epss`, `--no-kev`, `--exploits`, `--nvd-api-key`,
-`--min-cvss`, `--no-cache`, `--cache-ttl`, `--web`, `--full`, `--web-render`,
+`--min-cvss`, `--kev-high`, `--no-cache`, `--cache-ttl`, `--web`, `--full`, `--web-render`,
 `--web-depth`, `--web-max-pages`, `--write-hosts`, `-c/--concurrency`,
 `-t/--timeout`, `-o/--outdir`. Full list: `servicescan -h`.
 

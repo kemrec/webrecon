@@ -36,12 +36,28 @@ def _sev_color(sev: str, score) -> str:
     return C.GRY
 
 
-def write_all(outdir: str, result: ScanResult) -> None:
+def write_all(outdir: str, result: ScanResult,
+              kev_high_only: bool = False) -> None:
     os.makedirs(outdir, exist_ok=True)
     data = result.to_dict()
 
+    # scan.json is the COMPLETE machine record -- written first, before any
+    # severity filter, so the full CVE set (medium/low included) is never lost.
     with open(os.path.join(outdir, "scan.json"), "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, ensure_ascii=False)
+
+    # --kev-high: focus the human-facing outputs (cves.txt / CSV / JSONL / HTML
+    # and, since it runs after this, the console) on KEV or HIGH/CRITICAL
+    # findings. scan.json above already holds everything; this only prunes the
+    # reports, so a medium is hidden from view, not discarded.
+    hidden = 0
+    if kev_high_only:
+        from .cve import keep_kev_or_high
+        for s in result.services:
+            kept = keep_kev_or_high(s.cves)
+            hidden += len(s.cves) - len(kept)
+            s.cves = kept
+        result._kev_high_hidden = hidden    # surfaced by console_summary
 
     # services.txt  (host-prefixed)
     slines = []
@@ -175,6 +191,10 @@ def console_summary(result: ScanResult, outdir: str | None = None) -> None:
     print(f"  CVEs found    : {total_cve}  "
           f"({C.RED}{crit} critical{C.R}, {C.RED}{high} high{C.R}, "
           f"{C.RED}{C.B}{kev} KEV{C.R})")
+    hidden = getattr(result, "_kev_high_hidden", 0)
+    if hidden:
+        print(f"  {C.GRY}--kev-high: {hidden} medium/low CVE(s) hidden from this "
+              f"view; full set in scan.json{C.R}")
 
     for h in live_hosts:
         print(f"{C.B}{'-'*66}{C.R}")

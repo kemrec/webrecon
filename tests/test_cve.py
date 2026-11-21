@@ -72,6 +72,21 @@ def test_version_applies_wrong_product_keyword_mode_drops():
     assert cve.version_applies(obj, {"grafana"}, "9.0", require_product=False) is True
 
 
+def test_keep_kev_or_high_filter():
+    from servicescan.models import CVE
+    crit = CVE(id="C", source="nvd", cvss=9.8, severity="CRITICAL")
+    high = CVE(id="H", source="nvd", cvss=7.5, severity="HIGH")
+    med = CVE(id="M", source="nvd", cvss=5.0, severity="MEDIUM")
+    med_kev = CVE(id="MK", source="nvd", cvss=5.0, severity="MEDIUM", kev=True)
+    # environmentally demoted: canonical 7.4 but effective 0.0/LOW -> must drop
+    demoted = CVE(id="D", source="nvd", cvss=7.4, severity="HIGH",
+                  effective_cvss=0.0, effective_severity="LOW")
+    kept = {c.id for c in cve.keep_kev_or_high([crit, high, med, med_kev, demoted])}
+    assert kept == {"C", "H", "MK"}       # critical, high, and the KEV medium
+    assert "M" not in kept                # plain medium hidden
+    assert "D" not in kept                # demoted-to-LOW judged by disp_cvss
+
+
 class _NvdResp:
     def __init__(self, text):
         self.text = text

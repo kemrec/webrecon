@@ -203,6 +203,15 @@ def _cpe_products(mapped_product: str, want_product: str) -> set[str]:
     return out
 
 
+def keep_kev_or_high(cves: list) -> list:
+    """Filter a CVE list down to the ones in CISA KEV or rated HIGH/CRITICAL
+    (effective CVSS >= 7.0). Uses disp_cvss() so an environmentally demoted CVE
+    is judged by its effective score. Product-agnostic: applies to any service.
+    A KEV-flagged CVE is kept regardless of score (known-exploited outranks it).
+    """
+    return [c for c in cves if c.kev or (c.disp_cvss() or 0) >= 7.0]
+
+
 def version_applies(cve_obj: dict, products: set[str], want_version: str,
                     require_product: bool = False) -> bool:
     """Keep a CVE only if our product (+version, when known) fits its CPEs.
