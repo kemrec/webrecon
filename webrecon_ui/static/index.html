@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>webrecon-ui</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c232c; --line:#2a323c;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#2f81f7; --accent2:#1f6feb;
+    --alert:#f85149; --alertbg:#2d1113; --warn:#d29922; --ok:#3fb950;
+    --crit:#f85149; --high:#ff7b72; --med:#d29922; --low:#8b949e;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+  header { padding:14px 18px; border-bottom:1px solid var(--line);
+           display:flex; align-items:baseline; gap:12px; background:var(--panel); }
+  header h1 { font-size:16px; margin:0; letter-spacing:.2px; }
+  header .sub { color:var(--muted); font-size:12px; }
+  main { max-width:1100px; margin:0 auto; padding:18px 16px 60px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+          padding:14px 16px; margin-bottom:16px; }
+  form { display:grid; grid-template-columns:1fr; gap:12px; }
+  .row { display:flex; flex-wrap:wrap; gap:14px 18px; align-items:center; }
+  label { color:var(--muted); font-size:12px; display:flex; flex-direction:column; gap:4px; }
+  label.inline { flex-direction:row; align-items:center; gap:6px; color:var(--fg); font-size:13px; }
+  input[type=text], input[type=number] {
+    background:var(--bg); border:1px solid var(--line); color:var(--fg);
+    border-radius:6px; padding:8px 10px; font:inherit; min-width:120px; }
+  input#target { min-width:320px; }
+  button { background:var(--accent2); color:#fff; border:0; border-radius:6px;
+           padding:9px 16px; font:inherit; font-weight:600; cursor:pointer; }
+  button:hover { background:var(--accent); }
+  button:disabled { opacity:.55; cursor:default; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--fg); font-weight:500; }
+  button.ghost:hover { background:var(--panel2); }
+  #status { color:var(--muted); font-size:13px; min-height:18px; }
+  #status.err { color:var(--alert); }
+  .host-h { display:flex; align-items:baseline; gap:10px; margin:6px 0 10px; }
+  .host-h .ip { font-size:15px; font-weight:600; }
+  .host-h .meta { color:var(--muted); font-size:12px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:7px 9px; border-bottom:1px solid var(--line);
+           vertical-align:top; font-size:13px; }
+  th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.4px; }
+  .port { font-variant-numeric:tabular-nums; white-space:nowrap; font-weight:600; }
+  .tag { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px;
+         background:var(--panel2); border:1px solid var(--line); color:var(--muted); }
+  .conf-high { color:var(--ok); } .conf-medium { color:var(--warn); } .conf-low { color:var(--muted); }
+  .scripts { margin:6px 0 0; padding:0; list-style:none; display:flex; flex-direction:column; gap:5px; }
+  .scripts li { padding:6px 9px; border-radius:6px; background:var(--panel2);
+                border-left:3px solid var(--line); font-size:12px; }
+  .scripts li.alert { background:var(--alertbg); border-left-color:var(--alert); }
+  .scripts li .id { font-weight:700; }
+  .scripts li.alert .id { color:var(--alert); }
+  .scripts li .id::after { content:" "; }
+  .badge { font-size:10px; font-weight:700; padding:1px 6px; border-radius:4px; margin-left:6px; }
+  .badge.alert { background:var(--alert); color:#fff; }
+  .cves { margin:6px 0 0; padding:0; list-style:none; display:flex; flex-direction:column; gap:3px; }
+  .cves li { font-size:12px; display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
+  .score { font-weight:700; font-variant-numeric:tabular-nums; min-width:34px; }
+  .sev-CRITICAL,.score.CRITICAL { color:var(--crit); } .sev-HIGH,.score.HIGH { color:var(--high); }
+  .sev-MEDIUM,.score.MEDIUM { color:var(--med); } .sev-LOW,.score.LOW { color:var(--low); }
+  .kev { background:var(--alert); color:#fff; font-size:10px; font-weight:700; padding:0 5px; border-radius:3px; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  .muted { color:var(--muted); }
+  .empty { color:var(--muted); padding:20px; text-align:center; }
+  .dl { display:flex; gap:10px; margin-top:10px; }
+  details summary { cursor:pointer; color:var(--muted); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>webrecon-ui</h1>
+  <span class="sub">servicescan &mdash; service / version discovery + CVE &amp; exposure correlation</span>
+</header>
+<main>
+  <div class="card">
+    <form id="scan-form">
+      <div class="row">
+        <label>target(s)
+          <input type="text" id="target" placeholder="10.0.0.5  example.com  192.168.1.0/24" autofocus>
+        </label>
+        <label>ports
+          <input type="text" id="ports" placeholder="- (all) or 1-1000,8080">
+        </label>
+        <label>min CVSS
+          <input type="number" id="min_cvss" min="0" max="10" step="0.1" value="0">
+        </label>
+      </div>
+      <div class="row">
+        <label class="inline"><input type="checkbox" id="use_nmap" checked> use nmap</label>
+        <label class="inline"><input type="checkbox" id="fingerprint" checked> fingerprint layer</label>
+        <label class="inline"><input type="checkbox" id="fp_all"> fingerprint all ports</label>
+        <label class="inline"><input type="checkbox" id="udp"> UDP (needs root)</label>
+        <label class="inline"><input type="checkbox" id="cve" checked> CVE correlation</label>
+        <label class="inline"><input type="checkbox" id="exploits"> map exploits</label>
+      </div>
+      <div class="row">
+        <button type="submit" id="go">Scan</button>
+        <span id="status"></span>
+      </div>
+    </form>
+  </div>
+
+  <div id="results"></div>
+  <div id="downloads" class="dl" hidden>
+    <button class="ghost" id="dl-json">Download scan.json</button>
+    <button class="ghost" id="dl-sarif">Download scan.sarif</button>
+  </div>
+</main>
+
+<script>
+"use strict";
+let ALERT_IDS = new Set();
+let lastBody = null, lastResult = null;
+
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, txt) => { const e = document.createElement(tag);
+  if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
+
+async function loadAlertIds() {
+  try {
+    const r = await fetch("/api/alert-ids");
+    if (r.ok) ALERT_IDS = new Set((await r.json()).alert_ids || []);
+  } catch (_) { /* highlighting is best-effort */ }
+}
+
+function buildBody() {
+  const b = { target: $("target").value.trim() };
+  const ports = $("ports").value.trim();
+  if (ports) b.ports = ports;
+  b.use_nmap = $("use_nmap").checked;
+  b.fingerprint = $("fingerprint").checked;
+  b.fp_all = $("fp_all").checked;
+  b.udp = $("udp").checked;
+  b.cve = $("cve").checked;
+  b.exploits = $("exploits").checked;
+  const mc = parseFloat($("min_cvss").value);
+  if (!isNaN(mc) && mc > 0) b.min_cvss = mc;
+  return b;
+}
+
+function cveDispScore(c) {
+  return (c.effective_cvss != null) ? c.effective_cvss : c.cvss;
+}
+function cveDispSev(c) {
+  return c.effective_severity || c.severity || "";
+}
+
+function renderService(svc) {
+  const tr = el("tr");
+  const idv = [svc.product, svc.version].filter(Boolean).join(" ") || svc.name || "—";
+  tr.appendChild(Object.assign(el("td", "port"), { textContent: `${svc.port}/${svc.proto}` }));
+  tr.appendChild(el("td", null, svc.name || "—"));
+  const idTd = el("td");
+  idTd.appendChild(el("span", null, idv));
+  if (svc.extrainfo) { idTd.appendChild(document.createTextNode(" ")); idTd.appendChild(el("span", "muted", "· " + svc.extrainfo)); }
+
+  // scripts (exposure alerts highlighted)
+  if (svc.scripts && svc.scripts.length) {
+    const ul = el("ul", "scripts");
+    for (const sc of svc.scripts) {
+      const isAlert = ALERT_IDS.has(sc.id);
+      const li = el("li", isAlert ? "alert" : null);
+      li.appendChild(Object.assign(el("span", "id"), { textContent: sc.id }));
+      li.appendChild(document.createTextNode(sc.output || ""));
+      if (isAlert) li.appendChild(Object.assign(el("span", "badge alert"), { textContent: "ALERT" }));
+      ul.appendChild(li);
+    }
+    idTd.appendChild(ul);
+  }
+
+  // CVEs
+  const cves = (svc.cves || []).slice().sort((a, b) => (cveDispScore(b) || 0) - (cveDispScore(a) || 0));
+  if (cves.length) {
+    const ul = el("ul", "cves");
+    for (const c of cves) {
+      const sev = cveDispSev(c), score = cveDispScore(c);
+      const li = el("li");
+      li.appendChild(Object.assign(el("span", "score " + sev), { textContent: (score != null ? score.toFixed(1) : "—") }));
+      const a = el("a", null, c.id); a.href = c.url || "#"; a.target = "_blank"; a.rel = "noopener";
+      li.appendChild(a);
+      if (c.kev) li.appendChild(Object.assign(el("span", "kev"), { textContent: "KEV" }));
+      if (c.epss_pct != null) li.appendChild(Object.assign(el("span", "muted"), { textContent: `EPSS ${(c.epss_pct * 100).toFixed(0)}%` }));
+      if (c.summary || c.env_note) {
+        const s = el("span", "muted", (c.env_note ? c.env_note + " " : "") + (c.summary || "").slice(0, 140));
+        li.appendChild(s);
+      }
+      ul.appendChild(li);
+    }
+    idTd.appendChild(ul);
+  }
+
+  tr.appendChild(idTd);
+  tr.appendChild(Object.assign(el("td", "conf-" + (svc.confidence || "low")), { textContent: svc.confidence || "low" }));
+  tr.appendChild(el("td", "muted", (svc.sources || []).join("+")));
+  return tr;
+}
+
+function render(result) {
+  const root = $("results");
+  root.innerHTML = "";
+  const hosts = result.hosts || [];
+  const nsvc = hosts.reduce((n, h) => n + (h.services || []).length, 0);
+  if (!hosts.length || !nsvc) {
+    root.appendChild(Object.assign(el("div", "card empty"),
+      { textContent: "No open services found." + (result.errors && result.errors.length ? " (" + result.errors.join("; ") + ")" : "") }));
+    return;
+  }
+  for (const h of hosts) {
+    const card = el("div", "card");
+    const hh = el("div", "host-h");
+    const label = (h.hostname && h.ip && h.hostname !== h.ip) ? `${h.hostname} (${h.ip})` : (h.ip || h.hostname || h.target);
+    hh.appendChild(Object.assign(el("span", "ip"), { textContent: label }));
+    hh.appendChild(Object.assign(el("span", "meta"), { textContent: `${(h.services || []).length} open service(s)` }));
+    card.appendChild(hh);
+
+    const table = el("table");
+    const thead = el("thead"), htr = el("tr");
+    for (const c of ["Port", "Name", "Service / findings", "Conf", "Src"]) htr.appendChild(el("th", null, c));
+    thead.appendChild(htr); table.appendChild(thead);
+    const tb = el("tbody");
+    for (const svc of (h.services || [])) tb.appendChild(renderService(svc));
+    table.appendChild(tb);
+    card.appendChild(table);
+    root.appendChild(card);
+  }
+}
+
+function setStatus(msg, isErr) {
+  const s = $("status"); s.textContent = msg; s.className = isErr ? "err" : "";
+}
+
+function downloadBlob(obj, filename) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href = url; a.download = filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function doScan(ev) {
+  ev.preventDefault();
+  const body = buildBody();
+  if (!body.target) { setStatus("Enter a target.", true); return; }
+  $("go").disabled = true;
+  setStatus("Scanning " + body.target + " … (this can take a while on large port ranges)");
+  $("downloads").hidden = true;
+  const t0 = Date.now();
+  try {
+    const r = await fetch("/api/scan", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (!r.ok) { setStatus("Error: " + (data.error || r.status), true); return; }
+    lastBody = body; lastResult = data;
+    render(data);
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    const nh = (data.hosts || []).length;
+    const ns = (data.hosts || []).reduce((n, h) => n + (h.services || []).length, 0);
+    setStatus(`Done in ${secs}s — ${ns} service(s) across ${nh} host(s)${data.nmap_used ? " (nmap)" : ""}.`);
+    $("downloads").hidden = false;
+  } catch (e) {
+    setStatus("Request failed: " + e.message, true);
+  } finally {
+    $("go").disabled = false;
+  }
+}
+
+async function doDownloadSarif() {
+  if (!lastBody) return;
+  try {
+    const r = await fetch("/api/scan.sarif", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(lastBody),
+    });
+    const data = await r.json();
+    if (!r.ok) { setStatus("SARIF error: " + (data.error || r.status), true); return; }
+    downloadBlob(data, "scan.sarif");
+  } catch (e) { setStatus("SARIF request failed: " + e.message, true); }
+}
+
+$("scan-form").addEventListener("submit", doScan);
+$("dl-json").addEventListener("click", () => lastResult && downloadBlob(lastResult, "scan.json"));
+$("dl-sarif").addEventListener("click", doDownloadSarif);
+loadAlertIds();
+</script>
+</body>
+</html>

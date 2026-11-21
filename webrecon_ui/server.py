@@ -19,11 +19,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from servicescan import formats
+from servicescan import formats, fingerprint
 from servicescan.config import ScanConfig
 from servicescan.orchestrator import run as _orchestrator_run
+
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+# Only these files are ever served from disk; there is no directory walk and no
+# user-supplied path reaches the filesystem, so path traversal is impossible.
+_STATIC = {
+    "/":           ("index.html", "text/html; charset=utf-8"),
+    "/index.html": ("index.html", "text/html; charset=utf-8"),
+}
 
 # Largest POST body we will read (a scan request is tiny; this just caps abuse).
 MAX_BODY = 64 * 1024
@@ -119,6 +129,23 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, code: int, message: str) -> None:
         self._send_json(code, {"error": message})
 
+    def _send_bytes(self, code: int, body: bytes, ctype: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _serve_static(self, name: str, ctype: str) -> None:
+        try:
+            with open(os.path.join(STATIC_DIR, name), "rb") as fh:
+                body = fh.read()
+        except OSError:
+            self._error(404, "not found")
+            return
+        self._send_bytes(200, body, ctype)
+
     def _read_json_body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
@@ -135,6 +162,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         if self.path == "/api/health":
             self._send_json(200, {"ok": True, "service": "webrecon-ui"})
+            return
+        if self.path == "/favicon.ico":
+            self._send_bytes(204, b"", "image/x-icon")
+            return
+        if self.path == "/api/alert-ids":
+            # The source of truth for which script ids are unauthenticated-breach
+            # alerts (vs informational) lives in Python; the UI fetches it to
+            # colour exposure findings, so the two never drift.
+            self._send_json(200, {"alert_ids": sorted(fingerprint.EXPOSURE_ALERT_IDS)})
+            return
+        static = _STATIC.get(self.path)
+        if static is not None:
+            self._serve_static(*static)
             return
         self._error(404, "not found")
 

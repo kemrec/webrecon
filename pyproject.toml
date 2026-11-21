@@ -28,6 +28,7 @@ packages = ["webrecon", "servicescan", "webrecon_ui"]
 
 [tool.setuptools.package-data]
 servicescan = ["data/*.json"]
+webrecon_ui = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

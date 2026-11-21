@@ -781,10 +781,16 @@ HTTP layer that maps a JSON request to a `ScanConfig`, runs one scan, and
 returns the result.
 
 ```bash
-# start the console (binds 127.0.0.1 by default)
+# start the console (binds 127.0.0.1 by default), then open the URL
 python -m webrecon_ui                 # http://127.0.0.1:8787
 python -m webrecon_ui --port 9000
 ```
+
+Opening `http://127.0.0.1:8787/` serves a single, self-contained **vanilla
+HTML/JS page** (no framework, no build step): a target + options form, a
+per-host service table with CVEs, unauthenticated-exposure findings highlighted
+in red (the page pulls the alert-id list from `/api/alert-ids` so it never
+drifts from the engine), and **Download scan.json / scan.sarif** buttons.
 
 It binds to **localhost** on purpose: the API launches scans against whatever
 target the caller names, so it must not be reachable by untrusted clients. A
@@ -792,7 +798,10 @@ non-loopback `--host` prints a warning.
 
 API:
 
+- `GET  /` → the operator console (static HTML page)
 - `GET  /api/health` → `{"ok": true, "service": "webrecon-ui"}`
+- `GET  /api/alert-ids` → the set of script ids that are unauthenticated-breach
+  alerts (vs informational), for the page's exposure highlighting
 - `POST /api/scan` → `scan.json`-shaped result (`ScanResult.to_dict()`)
 - `POST /api/scan.sarif` → SARIF 2.1.0 document (same as `scan.sarif`)
 
