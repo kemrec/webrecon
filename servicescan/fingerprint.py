@@ -2215,6 +2215,209 @@ async def ssdp_describe(host: str, location: str, timeout: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# SMB (TCP 445). Dependency-free, read-only posture for internal-network
+# triage. Three facts recovered without credentials:
+#   1. SMB signing posture (dialect SecurityMode): signing-not-required is the
+#      precondition for NTLM relay (ntlmrelayx) -> alert.
+#   2. SMBv1 enabled (a server that answers an SMB1 "NT LM 0.12" negotiate):
+#      EternalBlue / wormable-RCE surface -> alert.
+#   3. The NTLM CHALLENGE leaked by an anonymous SMB2 SESSION_SETUP, which
+#      names the host OS build + AD/NetBIOS domain and computer names (one
+#      unauthenticated packet) -> informational recon + CVE anchor.
+# We send an NTLMSSP NEGOTIATE (type 1) and only READ the server's CHALLENGE
+# (type 2); no credentials, no type-3, so no authentication is attempted.
+# Wire format per MS-SMB2 (NEGOTIATE/SESSION_SETUP) and MS-NLMP (CHALLENGE).
+# ---------------------------------------------------------------------------
+_SMB_PORTS = {445}
+
+
+def _nbss(msg: bytes) -> bytes:
+    """Direct-TCP (NBSS) framing: 0x00 + 3-byte big-endian length + message."""
+    return b"\x00" + len(msg).to_bytes(3, "big") + msg
+
+
+def _smb2_header(command: int, msgid: int) -> bytes:
+    return (b"\xfeSMB"                       # ProtocolId
+            + (64).to_bytes(2, "little")     # StructureSize
+            + b"\x00\x00"                     # CreditCharge
+            + b"\x00\x00\x00\x00"             # Status (0 on request)
+            + command.to_bytes(2, "little")   # Command
+            + (1).to_bytes(2, "little")       # CreditRequest
+            + b"\x00\x00\x00\x00"             # Flags
+            + b"\x00\x00\x00\x00"             # NextCommand
+            + msgid.to_bytes(8, "little")     # MessageId
+            + b"\x00\x00\x00\x00"             # Reserved
+            + b"\x00\x00\x00\x00"             # TreeId
+            + b"\x00" * 8                     # SessionId
+            + b"\x00" * 16)                   # Signature  (total 64)
+
+
+_SMB2_DIALECTS = (0x0202, 0x0210, 0x0300, 0x0302)
+
+
+def _smb2_negotiate_body() -> bytes:
+    return ((36).to_bytes(2, "little")                   # StructureSize
+            + len(_SMB2_DIALECTS).to_bytes(2, "little")  # DialectCount
+            + (1).to_bytes(2, "little")                  # SecurityMode: SIGNING_ENABLED
+            + b"\x00\x00"                                # Reserved
+            + b"\x00\x00\x00\x00"                        # Capabilities
+            + b"\x00" * 16                               # ClientGuid
+            + b"\x00" * 8                                # ClientStartTime
+            + b"".join(d.to_bytes(2, "little") for d in _SMB2_DIALECTS))
+
+
+def _der_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(b)]) + b
+
+
+def _der(tag: int, content: bytes) -> bytes:
+    return bytes([tag]) + _der_len(len(content)) + content
+
+
+def _ntlm_type1() -> bytes:
+    """NTLMSSP NEGOTIATE (type 1). Flags request Unicode + a server VERSION +
+    TargetInfo so the CHALLENGE carries the OS build and AD/NetBIOS names."""
+    flags = (0x00000001 | 0x00000004 | 0x00000200 | 0x00008000 | 0x00080000
+             | 0x00800000 | 0x02000000 | 0x20000000 | 0x80000000)
+    return (b"NTLMSSP\x00"
+            + (1).to_bytes(4, "little")      # MessageType 1
+            + flags.to_bytes(4, "little")
+            + b"\x00" * 8                     # DomainNameFields
+            + b"\x00" * 8                     # WorkstationFields
+            + bytes([6, 1, 0, 0, 0, 0, 0, 15]))  # Version (any)
+
+
+def _spnego_ntlm(token: bytes) -> bytes:
+    """Wrap an NTLMSSP token in a GSS-API SPNEGO NegTokenInit."""
+    ntlmssp_oid = bytes.fromhex("2b06010401823702020a")   # 1.3.6.1.4.1.311.2.2.10
+    spnego_oid = bytes.fromhex("2b0601050502")            # 1.3.6.1.5.5.2
+    mechtypes = _der(0x30, _der(0x06, ntlmssp_oid))
+    inner = _der(0x30, _der(0xa0, mechtypes) + _der(0xa2, _der(0x04, token)))
+    return _der(0x60, _der(0x06, spnego_oid) + _der(0xa0, inner))
+
+
+def _smb2_session_setup_body() -> bytes:
+    spnego = _spnego_ntlm(_ntlm_type1())
+    return ((25).to_bytes(2, "little")       # StructureSize
+            + b"\x00"                         # Flags
+            + b"\x01"                         # SecurityMode: SIGNING_ENABLED
+            + b"\x00\x00\x00\x00"             # Capabilities
+            + b"\x00\x00\x00\x00"             # Channel
+            + (88).to_bytes(2, "little")      # SecurityBufferOffset (64 hdr + 24)
+            + len(spnego).to_bytes(2, "little")
+            + b"\x00" * 8                     # PreviousSessionId
+            + spnego)
+
+
+def _smb1_negotiate() -> bytes:
+    hdr = (b"\xffSMB" + b"\x72" + b"\x00\x00\x00\x00"     # ProtocolId + NEGOTIATE + Status
+           + b"\x18" + b"\x01\x28"                         # Flags, Flags2
+           + b"\x00" * 20)                                 # PIDHigh+Sig+Reserved+TID+PID+UID+MID
+    dialects = b"\x02" + b"NT LM 0.12\x00"
+    return hdr + b"\x00" + len(dialects).to_bytes(2, "little") + dialects
+
+
+def _parse_ntlm_type2(data: bytes) -> dict:
+    """Pull OS build + AD/NetBIOS names from an NTLMSSP CHALLENGE anywhere in
+    `data` (the SESSION_SETUP response's SPNEGO buffer)."""
+    i = data.find(b"NTLMSSP\x00\x02\x00\x00\x00")
+    if i < 0:
+        return {}
+    msg = data[i:]
+    if len(msg) < 48:
+        return {}
+    flags = int.from_bytes(msg[20:24], "little")
+    ti_len = int.from_bytes(msg[40:42], "little")
+    ti_off = int.from_bytes(msg[44:48], "little")
+    info = {}
+    if flags & 0x02000000 and len(msg) >= 56:            # NEGOTIATE_VERSION
+        info["os"] = f"{msg[48]}.{msg[49]}.{int.from_bytes(msg[50:52], 'little')}"
+    av = msg[ti_off:ti_off + ti_len]
+    names = {1: "nb_computer", 2: "nb_domain", 3: "dns_computer",
+             4: "dns_domain", 5: "dns_tree"}
+    j = 0
+    while j + 4 <= len(av):
+        avid = int.from_bytes(av[j:j + 2], "little")
+        avlen = int.from_bytes(av[j + 2:j + 4], "little")
+        val = av[j + 4:j + 4 + avlen]
+        j += 4 + avlen
+        if avid == 0:
+            break
+        if avid in names:
+            info[names[avid]] = val.decode("utf-16-le", "replace").rstrip("\x00")
+    return info
+
+
+async def _smb_recv(reader, timeout: float) -> bytes:
+    """Read one NBSS-framed SMB message; b'' on EOF/short read."""
+    try:
+        hdr = await asyncio.wait_for(reader.readexactly(4), timeout)
+        n = int.from_bytes(hdr[1:4], "big")
+        return await asyncio.wait_for(reader.readexactly(n), timeout)
+    except Exception:  # noqa: BLE001
+        return b""
+
+
+async def smb_probe(host: str, port: int, timeout: float):
+    """Returns {dialect, signing_required, signing_enabled, smbv1, ntlm} or None.
+    Read-only: an anonymous SMB2 negotiate + session-setup (NTLM type-1 only)
+    and a separate SMB1 negotiate; no credentials, no NTLM type-3."""
+    info = {"dialect": None, "signing_required": None, "signing_enabled": None,
+            "smbv1": False, "ntlm": {}}
+    got_smb2 = False
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+        try:
+            writer.write(_nbss(_smb2_header(0x0000, 0) + _smb2_negotiate_body()))
+            await writer.drain()
+            resp = await _smb_recv(reader, timeout)
+            if resp[:4] == b"\xfeSMB" and len(resp) >= 70:
+                got_smb2 = True
+                secmode = int.from_bytes(resp[66:68], "little")
+                info["signing_enabled"] = bool(secmode & 0x01)
+                info["signing_required"] = bool(secmode & 0x02)
+                info["dialect"] = int.from_bytes(resp[68:70], "little")
+                writer.write(_nbss(_smb2_header(0x0001, 1)
+                                   + _smb2_session_setup_body()))
+                await writer.drain()
+                r2 = await _smb_recv(reader, timeout)
+                if r2[:4] == b"\xfeSMB":
+                    info["ntlm"] = _parse_ntlm_type2(r2)
+        finally:
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+        try:
+            writer.write(_nbss(_smb1_negotiate()))
+            await writer.drain()
+            r = await _smb_recv(reader, timeout)
+            if r[:4] == b"\xffSMB":
+                info["smbv1"] = True
+        finally:
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    if not got_smb2 and not info["smbv1"]:
+        return None
+    return info
+
+
+# ---------------------------------------------------------------------------
 # gRPC (HTTP/2). Modern device/service control planes expose gRPC; nmap usually
 # leaves these ports unidentified ("tcpwrapped"). Detection is dependency-free:
 # over TLS we offer ALPN and check for a negotiated "h2"; cleartext we send the
@@ -2679,7 +2882,7 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "prometheus-unauth", "consul-unauth", "rabbitmq-unauth",
                       "minio-unauth", "portainer-unauth", "zookeeper-unauth",
                       "camera-ws-stream-unauth", "ttyd-shell-unauth",
-                      "mqtt-unauth"}
+                      "mqtt-unauth", "smbv1-enabled", "smb-signing-not-required"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -3015,6 +3218,63 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                     f"refused for a non-credential reason (CONNACK != 0x00/0x04/"
                     f"0x05), so anonymous access could not be confirmed."})
             return
+
+    if (port in _SMB_PORTS or "microsoft-ds" in name or "netbios-ssn" in name
+            or name == "smb"):
+        res = await smb_probe(host, port, cfg.timeout)
+        if res:
+            if not svc.name:
+                svc.name = "microsoft-ds"
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            ntlm = res.get("ntlm") or {}
+            if ntlm.get("os") and not svc.version:
+                svc.version = ntlm["os"]
+                svc.cve_skip = False
+            if not svc.product:
+                svc.product = ("Windows" if (ntlm.get("os") or ntlm.get("nb_domain"))
+                               else "SMB")
+            recon = [f"{lbl} {ntlm[k]}" for k, lbl in (
+                        ("dns_domain", "AD domain"),
+                        ("nb_domain", "NetBIOS/workgroup"),
+                        ("dns_computer", "host"),
+                        ("nb_computer", "NetBIOS name"),
+                        ("os", "OS build")) if ntlm.get(k)]
+            if recon:
+                svc.scripts.append({"id": "smb-ntlm-info", "output":
+                    "SMB/NTLM negotiation disclosed WITHOUT authentication: "
+                    + "; ".join(recon) + ". A single anonymous SMB2 SESSION_SETUP "
+                    "returns the host OS build and AD/NetBIOS names via the NTLM "
+                    "challenge (no credentials sent). Restrict SMB to trusted "
+                    "networks."})
+            if res.get("smbv1"):
+                svc.confidence = "high"
+                svc.extrainfo = "SMBv1 enabled"
+                svc.scripts.append({"id": "smbv1-enabled", "output":
+                    "SMBv1 is ENABLED (the host answered an SMB1 'NT LM 0.12' "
+                    "negotiate). SMBv1 is obsolete and carries the EternalBlue "
+                    "(MS17-010 / CVE-2017-0144) wormable-RCE class and NTLM "
+                    "downgrade exposure -- the vector behind WannaCry/NotPetya. "
+                    "Disable SMBv1 entirely (it is off by default on current "
+                    "Windows)."})
+            if res.get("signing_required") is False:
+                svc.confidence = "high"
+                if not svc.extrainfo:
+                    svc.extrainfo = "SMB signing not required"
+                svc.scripts.append({"id": "smb-signing-not-required", "output":
+                    "SMB signing is NOT required"
+                    + (" (supported but optional)" if res.get("signing_enabled")
+                       else " (disabled)")
+                    + f" on dialect 0x{res['dialect']:04x}. An on-path attacker "
+                    "can NTLM-relay authentication to this host (e.g. ntlmrelayx) "
+                    "to execute commands or pivot without cracking a password. "
+                    "Require SMB signing (GPO 'Microsoft network server: Digitally "
+                    "sign communications (always)')."})
+            elif res.get("signing_required") is True:
+                svc.scripts.append({"id": "smb-signing-required", "output":
+                    f"SMB signing is required on dialect 0x{res['dialect']:04x} "
+                    "(good posture; NTLM relay to this host is blocked)."})
+        return
 
     # gRPC / HTTP2 on a dedicated gRPC port (or a `grpc`-named service). Scoped
     # this way so HTTPS/2 web ports (also "h2") are never mislabelled as gRPC.

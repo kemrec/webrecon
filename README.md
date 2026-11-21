@@ -423,6 +423,19 @@ nmap's result and, for every under-identified port, adds:
   alert. On an anonymous accept the probe additionally subscribes to the single
   `$SYS/broker/version` metadata topic to recover a broker version for CVE
   matching — **never an application topic**, and it publishes nothing.
+- **SMB** (TCP `445`): dependency-free internal-network triage with no
+  credentials. A hand-rolled SMB2 negotiate reads the **signing posture** — a
+  host where signing is *not required* can be **NTLM-relayed** (ntlmrelayx) to
+  run commands or pivot without a password (**alert**, `smb-signing-not-required`).
+  A separate SMB1 `NT LM 0.12` negotiate detects **SMBv1 enabled** — the
+  EternalBlue / MS17-010 wormable-RCE surface (**alert**, `smbv1-enabled`).
+  Finally an anonymous SMB2 session-setup sends only an NTLM `NEGOTIATE`
+  (type 1) and **reads the server's `CHALLENGE`** (type 2) — no credentials,
+  no type-3, so no authentication is attempted — which discloses the host's OS
+  build and AD/NetBIOS domain and computer names in a single unauthenticated
+  packet (`smb-ntlm-info`, informational recon that also anchors CVE
+  correlation to the Windows build). Signing *required* is reported as good
+  posture.
 
 The camera default-credential attempt (RTSP + ONVIF) is the one active step;
 disable it with `--no-cam-creds` (alias `--no-rtsp-creds`) for a fully
