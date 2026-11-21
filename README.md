@@ -312,6 +312,21 @@ nmap's result and, for every under-identified port, adds:
   reader are needed — no gRPC library. `grpcurl`/`grpcio` are used only as an
   optional fallback if the native client can't complete the exchange. Scoped to
   gRPC ports so HTTPS/2 web ports are never mislabelled. Read-only (list only).
+- **Ops / control-plane HTTP services** (read-only GETs, each gated to its port
+  or a matching service name): **Prometheus** (`/-/healthy` + `buildinfo`; no
+  auth by design, so network-reachable = **critical** metrics/topology
+  exposure), **Consul** (`/v1/agent/self` readable = ACLs disabled, **critical**
+  catalog/KV exposure), **RabbitMQ** management (`/api/overview` without creds =
+  **critical**), **MinIO** (anonymous `ListBuckets` = **critical**; detected via
+  the `Server: MinIO` header), **Portainer** (`/api/users/admin/check` → `404`
+  means **no admin is set yet**, so anyone can claim it and take over every
+  Docker/K8s environment it manages — **critical**), **Apache ZooKeeper** (the
+  four-letter-word `stat` over TCP = **critical** config/znode exposure), and
+  **HashiCorp Vault** (`/v1/sys/seal-status`; this endpoint is unauthenticated by
+  design, so Vault is reported **informationally** — product, version and
+  sealed/unsealed state — as a hardening note, not an unauth-data finding). These
+  share ports with the gRPC detector (MinIO/Portainer on 9000, Prometheus on
+  9090); a confirmed product wins and only a genuine miss falls through to gRPC.
 - **SNMP** (UDP 161): a hand-built (no `pysnmp` dependency) `GetRequest` for
   `sysDescr.0` with the well-known community strings `public`/`private`, over
   both SNMP v2c and v1. A reply is a **critical** finding — the whole MIB

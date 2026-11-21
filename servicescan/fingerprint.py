@@ -586,6 +586,114 @@ async def kubelet_probe(host: str, port: int, timeout: float, tls: bool):
     return None
 
 
+# --- More HTTP(S) control-plane / ops services. Same read-only GET contract as
+# the stores above: confirm the product from a specific marker, then report
+# whether its data/admin surface answers without credentials. Each returns
+# ("open", version) / ("auth", "") / None, except Vault (by-design-public probe)
+# which returns its own dict and is framed as a hardening note, not an alert.
+async def prometheus_probe(host: str, port: int, timeout: float, tls: bool):
+    """Prometheus (no auth by design -> network-reachable = exposure)."""
+    r = await _http_get_once(host, port, "/-/healthy", timeout, tls)
+    if not r:
+        return None
+    status, _, body = r
+    if status in (401, 403):
+        return ("auth", "")
+    if status != 200 or b"Prometheus" not in body:
+        return None
+    ver = ""
+    r2 = await _http_get_once(host, port, "/api/v1/status/buildinfo", timeout, tls)
+    if r2 and r2[0] == 200:
+        ver = _json_ver(r2[2], "version")
+    return ("open", ver)
+
+
+async def consul_probe(host: str, port: int, timeout: float, tls: bool):
+    """Consul agent self-config (readable only when ACLs are disabled/open)."""
+    r = await _http_get_once(host, port, "/v1/agent/self", timeout, tls)
+    if not r:
+        return None
+    status, _, body = r
+    if status == 200 and b'"Config"' in body and b'"Member"' in body:
+        return ("open", _json_ver(body, "Version"))
+    if status in (401, 403):
+        return ("auth", "")
+    return None
+
+
+async def vault_probe(host: str, port: int, timeout: float, tls: bool):
+    """HashiCorp Vault seal-status (public by design). {sealed, version}/None."""
+    r = await _http_get_once(host, port, "/v1/sys/seal-status", timeout, tls)
+    if not r:
+        return None
+    status, _, body = r
+    if status != 200 or b'"sealed"' not in body or b'"version"' not in body:
+        return None
+    return {"sealed": b'"sealed":true' in body.replace(b" ", b""),
+            "version": _json_ver(body, "version")}
+
+
+async def rabbitmq_probe(host: str, port: int, timeout: float, tls: bool):
+    """RabbitMQ management API /api/overview. ('open', v) when it answers without
+    credentials, ('auth', '') when the plugin is present but demands them."""
+    r = await _http_get_once(host, port, "/api/overview", timeout, tls)
+    if not r:
+        return None
+    status, headers, body = r
+    if status == 200 and (b'"rabbitmq_version"' in body
+                          or b'"management_version"' in body):
+        return ("open", _json_ver(body, "rabbitmq_version"))
+    if status == 401 and "rabbitmq" in headers.get("www-authenticate", "").lower():
+        return ("auth", "")
+    return None
+
+
+async def minio_probe(host: str, port: int, timeout: float, tls: bool):
+    """MinIO S3 endpoint. ('open','') when anonymous ListBuckets succeeds,
+    ('auth','') when MinIO is present but anonymous listing is denied."""
+    def _is_minio(hdrs):
+        return "minio" in hdrs.get("server", "").lower()
+
+    r = await _http_get_once(host, port, "/minio/health/live", timeout, tls)
+    present = bool(r and _is_minio(r[1]))
+    r2 = await _http_get_once(host, port, "/", timeout, tls)
+    if not present and not (r2 and _is_minio(r2[1])):
+        return None
+    if r2 and r2[0] == 200 and b"ListAllMyBucketsResult" in r2[2]:
+        return ("open", "")
+    return ("auth", "")
+
+
+async def portainer_probe(host: str, port: int, timeout: float, tls: bool):
+    """Portainer. ('open', v) when no admin is set yet (anyone can claim it via
+    /api/users/admin/init), ('auth', v) when already initialised/protected."""
+    r = await _http_get_once(host, port, "/api/system/status", timeout, tls)
+    if not (r and r[0] == 200 and b'"Version"' in r[2]):
+        r = await _http_get_once(host, port, "/api/status", timeout, tls)
+    if not (r and r[0] == 200 and b'"Version"' in r[2]):
+        return None                     # not Portainer (no public status endpoint)
+    ver = _json_ver(r[2], "Version")
+    chk = await _http_get_once(host, port, "/api/users/admin/check", timeout, tls)
+    if chk and chk[0] == 404:
+        return ("open", ver)            # no admin account exists yet -> claimable
+    return ("auth", ver)
+
+
+async def zookeeper_probe(host: str, port: int, timeout: float):
+    """ZooKeeper four-letter-word 'stat' over TCP. ('open', v) when 4lw answers
+    with data, ('auth','') when ZK is present but 4lw is whitelist-restricted."""
+    data = await _read_once(host, port, b"stat\n", timeout)
+    if not data:
+        return None
+    if b"Zookeeper version:" in data:
+        m = re.search(rb"Zookeeper version:\s*([0-9][0-9.]+)", data)
+        return ("open", m.group(1).decode() if m else "")
+    low = data.lower()
+    if b"not in the whitelist" in low or b"is not executed" in low:
+        return ("auth", "")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # UDP exposure probes (SNMP, IPMI). Both are single-packet, read-only requests
 # over UDP. A shared datagram helper sends one payload and waits for one reply;
@@ -801,6 +909,13 @@ _COUCHDB_PORTS = {5984, 6984}
 _DOCKER_PORTS = {2375, 2376}
 _ETCD_PORTS = {2379, 4001}
 _KUBELET_PORTS = {10250, 10255}
+_PROMETHEUS_PORTS = {9090}
+_CONSUL_PORTS = {8500}
+_VAULT_PORTS = {8200}
+_RABBITMQ_PORTS = {15672}
+_MINIO_PORTS = {9000, 9001}
+_PORTAINER_PORTS = {9000, 9443}
+_ZOOKEEPER_PORTS = {2181}
 _RTSP_PORTS = {554, 8554, 7447, 10554, 1554, 555}
 _RTSPS_PORTS = {322}                             # RTSP over TLS (RTSPS, IANA 322)
 # ports that always speak TLS (the plaintext peer, when one exists, is elsewhere)
@@ -1895,7 +2010,9 @@ EXPOSURE_ALERT_IDS = {"redis-unauth", "memcached-unauth", "mongodb-unauth",
                       "camera-snapshot-unauth",
                       "cam-cgi-unauth", "cam-cgi-default-creds",
                       "grpc-reflection-exposed", "snmp-unauth",
-                      "ipmi-cipher-zero"}
+                      "ipmi-cipher-zero",
+                      "prometheus-unauth", "consul-unauth", "rabbitmq-unauth",
+                      "minio-unauth", "portainer-unauth", "zookeeper-unauth"}
 
 
 def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
@@ -2069,6 +2186,112 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 f"firewall {port}.")
         return
 
+    # Ops / control-plane HTTP services. Kept ahead of the gRPC branch because
+    # several share its ports (MinIO/Portainer on 9000, Prometheus on 9090): a
+    # confirmed product stops here, and only a genuine miss (None) falls through
+    # to the gRPC detector below.
+    if "prometheus" in name or port in _PROMETHEUS_PORTS:
+        res = await prometheus_probe(host, port, cfg.timeout, tls)
+        if res:
+            _mark_exposure(svc, "prometheus", "Prometheus", res[0], res[1],
+                "prometheus-unauth",
+                f"Prometheus reachable WITHOUT authentication (Prometheus has no "
+                f"auth of its own). An unauthenticated client can read every "
+                f"scraped metric -- internal hostnames/IPs, the full target list, "
+                f"build and config -- via /api/v1/*, and if the admin API is "
+                f"enabled can delete series. Put it behind an authenticating "
+                f"reverse proxy and firewall {port}.")
+            return
+
+    if "consul" in name or port in _CONSUL_PORTS:
+        res = await consul_probe(host, port, cfg.timeout, tls)
+        if res:
+            _mark_exposure(svc, "consul", "HashiCorp Consul", res[0], res[1],
+                "consul-unauth",
+                f"Consul HTTP API reachable WITHOUT authentication (ACLs disabled "
+                f"-- /v1/agent/self returned the full agent config and members). "
+                f"An unauthenticated client can read the service catalog and KV "
+                f"store (often secrets/config) and register or deregister "
+                f"services. Enable ACLs with a default-deny policy, bind the API "
+                f"to localhost, firewall {port}.")
+            return
+
+    if "vault" in name or port in _VAULT_PORTS:
+        vres = await vault_probe(host, port, cfg.timeout, tls)
+        if vres is not None:
+            if not svc.name:
+                svc.name = "vault"
+            if not svc.product:
+                svc.product = "HashiCorp Vault"
+            if vres["version"] and not svc.version:
+                svc.version = vres["version"]
+                svc.cve_skip = False
+            if "exposure" not in svc.sources:
+                svc.sources.append("exposure")
+            state = "sealed" if vres["sealed"] else "UNSEALED"
+            svc.scripts.append({"id": "vault-exposed", "output":
+                f"HashiCorp Vault reachable on {port} ({state}). The seal-status "
+                f"endpoint is unauthenticated by design, so this is informational "
+                f"rather than an unauth-data finding; but a network-reachable "
+                f"Vault widens the attack surface (auth brute-force, known-CVE "
+                f"exploitation, and -- if ever started in dev mode -- a well-known "
+                f"root token with in-memory storage). Restrict {port} to trusted "
+                f"clients, terminate TLS, and enable audit logging."})
+            return
+
+    if ("rabbitmq" in name or "amqp" in name or port in _RABBITMQ_PORTS):
+        res = await rabbitmq_probe(host, port, cfg.timeout, tls)
+        if res:
+            _mark_exposure(svc, "rabbitmq", "RabbitMQ Management", res[0], res[1],
+                "rabbitmq-unauth",
+                f"RabbitMQ management API answered /api/overview WITHOUT "
+                f"authentication. An unauthenticated client can read vhosts, "
+                f"users, queues and message rates and (via the same API) publish "
+                f"or drain messages. Require authentication, remove the default "
+                f"guest account, firewall {port}.")
+            return
+
+    if "minio" in name or port in _MINIO_PORTS:
+        res = await minio_probe(host, port, cfg.timeout, tls)
+        if res:
+            _mark_exposure(svc, "minio", "MinIO", res[0], res[1],
+                "minio-unauth",
+                f"MinIO allows ANONYMOUS bucket access (an unauthenticated "
+                f"ListBuckets returned the bucket list). Anonymous S3 access "
+                f"exposes -- and, depending on policy, lets anyone write/delete -- "
+                f"stored objects. Remove the anonymous/public bucket policies, "
+                f"require signed requests, firewall {port}.")
+            return
+
+    if "portainer" in name or port in _PORTAINER_PORTS:
+        res = await portainer_probe(host, port, cfg.timeout, tls)
+        if res:
+            _mark_exposure(svc, "portainer", "Portainer", res[0], res[1],
+                "portainer-unauth",
+                f"Portainer has NO admin account set yet "
+                f"(/api/users/admin/check returned 404): anyone who reaches it "
+                f"first can POST /api/users/admin/init to create the admin and "
+                f"take over Portainer -- and thus every Docker/Kubernetes "
+                f"environment it manages (equivalent to root on those hosts). "
+                f"Complete the admin setup immediately and firewall {port} until "
+                f"then.")
+            return
+
+    if "zookeeper" in name or port in _ZOOKEEPER_PORTS:
+        res = await zookeeper_probe(host, port, cfg.timeout)
+        if res:
+            _mark_exposure(svc, "zookeeper", "Apache ZooKeeper", res[0], res[1],
+                "zookeeper-unauth",
+                f"ZooKeeper four-letter-word commands answer WITHOUT "
+                f"authentication ('stat' returned server/version/client data). "
+                f"The 4lw surface (stat/mntr/envi/conf/cons/dump/wchp) leaks "
+                f"config, connected clients and znode paths, and ZooKeeper has no "
+                f"auth on the data tree by default -- an unauthenticated client "
+                f"can read and modify znodes (service registries, Kafka/HBase "
+                f"metadata). Restrict the 4lw whitelist, enable SASL + ACLs, "
+                f"firewall {port}.")
+            return
+
     # gRPC / HTTP2 on a dedicated gRPC port (or a `grpc`-named service). Scoped
     # this way so HTTPS/2 web ports (also "h2") are never mislabelled as gRPC.
     if port in _GRPC_PORTS or "grpc" in name:
@@ -2100,7 +2323,9 @@ async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
                 svc.scripts.append({"id": "grpc-detected", "output":
                     f"gRPC/HTTP2 server detected (transport {det['transport']}); "
                     f"{note}."})
-        return
+            return
+        # not gRPC (e.g. a plain HTTP app sharing a gRPC-ish port): fall through
+        # so the ops/ONVIF HTTP checks still get a chance on this port.
 
     # ONVIF rides HTTP (no dedicated port of its own in most deployments), so it
     # is checked on any web service or a known ONVIF-only port. A single SOAP
