@@ -5407,14 +5407,40 @@ async def run_exposure_checks(cfg: ScanConfig, host: str,
 
     await asyncio.gather(*(one(s) for s in open_svcs))
 
-    # Host-level ONVIF WS-Discovery (UDP 3702, active unicast Probe). Runs once
-    # per host regardless of whether 3702 was port-scanned, so it surfaces
-    # cameras/NVRs that a default TCP scan would miss. Read-only; a non-answer
-    # just times out. A hit lands on the udp/3702 service (created if absent).
-    try:
-        wsd = await wsdiscovery_probe(host, 3702, min(cfg.timeout, 3.0))
-    except Exception:  # noqa: BLE001
-        wsd = None
+    def _udp_svc(port: int, name: str) -> Service:
+        s = next((s for s in services
+                  if s.port == port and s.proto == "udp"), None)
+        if s is None:
+            s = Service(port=port, proto="udp", state="open", name=name)
+            services.append(s)
+        if "exposure" not in s.sources:
+            s.sources.append("exposure")
+        return s
+
+    # Host-level UDP/multicast exposure probes, run once per host regardless of
+    # which ports were scanned (UDP services a default TCP scan misses):
+    #   WS-Discovery 3702 (ONVIF cameras/NVRs), SNMP 161 (unauth MIB read),
+    #   IPMI 623 (cipher-zero BMC auth bypass), SSDP/UPnP 1900 (device enum).
+    # Each must wait out a UDP timeout when the host is silent, and they are
+    # independent, so they run CONCURRENTLY and their results are folded in
+    # sequentially below -- the fixed cost is the slowest single probe, not the
+    # sum of all four. Read-only; a non-answer just times out. (The probe
+    # coroutines only do network I/O and return data; every mutation of
+    # `services` happens in the sequential blocks below, so this is race-free.)
+    async def _safe(coro):
+        try:
+            return await coro
+        except Exception:  # noqa: BLE001
+            return None
+
+    wsd, snmp, ipmi, ssdp = await asyncio.gather(
+        _safe(wsdiscovery_probe(host, 3702, min(cfg.timeout, 3.0))),
+        _safe(snmp_probe(host, 161, cfg.timeout)),
+        _safe(ipmi_cipher_zero_probe(host, 623, cfg.timeout)),
+        _safe(ssdp_probe(host, 1900, min(cfg.timeout, 3.0))),
+    )
+
+    # WS-Discovery (UDP 3702): a hit lands on the udp/3702 service.
     if wsd:
         svc = next((s for s in services
                     if s.port == 3702 and s.proto == "udp"), None)
@@ -5432,23 +5458,8 @@ async def run_exposure_checks(cfg: ScanConfig, host: str,
             + ". The device advertises its type/name/location and the "
               "device_service URL without authentication."})
 
-    def _udp_svc(port: int, name: str) -> Service:
-        s = next((s for s in services
-                  if s.port == port and s.proto == "udp"), None)
-        if s is None:
-            s = Service(port=port, proto="udp", state="open", name=name)
-            services.append(s)
-        if "exposure" not in s.sources:
-            s.sources.append("exposure")
-        return s
-
-    # Host-level SNMP (UDP 161). Runs once per host regardless of UDP scanning,
-    # since 161 is rarely in a default TCP scan. A GetRequest answered with a
-    # well-known community string is a full read of the device over SNMP.
-    try:
-        snmp = await snmp_probe(host, 161, cfg.timeout)
-    except Exception:  # noqa: BLE001
-        snmp = None
+    # SNMP (UDP 161): a GetRequest answered with a well-known community string
+    # is a full read of the device over SNMP.
     if snmp:
         svc = _udp_svc(161, "snmp")
         if not svc.product:
@@ -5465,13 +5476,8 @@ async def run_exposure_checks(cfg: ScanConfig, host: str,
             f"allows configuration changes. Change the community strings, restrict "
             f"SNMP to a management network, or move to SNMPv3 with auth+priv."})
 
-    # Host-level IPMI cipher-zero (UDP 623). A BMC that accepts cipher suite 0
-    # grants an administrative session with no password -- full out-of-band
-    # control of the server (power, serial-over-LAN, virtual media).
-    try:
-        ipmi = await ipmi_cipher_zero_probe(host, 623, cfg.timeout)
-    except Exception:  # noqa: BLE001
-        ipmi = None
+    # IPMI cipher-zero (UDP 623): a BMC that accepts cipher suite 0 grants an
+    # administrative session with no password -- full out-of-band control.
     if ipmi:
         svc = _udp_svc(623, "asf-rmcp")
         if not svc.product:
@@ -5493,15 +5499,9 @@ async def run_exposure_checks(cfg: ScanConfig, host: str,
                 "to the IPMI 2.0 RAKP password-hash disclosure -- restrict UDP 623 "
                 "to a management network and use strong BMC passwords."})
 
-    # Host-level SSDP/UPnP (UDP 1900, unicast M-SEARCH). UPnP discovery is
-    # unauthenticated by design, so this is INFORMATIONAL enumeration (device
-    # model/firmware for CVE anchoring + advertised service surface), never an
-    # unauth-access alert. An advertised Internet Gateway control service
-    # (WANIPConnection/WANPPPConnection) is called out as a hardening concern.
-    try:
-        ssdp = await ssdp_probe(host, 1900, min(cfg.timeout, 3.0))
-    except Exception:  # noqa: BLE001
-        ssdp = None
+    # SSDP/UPnP (UDP 1900, unicast M-SEARCH): INFORMATIONAL device enumeration
+    # (model/firmware for CVE anchoring + advertised service surface), never an
+    # unauth-access alert. An advertised IGD control service is flagged below.
     if ssdp:
         svc = _udp_svc(1900, "upnp")
         desc = {}
