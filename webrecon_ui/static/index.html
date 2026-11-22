@@ -185,6 +185,7 @@
     <span class="muted">Saved to</span>
     <code id="saved-path"></code>
     <button class="ghost" id="copy-path">Copy path</button>
+    <button class="ghost" id="open-folder" title="opens on the machine running the server">Open folder</button>
     <span id="copy-note" class="muted"></span>
   </div>
 </main>
@@ -473,6 +474,29 @@ async function copyPath() {
   setTimeout(() => { note.textContent = ""; }, 1800);
 }
 
+// Open the saved folder in the file manager OF THE MACHINE RUNNING THE SERVER
+// (only useful when that's this machine). The X-Requested-With header is what
+// lets the server tell this same-origin call apart from a drive-by cross-site POST.
+async function openFolder() {
+  if (!scanId) return;
+  const note = $("copy-note"); note.textContent = "";
+  try {
+    const r = await fetch("/api/reveal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Requested-With": "webrecon-ui" },
+      body: JSON.stringify({ scan_id: scanId }),
+    });
+    if (!r.ok) {
+      let msg = String(r.status);
+      try { msg = (await r.json()).error || msg; } catch (_) {}
+      note.textContent = "— " + msg;
+    } else {
+      note.textContent = "opened on the server host";
+      setTimeout(() => { note.textContent = ""; }, 1800);
+    }
+  } catch (e) { note.textContent = "— " + e.message; }
+}
+
 function endScan() {
   if (es) { es.close(); es = null; }
   $("go").disabled = false;
@@ -545,6 +569,7 @@ $("scan-form").addEventListener("submit", doScan);
 $("dl-go").addEventListener("click", doExport);
 $("dl-all").addEventListener("click", doExportAll);
 $("copy-path").addEventListener("click", copyPath);
+$("open-folder").addEventListener("click", openFolder);
 loadAlertIds();
 </script>
 </body>

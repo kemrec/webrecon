@@ -12,6 +12,9 @@ POST /api/scan.sarif         -> SARIF 2.1.0 document    (same body)
 GET  /api/export/<id>/<fmt>  -> one output file for a completed scan, as a
                                 download; <fmt>="all" bundles every output (and
                                 the web-crawl dir) as a <target>-<timestamp>.zip
+POST /api/reveal             -> open a saved scan's folder in the host file
+                                manager (localhost only; CSRF-guarded; the path
+                                is the server-remembered dir, not from the body)
 
 The POST body is a JSON object; only an allowlisted subset of ScanConfig fields
 is honoured (see _ALLOWED), so a request can never set, e.g., an arbitrary
@@ -37,6 +40,8 @@ import json
 import os
 import queue
 import re
+import subprocess
+import sys
 import tempfile
 import threading
 import uuid
@@ -118,6 +123,24 @@ def _record_scan_dir(scan_id: str, path: str) -> str:
     while len(_SCAN_DIRS) > _SCANS_MAX:
         _SCAN_DIRS.popitem(last=False)
     return ap
+
+
+def _open_in_file_manager(path: str) -> None:
+    """Open `path` in the host's file manager (xdg-open / open / explorer).
+
+    argv list, never a shell, and the caller passes only a server-remembered,
+    existence-checked scan dir -- never a request-supplied path -- so the opened
+    target is always one the server itself wrote. Detached; we never wait on it.
+    Module-level so tests can monkeypatch it (no real window spawns under CI).
+    """
+    if sys.platform == "darwin":
+        argv = ["open", path]
+    elif os.name == "nt":
+        argv = ["explorer", path]
+    else:
+        argv = ["xdg-open", path]
+    subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     stdin=subprocess.DEVNULL)
 
 
 def persist_scan(result, scan_id: str, scan_dir: str) -> dict:
@@ -442,7 +465,57 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
+    def _reveal_allowed(self) -> bool:
+        """CSRF guard for the local-command (file-manager) endpoint.
+
+        A cross-origin page cannot set a custom request header without a CORS
+        preflight that this server never answers, so requiring X-Requested-With
+        blocks drive-by POSTs from any other site the operator happens to be
+        browsing; the Origin, when the browser sends one, must additionally be
+        our own loopback console.
+        """
+        if not self.headers.get("X-Requested-With"):
+            return False
+        origin = self.headers.get("Origin")
+        if origin and not re.match(
+                r"^http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$", origin):
+            return False
+        return True
+
+    def _handle_reveal(self) -> None:
+        """Open a saved scan's folder in the host file manager (localhost only).
+
+        Only meaningful when the browser and this server share a machine. The
+        path is never taken from the request: we look up the server-remembered
+        dir for the given scan_id, so a caller can neither steer nor traverse it.
+        """
+        if not self._reveal_allowed():
+            self._error(403, "forbidden")
+            return
+        try:
+            payload = self._read_json_body()
+        except BadRequest as e:
+            self._error(400, str(e))
+            return
+        scan_id = payload.get("scan_id") if isinstance(payload, dict) else None
+        path = _SCAN_DIRS.get(scan_id) if scan_id else None
+        if not path:
+            self._error(404, "no saved directory for this scan")
+            return
+        if not os.path.isdir(path):
+            self._error(409, "saved directory no longer exists")
+            return
+        try:
+            _open_in_file_manager(path)
+        except Exception as e:  # noqa: BLE001
+            self._error(500, f"could not open folder: {e}")
+            return
+        self._send_json(200, {"ok": True, "path": path})
+
     def do_POST(self):  # noqa: N802
+        if self.path == "/api/reveal":
+            self._handle_reveal()
+            return
         if self.path not in ("/api/scan", "/api/scan.sarif"):
             self._error(404, "not found")
             return

@@ -854,6 +854,15 @@ button. The server picks the folder itself: `<save-dir>/<target>-<timestamp>/`,
 where `<save-dir>` defaults to `webrecon-ui-scans/` and is set only with
 `--save-dir` (never by the request), so a scan can never write outside it.
 
+An **Open folder** button sits next to the path: it `POST`s to `/api/reveal`,
+which opens that folder in the host's file manager (`xdg-open` / `open` /
+`explorer`). This only does something useful when the browser and the server are
+on the **same machine** — it opens on whatever host runs the server. The path is
+the server-remembered scan dir (never taken from the request), and the endpoint
+is CSRF-guarded (a required `X-Requested-With` header that a cross-site page
+can't set without a preflight the server refuses, plus a loopback-`Origin`
+check), so another site the operator is browsing can't trigger it.
+
 ```bash
 curl -s -XPOST http://127.0.0.1:8787/api/scan \
   -d '{"target":"10.0.0.5","fp_all":true,"min_cvss":7.0}' | jq .
