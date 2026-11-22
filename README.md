@@ -838,13 +838,21 @@ params). Only an allowlisted subset of options is honoured — `target`
 (required; string or list), `ports`, `use_nmap`, `top_ports`, `udp`, `nse`,
 `nse_scripts`, `fingerprint`, `fp_all`, `render`, `cam_creds`, `realm`, `scan_rate`, `cve`,
 the per-feed CVE sources `nvd` / `osv` / `epss` / `kev`, `nvd_api_key`, `min_cvss`,
-`kev_high_only`, `exploits`, `timeout`, `concurrency`, and the `--web` crawl
-chain (`web`, `web_render`, `web_depth`, `web_max_pages`). These are all scan
-*semantics*; host-filesystem / subprocess-path knobs (`nmap_path`, `nmap_args`,
-`outdir`) are deliberately **not** reachable from the web surface. With the web
-chain enabled, each web port's crawl summary (pages / urls / params / secrets /
-tech) is shown inline on the service and the crawl output is written under
-`servicescan-out/` as usual.
+`kev_high_only`, `exploits`, `timeout`, `concurrency`, the `--web` crawl
+chain (`web`, `web_render`, `web_depth`, `web_max_pages`), and `save_to_disk`.
+These are all scan *semantics*; host-filesystem / subprocess-path knobs
+(`nmap_path`, `nmap_args`, `outdir`) are deliberately **not** reachable from the
+web surface. With the web chain enabled, each web port's crawl summary (pages /
+urls / params / secrets / tech) is shown inline on the service.
+
+**Saving to disk.** By default a UI scan is kept only in memory (exports are
+rendered on demand; see the zip above). Tick **save to disk** (or send
+`save_to_disk: true`) to also write the full servicescan output tree — the same
+files `report.write_all` produces on the CLI, plus the `--web` crawl dir — into
+a per-scan folder, and the console shows the absolute path with a **Copy path**
+button. The server picks the folder itself: `<save-dir>/<target>-<timestamp>/`,
+where `<save-dir>` defaults to `webrecon-ui-scans/` and is set only with
+`--save-dir` (never by the request), so a scan can never write outside it.
 
 ```bash
 curl -s -XPOST http://127.0.0.1:8787/api/scan \

@@ -70,6 +70,10 @@
   .muted { color:var(--muted); }
   .empty { color:var(--muted); padding:20px; text-align:center; }
   .dl { display:flex; gap:10px; margin-top:10px; }
+  /* saved-dir row: plain block so the [hidden] attribute always wins (no display override) */
+  #saved-row { margin-top:10px; }
+  #saved-row > * { margin-right:8px; vertical-align:middle; }
+  code { background:var(--panel2); padding:2px 7px; border-radius:5px; font-size:12px; color:var(--fg); }
   details summary { cursor:pointer; color:var(--muted); font-size:12px; }
   /* accordion: one summary row per service, detail revealed on toggle */
   tr.svc { cursor:default; }
@@ -128,6 +132,7 @@
         <label class="inline"><input type="checkbox" id="exploits"> map exploits</label>
         <label class="inline"><input type="checkbox" id="render"> render web roots (JS)</label>
         <label class="inline"><input type="checkbox" id="cam_creds" checked> camera default-cred test</label>
+        <label class="inline"><input type="checkbox" id="save_to_disk"> save to disk</label>
       </div>
       <div class="row">
         <span class="muted" style="font-size:12px;">CVE sources:</span>
@@ -176,12 +181,19 @@
     <button class="ghost" id="dl-all">Download all (zip)</button>
     <span id="dl-note" class="muted"></span>
   </div>
+  <div id="saved-row" hidden>
+    <span class="muted">Saved to</span>
+    <code id="saved-path"></code>
+    <button class="ghost" id="copy-path">Copy path</button>
+    <span id="copy-note" class="muted"></span>
+  </div>
 </main>
 
 <script>
 "use strict";
 let ALERT_IDS = new Set();
 let scanId = null;
+let lastOutdir = null;  // abs path of the on-disk scan dir (when "save to disk" was on)
 let es = null;        // active EventSource (live scan stream)
 
 const $ = (id) => document.getElementById(id);
@@ -221,6 +233,7 @@ function buildQuery() {
   p.set("exploits", $("exploits").checked);
   p.set("render", $("render").checked);
   p.set("cam_creds", $("cam_creds").checked);   // uncheck = fully passive camera recon
+  if ($("save_to_disk").checked) p.set("save_to_disk", true);
   const mc = parseFloat($("min_cvss").value);
   if (!isNaN(mc) && mc > 0) p.set("min_cvss", mc);
   const rate = parseInt($("rate").value, 10);
@@ -448,6 +461,18 @@ async function fetchAndSave(fmt, fallbackName) {
 function doExport() { fetchAndSave($("fmt").value, $("fmt").value + ".txt"); }
 function doExportAll() { fetchAndSave("all", "scan.zip"); }
 
+async function copyPath() {
+  if (!lastOutdir) return;
+  const note = $("copy-note");
+  try {
+    await navigator.clipboard.writeText(lastOutdir);
+    note.textContent = "copied";
+  } catch (_) {
+    note.textContent = "select & copy manually";   // clipboard blocked (non-secure ctx)
+  }
+  setTimeout(() => { note.textContent = ""; }, 1800);
+}
+
 function endScan() {
   if (es) { es.close(); es = null; }
   $("go").disabled = false;
@@ -464,6 +489,7 @@ function doScan(ev) {
   $("downloads").hidden = true;
   $("results").innerHTML = "";
   EXPANDED.clear(); COLLAPSED.clear();   // fresh expand/collapse state per scan
+  lastOutdir = null; $("saved-row").hidden = true;   // clear prior save-to-disk path
   const hosts = [];
   let expected = null;
   const t0 = Date.now();
@@ -495,6 +521,13 @@ function doScan(ev) {
       const ns = hosts.reduce((n, h) => n + (h.services || []).length, 0);
       setStatus(`Done in ${secs}s — ${ns} service(s) across ${hosts.length} host(s)${msg.nmap_used ? " (nmap)" : ""}.`);
       if (scanId) $("downloads").hidden = false;
+      if (msg.outdir) {
+        lastOutdir = msg.outdir;
+        $("saved-path").textContent = msg.outdir;
+        $("saved-row").hidden = false;
+      } else if (msg.outdir_error) {
+        $("dl-note").textContent = "— save to disk failed: " + msg.outdir_error;
+      }
       endScan();
     } else if (msg.type === "error") {
       setStatus("Error: " + (msg.error || "scan failed"), true);
@@ -511,6 +544,7 @@ function doScan(ev) {
 $("scan-form").addEventListener("submit", doScan);
 $("dl-go").addEventListener("click", doExport);
 $("dl-all").addEventListener("click", doExportAll);
+$("copy-path").addEventListener("click", copyPath);
 loadAlertIds();
 </script>
 </body>

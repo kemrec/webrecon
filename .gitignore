@@ -17,6 +17,7 @@ ENV/
 webrecon-out/
 *-out/
 out/
+webrecon-ui-scans/
 
 # Tooling / OS
 .pytest_cache/

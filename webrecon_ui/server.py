@@ -66,6 +66,14 @@ MAX_BODY = 64 * 1024
 _SCANS: "OrderedDict[str, object]" = OrderedDict()
 _SCANS_MAX = 16
 
+# When a scan is run with save_to_disk, its full servicescan-out tree is written
+# under _SAVE_BASE/<target-slug>-<timestamp>/ and the absolute path is remembered
+# here (scan_id -> abspath), bounded like _SCANS. The *web* never supplies this
+# path -- the server derives it from _SAVE_BASE (set only via --save-dir), so a
+# request can never steer a write (or a later reveal) outside that base.
+_SCAN_DIRS: "OrderedDict[str, str]" = OrderedDict()
+_SAVE_BASE = "webrecon-ui-scans"
+
 # Downloadable formats: fmt token -> (write_all output filename, content-type).
 # The filename is from this fixed table, never from the request, so the export
 # path can only ever read a known servicescan output -- no traversal.
@@ -90,6 +98,42 @@ def _cache_scan(result) -> str:
     while len(_SCANS) > _SCANS_MAX:
         _SCANS.popitem(last=False)
     return sid
+
+
+def scan_dir_for(target: str) -> str:
+    """Server-chosen output dir for a saved scan: _SAVE_BASE/<slug>-<timestamp>.
+
+    The path is derived entirely from _SAVE_BASE plus a sanitised target slug and
+    a timestamp -- never from the request -- so a scan can never write outside the
+    configured base, and the dir the reveal endpoint later opens is one we chose.
+    """
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return os.path.join(_SAVE_BASE, f"{_safe_slug(target)}-{stamp}")
+
+
+def _record_scan_dir(scan_id: str, path: str) -> str:
+    """Remember the absolute dir written for a scan_id; evict oldest past the cap."""
+    ap = os.path.abspath(path)
+    _SCAN_DIRS[scan_id] = ap
+    while len(_SCAN_DIRS) > _SCANS_MAX:
+        _SCAN_DIRS.popitem(last=False)
+    return ap
+
+
+def persist_scan(result, scan_id: str, scan_dir: str) -> dict:
+    """write_all the result into scan_dir, remember it, return an outdir payload.
+
+    Reuses report.write_all (every servicescan writer) exactly as the CLI does, so
+    the on-disk tree is identical. When the --web chain ran, its crawl output is
+    already under this same dir (the server pointed cfg.outdir here before the
+    scan), so the folder holds both the crawl artifacts and the main outputs.
+    """
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            report.write_all(scan_dir, result, kev_high_only=False)
+        return {"outdir": _record_scan_dir(scan_id, scan_dir)}
+    except Exception as e:  # noqa: BLE001
+        return {"outdir_error": str(e)}
 
 
 def render_export(result, fmt: str) -> bytes | None:
@@ -409,6 +453,14 @@ class Handler(BaseHTTPRequestHandler):
             self._error(400, str(e))
             return
 
+        # save_to_disk: server-chosen dir, set BEFORE the scan so the --web chain
+        # writes there too; the main outputs are written after (see persist_scan).
+        save = _as_bool(payload.get("save_to_disk", False))
+        scan_dir = None
+        if save and self.path == "/api/scan":
+            scan_dir = scan_dir_for(cfg.target)
+            cfg.outdir = scan_dir
+
         try:
             result = run_scan(cfg)
         except Exception as e:  # noqa: BLE001
@@ -419,7 +471,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, formats.build_sarif(result))
         else:
             body = result.to_dict()
-            body["scan_id"] = _cache_scan(result)   # for the export endpoints
+            sid = _cache_scan(result)                # for the export endpoints
+            body["scan_id"] = sid
+            if scan_dir is not None:
+                body.update(persist_scan(result, sid, scan_dir))
             self._send_json(200, body)
 
     def _handle_stream(self, query: str) -> None:
@@ -439,13 +494,23 @@ class Handler(BaseHTTPRequestHandler):
             self._error(400, str(e))
             return
 
+        save = _as_bool(params.get("save_to_disk", False))
+        scan_dir = None
+        if save:
+            scan_dir = scan_dir_for(cfg.target)   # web chain writes here too
+            cfg.outdir = scan_dir
+
         events: "queue.Queue" = queue.Queue()
 
         def worker():
             try:
                 result = run_scan(cfg, on_event=events.put)
-                events.put({"type": "done", "scan_id": _cache_scan(result),
-                            "nmap_used": result.nmap_used, "errors": result.errors})
+                sid = _cache_scan(result)
+                done = {"type": "done", "scan_id": sid,
+                        "nmap_used": result.nmap_used, "errors": result.errors}
+                if scan_dir is not None:
+                    done.update(persist_scan(result, sid, scan_dir))
+                events.put(done)
             except Exception as e:  # noqa: BLE001
                 events.put({"type": "error", "error": str(e)})
             finally:
@@ -480,6 +545,7 @@ def make_server(host: str = "127.0.0.1", port: int = 8787) -> ThreadingHTTPServe
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
+    global _SAVE_BASE
 
     p = argparse.ArgumentParser(
         prog="webrecon-ui",
@@ -487,7 +553,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--host", default="127.0.0.1",
                    help="bind address (default 127.0.0.1; do NOT expose publicly)")
     p.add_argument("--port", type=int, default=8787, help="bind port (default 8787)")
+    p.add_argument("--save-dir", default=_SAVE_BASE, metavar="DIR",
+                   help="base dir for 'save to disk' scans "
+                        f"(default {_SAVE_BASE!r}; each scan lands in a "
+                        "<target>-<timestamp> subdir)")
     a = p.parse_args(argv)
+    _SAVE_BASE = a.save_dir
 
     httpd = make_server(a.host, a.port)
     if a.host not in ("127.0.0.1", "::1", "localhost"):
