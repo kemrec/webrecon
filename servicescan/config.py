@@ -80,6 +80,10 @@ class ScanConfig:
                                           # the crawl stops gracefully and returns
                                           # partial results.
     write_hosts: bool = False             # append harvested cert SANs to /etc/hosts
+    # opt-in: in the web chain, try a tiny known-default credential set against
+    # detected admin panels (Tomcat / Grafana / phpMyAdmin). OFF by default --
+    # it sends login requests and can trip account lockouts.
+    try_default_creds: bool = False
 
     # output
     outdir: str = "servicescan-out"

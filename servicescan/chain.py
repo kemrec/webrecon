@@ -202,6 +202,8 @@ async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
         # final trufflehog filesystem sweep can mine them for secrets; the
         # per-port outdir already encodes the IP:port provenance.
         wcfg.save_js = True
+        # opt-in default-credential check, propagated from the scan config
+        wcfg.try_default_creds = getattr(cfg, "try_default_creds", False)
         # pivot on cert SANs, not public CT logs: skip crt.sh, keep vhost fuzz
         wcfg.do_subdomains = False
         wcfg.scope_hosts = {seed_host} | ({ip} if ip else set()) | extra
@@ -242,6 +244,7 @@ async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
         _params = data.get("params", {}) or {}
         _endpoints = data.get("endpoints", []) or []
         _exposures = data.get("sensitive_paths", []) or []
+        _dcreds = data.get("default_creds", []) or []
         svc.web = {
             "url": url,
             "scheme": scheme,
@@ -268,6 +271,9 @@ async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
             # unauth datastores, dir-listing, ...). Full list in exposures.txt.
             "exposures": len(_exposures),
             "exposure_list": _exposures[:_WEB_SAMPLE],
+            # confirmed default-credential logins (opt-in --try-default-creds)
+            "default_creds": len(_dcreds),
+            "default_cred_list": _dcreds[:_WEB_SAMPLE],
         }
         nv = len(svc.web["vhosts"])
         if nv:
@@ -277,3 +283,6 @@ async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
             eh = sum(1 for e in _exposures if e.get("severity") == "high")
             utils.hit(f":{svc.port} web chain confirmed {ne} exposure(s)"
                       f"{f' ({eh} high)' if eh else ''} on {ip or seed_host}")
+        if _dcreds:
+            utils.hit(f":{svc.port} web chain: {len(_dcreds)} panel(s) accept "
+                      f"default credentials on {ip or seed_host}")

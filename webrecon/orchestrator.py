@@ -48,6 +48,20 @@ async def run(cfg: Config, control=None) -> dict:
             except Exception as e:  # noqa: BLE001
                 utils.warn(f"sensitive-path probe failed ({e}); continuing")
 
+        # ---- phase 1c: default-credential check (opt-in, OFF by default) ----
+        default_creds: list = []
+        if getattr(cfg, "try_default_creds", False):
+            utils.info("phase 1c: default-credential check (opt-in)")
+            try:
+                from . import defaultcreds
+                default_creds = await defaultcreds.try_default_creds(
+                    http, cfg.target, tech=agg.tech, cfg=cfg)
+                if default_creds:
+                    utils.good(f"default-cred check: {len(default_creds)} "
+                               f"panel(s) accept a default login")
+            except Exception as e:  # noqa: BLE001
+                utils.warn(f"default-cred check failed ({e}); continuing")
+
         # ---- phase 2: discovery ----
         disco = None
         want_disco = cfg.do_subdomains or cfg.do_vhost
@@ -172,6 +186,7 @@ async def run(cfg: Config, control=None) -> dict:
             "forms": in_forms,
             "openapi": openapi_specs,
             "sensitive_paths": sensitive_paths,
+            "default_creds": default_creds,
         }
         return data
     finally:

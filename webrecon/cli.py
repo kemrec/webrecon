@@ -75,6 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
     dsc = p.add_argument_group("discovery")
     dsc.add_argument("--subdomain-wordlist", default=None)
     dsc.add_argument("--vhost-wordlist", default=None)
+    dsc.add_argument("--try-default-creds", action="store_true",
+                     help="OPT-IN: try a tiny known-default credential set "
+                          "against detected admin panels (Tomcat / Grafana / "
+                          "phpMyAdmin). One short default pass per panel, no "
+                          "brute-force. Sends login requests -- off by default "
+                          "(lockout risk).")
     dsc.add_argument("--aggressive", action="store_true",
                      help="secrets: also flag secret-shaped high-entropy strings "
                           "whose variable name isn't a known keyword (gitleaks "
@@ -134,6 +140,7 @@ def cfg_from_args(a: argparse.Namespace) -> Config:
                          else {"image", "media", "font"}),
         max_js_bytes=a.max_js_bytes,
         secrets_aggressive=a.aggressive,
+        try_default_creds=a.try_default_creds,
         include_subdomains=not a.no_subs_scope,
         concurrency=a.concurrency,
         timeout=a.timeout,

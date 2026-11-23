@@ -74,6 +74,12 @@ def write_all(outdir: str, data: dict) -> None:
            [f"[{e['severity'].upper()}] {e['title']}\t{e['url']}\t{e.get('evidence','')}"
             for e in exposures])
 
+    dcreds = data.get("default_creds", []) or []
+    if dcreds:
+        _w(os.path.join(outdir, "default-creds.txt"),
+           [f"[CRITICAL] {d['panel']}\t{d['url']}\t{d['username']}:{d['password']}"
+            for d in dcreds])
+
     specs = data.get("openapi", [])
     if specs:
         olines = [f"{s.get('url','')}\t{s.get('title','')} "
@@ -137,6 +143,15 @@ def console_summary(data: dict) -> None:
                 C.YEL if e["severity"] == "medium" else C.GRY)
             print(f"   {col}[{e['severity'][:1].upper()}]{C.R} {e['title']}  "
                   f"{C.GRY}{e['url']}{C.R}")
+        print()
+
+    dcreds = s.get("default_creds", []) or []
+    if dcreds:
+        print(f"{C.RED}{C.B}  Default credentials accepted:{C.R}")
+        for d in dcreds:
+            print(f"   {C.RED}[CRIT]{C.R} {d['panel']}  "
+                  f"{C.B}{d['username']}:{d['password']}{C.R}  "
+                  f"{C.GRY}{d['url']}{C.R}")
         print()
 
     if sec:

@@ -137,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
     wb.add_argument("--write-hosts", action="store_true",
                     help="append harvested cert SANs -> IP to /etc/hosts "
                          "(needs root; for use by other tools)")
+    wb.add_argument("--try-default-creds", action="store_true",
+                    help="OPT-IN: in the web chain, try a tiny known-default "
+                         "credential set against detected admin panels "
+                         "(Tomcat / Grafana / phpMyAdmin). Sends login requests "
+                         "-- off by default (lockout risk).")
 
     net = p.add_argument_group("network")
     net.add_argument("-c", "--concurrency", type=int, default=50)
@@ -207,6 +212,7 @@ def cfg_from_args(a: argparse.Namespace) -> ScanConfig:
         web_time_budget=(a.web_time_budget if a.web_time_budget is not None
                          else (600.0 if a.full else 300.0)),
         write_hosts=a.write_hosts,
+        try_default_creds=a.try_default_creds,
         concurrency=a.concurrency,
         timeout=a.timeout,
         realm=a.realm,

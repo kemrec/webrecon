@@ -40,6 +40,7 @@ This repo ships **two CLIs and a browser console**, all sharing one async core:
 | **Subdomain enumeration** | Passive enum via crt.sh (Certificate Transparency) + optional wordlist. |
 | **Cert → vhost discovery** | Reads `subjectAltName` DNS names from the target's TLS certificate, then fuzzes the `Host:` header against the shared IP to surface hidden virtual hosts (baseline-divergence detection). |
 | **Sensitive-path probe** | Content-verified checklist run per web port: exposed VCS dirs (`.git` / `.svn` / `.hg`), Spring Boot Actuator (`/actuator`, `/env`, `/mappings`, and heapdump — confirmed via the link index, never downloaded), secrets-in-files (`.env`, `.htpasswd`, `web.config`, `.DS_Store`), status/debug surfaces (Apache `server-status`, Go `pprof`, Prometheus `metrics`), unauthenticated datastore HTTP (Elasticsearch / CouchDB / Kibana), and directory listings. Every hit is gated on a response-body signature — never a bare 200 — so soft-404s and SPA shells don't produce false positives. Written to `exposures.txt`. |
+| **Default-credential check** *(opt-in)* | `--try-default-creds`: detects exposed admin panels (Apache Tomcat Manager, Grafana, phpMyAdmin) and tries a tiny curated set of the vendor's default logins against each. A hit is content-verified (a post-login signature, never a bare 200), one short default pass per panel, no brute-force, capped to stay lockout-safe. **Off by default** — it sends login requests. Written to `default-creds.txt`. |
 | **Secret scanning** | 50+ provider rules (gitleaks / truffleHog family): AWS / Azure / GCP / DigitalOcean / Vault / GitHub / GitLab / Atlassian / Slack / Discord / Telegram / Twilio / SendGrid / Stripe / Square / PayPal / npm / PyPI / OpenAI / Anthropic / HuggingFace / Shopify / Datadog / New Relic / Postman / Databricks / Notion / Grafana / Mapbox / Dropbox keys, JWTs, private-key blocks, DB connection strings, basic-auth-in-URL, and generic `password=/token=/secret=/apikey=/username=` assignments — with entropy + placeholder filtering. `--aggressive` adds an opt-in entropy sweep for secret-shaped strings under unrecognised key names (gitleaks `generic-api-key`; noisier, rated low). Findings carry the full value (operator tool, not redacted), severity-tagged, with source + line. |
 | **Clean output** | Full `report.json` plus greppable `*.txt` lists, and a colored console summary. |
 
@@ -128,6 +129,7 @@ webrecon example.com -H "Cookie: sid=abc" -H "X-Api-Key: k" \
 | `--no-block-resources` | off | also load images/media/fonts (default: aborted) |
 | `--max-js-bytes` | `20000000` | skip parsing JS bundles bigger than this |
 | `--aggressive` | off | secrets: also flag secret-shaped high-entropy strings under unknown key names (noisier, all rated low) |
+| `--try-default-creds` | off | opt-in: try vendor default logins against detected admin panels (sends login requests; lockout-safe, no brute-force) |
 | `-c, --concurrency` | `40` | async concurrency |
 | `-t, --timeout` | `12` | per-request timeout (s) |
 | `-H, --header` | — | extra header, repeatable (`K:V`) |
@@ -190,6 +192,7 @@ single-directory behaviour). Files in each run directory:
 - `subdomains.txt`, `alive.txt`, `vhosts.txt`
 - `secrets.txt` — `[SEVERITY] type  value  source:line` (full value, not redacted)
 - `exposures.txt` — content-verified sensitive-path hits (`[SEVERITY] title<TAB>url<TAB>evidence`)
+- `default-creds.txt` — confirmed default logins, `--try-default-creds` only (`[CRITICAL] panel<TAB>url<TAB>user:pass`)
 - `tech.txt` — detected technologies (server, framework, CMS, JS libs)
 - `forms.txt` — `METHOD<TAB>action-url<TAB>field1,field2` for every HTML form
 - `openapi.txt` — any OpenAPI/Swagger spec found (`spec-url<TAB>title vN<TAB>N paths<TAB>N endpoints`); its routes also merge into `endpoints.txt` / `params.txt` / `urls.txt`

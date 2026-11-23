@@ -88,8 +88,15 @@ class HTTPClient:
 
     async def fetch(self, url: str, method: str = "GET",
                     headers: dict | None = None,
-                    read_body: bool = True) -> Response:
-        """Fetch a URL with retries; never raises — returns Response with error set."""
+                    read_body: bool = True,
+                    data: dict | None = None,
+                    json: dict | None = None,
+                    auth: tuple[str, str] | None = None) -> Response:
+        """Fetch a URL with retries; never raises — returns Response with error set.
+
+        `data` / `json` send a form-encoded / JSON body (for login POSTs); `auth`
+        sends HTTP Basic credentials. The shared client keeps a cookie jar across
+        calls, so a GET-then-POST login flow carries its session cookie."""
         last_err = "unknown"
         for attempt in range(self.cfg.retries + 1):
             async with self._sem:
@@ -98,7 +105,8 @@ class HTTPClient:
                     # (non-streaming), so wrapping this bounds a trickled body
                     # that the per-read timeout alone would let hang forever.
                     r = await asyncio.wait_for(
-                        self._client.request(method, url, headers=headers),
+                        self._client.request(method, url, headers=headers,
+                                             data=data, json=json, auth=auth),
                         timeout=self._hard_timeout)
                     body = ""
                     if read_body:
