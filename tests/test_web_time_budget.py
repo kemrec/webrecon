@@ -43,7 +43,7 @@ def test_cli_explicit_overrides_full():
 def test_chain_passes_budget_to_webconfig(monkeypatch, tmp_path):
     seen = {}
 
-    async def fake_run(wcfg):
+    async def fake_run(wcfg, control=None):
         seen["time_budget"] = wcfg.time_budget
         return {"pages": {}, "urls": [], "endpoints": [], "params": {},
                 "secrets": [], "vhosts": [], "subdomains": [], "tech": [],

@@ -12,6 +12,7 @@ from .models import ScanResult, Service, Host
 from . import nmap_engine, fingerprint, cve, targets
 from webrecon import utils
 from webrecon.config import Config as WebConfig
+from webrecon.control import ScanStopped
 from webrecon.http_client import HTTPClient
 
 
@@ -24,7 +25,7 @@ def _is_ip(token: str) -> bool:
         return False
 
 
-async def run(cfg: ScanConfig, on_event=None) -> ScanResult:
+async def run(cfg: ScanConfig, on_event=None, control=None) -> ScanResult:
     """Run the scan pipeline and return a ScanResult.
 
     `on_event`, if given, is a plain callable invoked with small JSON-able dicts
@@ -44,6 +45,12 @@ async def run(cfg: ScanConfig, on_event=None) -> ScanResult:
                 on_event(ev)
             except Exception:  # noqa: BLE001
                 pass
+
+    async def _ckpt():
+        # cooperative pause/stop boundary; a stop raises ScanStopped (caught
+        # below) so the scan returns the partial result it has so far.
+        if control is not None:
+            await control.checkpoint()
 
     tokens = cfg.targets or ([cfg.target] if cfg.target else [])
     result = ScanResult(target=cfg.target or " ".join(tokens))
@@ -76,10 +83,12 @@ async def run(cfg: ScanConfig, on_event=None) -> ScanResult:
                         concurrency=cfg.concurrency, timeout=cfg.timeout,
                         verify_tls=False)
     http = HTTPClient(web_cfg)
+    stopped = False
     try:
         for h in hosts:
             if not h.services:
                 continue
+            await _ckpt()                 # pause/stop boundary (between hosts)
             conn_host = h.ip or h.hostname
             if nhosts > 1:
                 utils.info(f"host {h.label()}: {len(h.services)} open service(s)")
@@ -97,6 +106,7 @@ async def run(cfg: ScanConfig, on_event=None) -> ScanResult:
                 _emit({"type": "phase", "phase": "render", "host": label})
                 await fingerprint.run_render_catalog(cfg, conn_host, h.services)
             if cfg.cve:
+                await _ckpt()             # pause/stop before the long CVE step
                 _emit({"type": "phase", "phase": "cve", "host": label})
                 utils.info(f"correlating CVEs (NVD / OSV) for {h.label()}")
                 await cve.correlate(cfg, http, h.services)
@@ -105,21 +115,29 @@ async def run(cfg: ScanConfig, on_event=None) -> ScanResult:
                 # services carrying that CVE).
                 await cve.refine_ftp_alpaca(cfg, conn_host, h.services)
             _emit({"type": "host", "host": h.to_dict()})
+    except ScanStopped:
+        stopped = True
     finally:
         await http.close()
 
     # ---- optional phase 4: web chain (hand web ports to webrecon) ----
-    if cfg.web:
+    if cfg.web and not stopped:
         from . import chain
         _emit({"type": "phase", "phase": "web"})
         utils.info("web chain: handing discovered web ports to webrecon")
-        await chain.run_web_chain(cfg, result)
-        # the chain enriches services with a `web` summary AFTER the per-host
-        # events above were emitted, so push the enriched hosts once more for
-        # any live consumer to replace what it rendered.
-        _emit({"type": "update",
-               "hosts": [h.to_dict() for h in hosts if h.services]})
+        try:
+            await chain.run_web_chain(cfg, result, control=control)
+            # the chain enriches services with a `web` summary AFTER the per-host
+            # events above were emitted, so push the enriched hosts once more for
+            # any live consumer to replace what it rendered.
+            _emit({"type": "update",
+                   "hosts": [h.to_dict() for h in hosts if h.services]})
+        except ScanStopped:
+            stopped = True
 
+    if stopped:
+        _emit({"type": "phase", "phase": "stopped"})
+        utils.warn("scan stopped by request; returning partial results")
     return result
 
 

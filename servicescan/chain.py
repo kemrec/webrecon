@@ -18,6 +18,7 @@ from .models import ScanResult, Service, Host
 from . import fingerprint
 from webrecon import utils
 from webrecon.config import Config as WebConfig
+from webrecon.control import ScanStopped
 from webrecon import orchestrator as web_orch, report as web_report
 
 
@@ -72,7 +73,7 @@ def _safe_seg(name: str) -> str:
     return "".join(c if (c.isalnum() or c in ".-") else "_" for c in name)
 
 
-async def run_web_chain(cfg: ScanConfig, result: ScanResult) -> None:
+async def run_web_chain(cfg: ScanConfig, result: ScanResult, control=None) -> None:
     web_hosts = [h for h in result.hosts
                  if any(s.state == "open" and _is_web(s) for s in h.services)]
     if not web_hosts:
@@ -82,7 +83,7 @@ async def run_web_chain(cfg: ScanConfig, result: ScanResult) -> None:
     all_urls: set[str] = set()
     all_params: dict[str, set[str]] = {}
     for h in web_hosts:
-        await _chain_host(cfg, h, multi, all_urls, all_params)
+        await _chain_host(cfg, h, multi, all_urls, all_params, control=control)
 
     # one consolidated, deduped URL list across every host/port -- both
     # parameterized and plain URLs -- ready to feed into Burp (Target -> Site
@@ -122,7 +123,8 @@ async def run_web_chain(cfg: ScanConfig, result: ScanResult) -> None:
 
 async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
                       all_urls: set[str] | None = None,
-                      all_params: dict[str, set[str]] | None = None) -> None:
+                      all_params: dict[str, set[str]] | None = None,
+                      control=None) -> None:
     ip = host.ip or ""
     # use the hostname form if we have one, else the IP.
     target_host = host.hostname or ip
@@ -167,6 +169,10 @@ async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
     host_seg = _safe_seg(ip or target_host)
 
     for svc in web_svcs:
+        # honour pause/stop between web ports (within a single port's crawl the
+        # crawler checks too); a stop raises ScanStopped up to the orchestrator.
+        if control is not None:
+            await control.checkpoint()
         tls = _is_tls(svc)
         scheme = "https" if tls else "http"
         url = f"{scheme}://{seed_host}:{svc.port}/"
@@ -197,7 +203,9 @@ async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
         wcfg.scope_hosts = {seed_host} | ({ip} if ip else set()) | extra
 
         try:
-            data = await web_orch.run(wcfg)
+            data = await web_orch.run(wcfg, control=control)
+        except ScanStopped:
+            raise                        # stop request: unwind to the orchestrator
         except Exception as e:  # noqa: BLE001
             utils.warn(f"web chain {url}: {type(e).__name__}: {e}")
             continue

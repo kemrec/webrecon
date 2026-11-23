@@ -81,7 +81,7 @@ def test_scan_dir_for_is_confined_and_timestamped(monkeypatch):
 def test_stream_done_event_carries_outdir(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_SAVE_BASE", str(tmp_path))
     monkeypatch.setattr(server, "run_scan",
-                        lambda cfg, on_event=None: _canned_result())
+                        lambda cfg, on_event=None, control=None: _canned_result())
     seen = {}
     with _running_server() as base:
         with httpx.stream("GET", base + "/api/scan/stream",

@@ -34,6 +34,9 @@
   button:hover { background:var(--accent); }
   button:disabled { opacity:.55; cursor:default; }
   button.ghost { background:transparent; border:1px solid var(--line); color:var(--fg); font-weight:500; }
+  button.ctl { background:transparent; border:1px solid var(--line); color:var(--fg); font-weight:500; }
+  button#stop-btn { border-color:#b4433a; color:#e06c62; }
+  button#stop-btn:hover { background:#b4433a; color:#fff; }
   button.ghost:hover { background:var(--panel2); }
   #status { color:var(--muted); font-size:13px; min-height:18px; }
   #status.err { color:var(--alert); }
@@ -192,6 +195,8 @@
       </div>
       <div class="row">
         <button type="submit" id="go">Scan</button>
+        <button type="button" id="pause-btn" class="ctl" hidden>Pause</button>
+        <button type="button" id="stop-btn" class="ctl" hidden>Stop</button>
         <span id="status"></span>
       </div>
     </form>
@@ -237,6 +242,8 @@ let ALERT_IDS = new Set();
 let scanId = null;
 let lastOutdir = null;  // abs path of the on-disk scan dir (when "save to disk" was on)
 let es = null;        // active EventSource (live scan stream)
+let controlId = null; // scan_id of the in-flight scan, for pause/resume/stop
+let scanPaused = false;
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, txt) => { const e = document.createElement(tag);
@@ -651,9 +658,60 @@ async function openFolder() {
   } catch (e) { note.textContent = "— " + e.message; }
 }
 
+// --- pause / resume / stop controls for a live scan -----------------------
+function showScanControls(on) {
+  const p = $("pause-btn"), s = $("stop-btn");
+  p.hidden = !on; s.hidden = !on;
+  p.disabled = false; s.disabled = false;
+  p.textContent = "Pause";
+  scanPaused = false;
+}
+
+async function sendScanControl(action) {
+  if (!controlId) return null;
+  try {
+    const r = await fetch("/api/scan/" + controlId + "/" + action, {
+      method: "POST",
+      headers: { "X-Requested-With": "webrecon-ui" },
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (_) { return null; }
+}
+
+async function togglePause() {
+  if (!controlId) return;
+  if (!scanPaused) {
+    const s = await sendScanControl("pause");
+    if (s && s.state === "paused") {
+      scanPaused = true;
+      $("pause-btn").textContent = "Resume";
+      setStatus("Paused — resume to continue, or stop for partial results.");
+    }
+  } else {
+    const s = await sendScanControl("resume");
+    if (s && s.state === "running") {
+      scanPaused = false;
+      $("pause-btn").textContent = "Pause";
+      setStatus("Resumed …");
+    }
+  }
+}
+
+async function stopScan() {
+  if (!controlId) return;
+  $("stop-btn").disabled = true;
+  $("pause-btn").disabled = true;
+  setStatus("Stopping … (finishing the current step, then returning partial results)");
+  // the scan ends on its own with a 'done' event carrying stopped=true
+  await sendScanControl("stop");
+}
+
 function endScan() {
   if (es) { es.close(); es = null; }
   $("go").disabled = false;
+  showScanControls(false);
+  controlId = null;
   clearProgress();
 }
 
@@ -670,6 +728,7 @@ function doScan(ev) {
   EXPANDED.clear(); COLLAPSED.clear();   // fresh expand/collapse state per scan
   lastOutdir = null; $("saved-row").hidden = true;   // clear prior save-to-disk path
   clearProgress();                                   // fresh live-phase panel
+  controlId = null; showScanControls(false);         // controls appear on 'accepted'
   const hosts = [];
   let expected = null;
   const t0 = Date.now();
@@ -678,7 +737,11 @@ function doScan(ev) {
   es = new EventSource("/api/scan/stream?" + buildQuery());
   es.onmessage = (e) => {
     let msg; try { msg = JSON.parse(e.data); } catch (_) { return; }
-    if (msg.type === "phase") {
+    if (msg.type === "accepted") {
+      // scan id handed out up front -> enable the pause/stop controls
+      controlId = msg.scan_id || null;
+      if (controlId) showScanControls(true);
+    } else if (msg.type === "phase") {
       pushPhase(phaseText(msg));
     } else if (msg.type === "start") {
       expected = msg.nhosts;
@@ -701,7 +764,9 @@ function doScan(ev) {
       if (!hosts.length) render({ hosts: [], errors: msg.errors });
       const secs = ((Date.now() - t0) / 1000).toFixed(1);
       const ns = hosts.reduce((n, h) => n + (h.services || []).length, 0);
-      setStatus(`Done in ${secs}s — ${ns} service(s) across ${hosts.length} host(s)${msg.nmap_used ? " (nmap)" : ""}.`);
+      const verb = msg.stopped ? "Stopped" : "Done";
+      const tail = msg.stopped ? " (partial — stopped by request)" : (msg.nmap_used ? " (nmap)" : "");
+      setStatus(`${verb} in ${secs}s — ${ns} service(s) across ${hosts.length} host(s)${tail}.`);
       setDownloadsState(scanId ? "ready" : "hidden");
       if (msg.outdir) {
         lastOutdir = msg.outdir;
@@ -726,6 +791,8 @@ function doScan(ev) {
 }
 
 $("scan-form").addEventListener("submit", doScan);
+$("pause-btn").addEventListener("click", togglePause);
+$("stop-btn").addEventListener("click", stopScan);
 $("dl-go").addEventListener("click", doExport);
 $("dl-all").addEventListener("click", doExportAll);
 $("copy-path").addEventListener("click", copyPath);

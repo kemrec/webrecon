@@ -42,7 +42,7 @@ def test_no_update_event_without_web_chain():
 def test_update_event_after_web_chain(monkeypatch):
     calls = {"n": 0}
 
-    async def stub_chain(cfg, result):
+    async def stub_chain(cfg, result, control=None):
         calls["n"] += 1          # chain ran; it would enrich svc.web here
 
     monkeypatch.setattr(chain, "run_web_chain", stub_chain)

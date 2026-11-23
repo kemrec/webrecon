@@ -53,6 +53,7 @@ from urllib.parse import parse_qs, urlparse
 from servicescan import formats, fingerprint, report
 from servicescan.config import ScanConfig
 from servicescan.orchestrator import run as _orchestrator_run
+from webrecon.control import ScanControl
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -79,6 +80,13 @@ _SCANS_MAX = 16
 _SCAN_DIRS: "OrderedDict[str, str]" = OrderedDict()
 _SAVE_BASE = "webrecon-ui-scans"
 
+# Live pause/stop handles for in-flight streaming scans (scan_id -> ScanControl).
+# A handle is registered when a /api/scan/stream scan starts and removed when it
+# finishes, so the pause/resume/stop endpoints can signal the running scan. The
+# scan cooperatively checks its control at phase boundaries (see ScanControl).
+_CONTROLS: "OrderedDict[str, ScanControl]" = OrderedDict()
+_CONTROLS_MAX = 16
+
 # Downloadable formats: fmt token -> (write_all output filename, content-type).
 # The filename is from this fixed table, never from the request, so the export
 # path can only ever read a known servicescan output -- no traversal.
@@ -96,13 +104,20 @@ _EXPORTS = {
 }
 
 
-def _cache_scan(result) -> str:
-    """Store a completed ScanResult under a fresh id; evict oldest past the cap."""
-    sid = uuid.uuid4().hex
+def _cache_scan(result, sid: str | None = None) -> str:
+    """Store a completed ScanResult under `sid` (or a fresh id); evict oldest."""
+    sid = sid or uuid.uuid4().hex
     _SCANS[sid] = result
     while len(_SCANS) > _SCANS_MAX:
         _SCANS.popitem(last=False)
     return sid
+
+
+def _register_control(sid: str, control: ScanControl) -> None:
+    """Remember a running scan's control handle; evict oldest past the cap."""
+    _CONTROLS[sid] = control
+    while len(_CONTROLS) > _CONTROLS_MAX:
+        _CONTROLS.popitem(last=False)
 
 
 def scan_dir_for(target: str) -> str:
@@ -345,14 +360,15 @@ def build_config(payload: dict) -> ScanConfig:
     return cfg
 
 
-def run_scan(cfg: ScanConfig, on_event=None):
+def run_scan(cfg: ScanConfig, on_event=None, control=None):
     """Run one scan to completion and return the ScanResult.
 
-    `on_event` is forwarded to the orchestrator for live-streaming milestones.
-    Module-level so tests can monkeypatch it (webrecon_ui.server.run_scan) to
-    avoid any real network activity.
+    `on_event` is forwarded to the orchestrator for live-streaming milestones;
+    `control` (a ScanControl) lets a streaming scan be paused / resumed /
+    stopped cooperatively. Module-level so tests can monkeypatch it
+    (webrecon_ui.server.run_scan) to avoid any real network activity.
     """
-    return asyncio.run(_orchestrator_run(cfg, on_event=on_event))
+    return asyncio.run(_orchestrator_run(cfg, on_event=on_event, control=control))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -523,9 +539,35 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"ok": True, "path": path})
 
+    def _handle_scan_control(self, sid: str, action: str) -> None:
+        """Pause / resume / stop a running streaming scan.
+
+        The scan cooperatively honours the signal at its next phase boundary, so
+        it never cancels a task mid-flight (no crash, no half-written output).
+        Guarded by the same loopback CSRF check as /api/reveal.
+        """
+        if not self._reveal_allowed():
+            self._error(403, "forbidden")
+            return
+        control = _CONTROLS.get(sid)
+        if control is None:
+            self._error(404, "no running scan for this id")
+            return
+        if action == "pause":
+            control.pause()
+        elif action == "resume":
+            control.resume()
+        else:                       # "stop"
+            control.stop()
+        self._send_json(200, {"ok": True, "scan_id": sid, "state": control.state()})
+
     def do_POST(self):  # noqa: N802
         if self.path == "/api/reveal":
             self._handle_reveal()
+            return
+        m = re.match(r"^/api/scan/([0-9a-f]{8,64})/(pause|resume|stop)$", self.path)
+        if m:
+            self._handle_scan_control(m.group(1), m.group(2))
             return
         if self.path not in ("/api/scan", "/api/scan.sarif"):
             self._error(404, "not found")
@@ -585,12 +627,19 @@ class Handler(BaseHTTPRequestHandler):
             cfg.outdir = scan_dir
 
         events: "queue.Queue" = queue.Queue()
+        # Mint the scan id and its pause/stop handle up front so the client can
+        # address this run (pause / resume / stop) before any results arrive.
+        sid = uuid.uuid4().hex
+        control = ScanControl()
+        _register_control(sid, control)
+        events.put({"type": "accepted", "scan_id": sid})
 
         def worker():
             try:
-                result = run_scan(cfg, on_event=events.put)
-                sid = _cache_scan(result)
+                result = run_scan(cfg, on_event=events.put, control=control)
+                _cache_scan(result, sid)       # for the export endpoints
                 done = {"type": "done", "scan_id": sid,
+                        "stopped": control.stopped,
                         "nmap_used": result.nmap_used, "errors": result.errors}
                 if scan_dir is not None:
                     done.update(persist_scan(result, sid, scan_dir))
@@ -598,6 +647,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 events.put({"type": "error", "error": str(e)})
             finally:
+                _CONTROLS.pop(sid, None)       # scan over; drop the handle
                 events.put(None)       # sentinel: no more events
 
         threading.Thread(target=worker, daemon=True).start()

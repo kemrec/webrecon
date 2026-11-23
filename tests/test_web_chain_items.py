@@ -37,7 +37,7 @@ def _canned(n_eps=80, n_params=70, n_secrets=3):
 
 
 def test_svc_web_carries_bounded_item_samples(monkeypatch, tmp_path):
-    async def fake_run(wcfg):
+    async def fake_run(wcfg, control=None):
         return _canned()
     monkeypatch.setattr(web_orch, "run", fake_run)
     monkeypatch.setattr(web_report, "write_all", lambda outdir, data: None)
@@ -64,7 +64,7 @@ def test_svc_web_carries_bounded_item_samples(monkeypatch, tmp_path):
 
 
 def test_secret_sample_is_bounded(monkeypatch, tmp_path):
-    async def fake_run(wcfg):
+    async def fake_run(wcfg, control=None):
         return _canned(n_eps=1, n_params=0, n_secrets=200)
     monkeypatch.setattr(web_orch, "run", fake_run)
     monkeypatch.setattr(web_report, "write_all", lambda outdir, data: None)

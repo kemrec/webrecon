@@ -24,7 +24,7 @@ This repo ships **two CLIs and a browser console**, all sharing one async core:
 |------|---------|
 | **`webrecon`** | web app crawler & recon (crawl + JS + params + alive + subdomains + vhost + secrets) |
 | **`servicescan`** | port/service/version discovery (nmap + own fingerprint layer) with NVD/OSV CVE correlation |
-| **`webrecon-ui`** | browser-based operator console for `servicescan` (localhost; `python -m webrecon_ui`) — live SSE scan with per-phase progress, CVE/exposure highlighting, the `--web` crawl chain, every output format as a download |
+| **`webrecon-ui`** | browser-based operator console for `servicescan` (localhost; `python -m webrecon_ui`) — live SSE scan with per-phase progress and pause / resume / stop, CVE/exposure highlighting, the `--web` crawl chain, every output format as a download |
 
 ---
 
@@ -820,10 +820,18 @@ API:
   alerts (vs informational), for the page's exposure highlighting
 - `POST /api/scan` → `scan.json`-shaped result plus a `scan_id`
 - `GET  /api/scan/stream?<opts>` → a **Server-Sent Events** stream of scan
-  milestones (`start` with the host count, a `host` event as each host's
-  fingerprint/exposure/CVE work finishes, a final `done` carrying the
-  `scan_id`). Config comes from the query string, through the same allowlist.
-  The page uses this so hosts render live instead of all at once at the end.
+  milestones (an `accepted` event with the `scan_id` up front, `start` with the
+  host count, a `host` event as each host's fingerprint/exposure/CVE work
+  finishes, a final `done` carrying the `scan_id` and a `stopped` flag). Config
+  comes from the query string, through the same allowlist. The page uses this so
+  hosts render live instead of all at once at the end.
+- `POST /api/scan/<scan_id>/{pause,resume,stop}` → **pause / resume / stop** the
+  running streamed scan (the console's Pause / Stop buttons). The scan honours
+  the signal cooperatively at phase boundaries — between hosts, before the long
+  CVE step, before the web chain, and inside the crawl loop — so it never
+  cancels a task mid-flight: a stop returns the partial results gathered so far
+  (no crash, no half-written output). Guarded by the same loopback CSRF check as
+  `/api/reveal` (`X-Requested-With` + loopback `Origin`).
 - `POST /api/scan.sarif` → SARIF 2.1.0 document (same as `scan.sarif`)
 - `GET  /api/export/<scan_id>/<fmt>` → one output file for that scan, as a
   download. `<fmt>` is one of `json`, `sarif`, `services-csv`, `cves-csv`,

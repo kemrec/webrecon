@@ -52,7 +52,7 @@ def _read_stream(base, qs, timeout=10):
 def test_stream_emits_start_host_done(monkeypatch):
     captured = {}
 
-    def fake(cfg, on_event=None):
+    def fake(cfg, on_event=None, control=None):
         captured["cfg"] = cfg
         if on_event:
             on_event({"type": "start", "nhosts": 1})
@@ -64,18 +64,21 @@ def test_stream_emits_start_host_done(monkeypatch):
         events = _read_stream(base, "target=10.0.0.5&fp_all=true")
 
     types = [e["type"] for e in events]
-    assert types == ["start", "host", "done"]
-    assert events[0]["nhosts"] == 1
-    assert events[1]["host"]["services"][0]["port"] == 445
-    assert events[2]["scan_id"]
-    assert events[2]["nmap_used"] is True
+    # the server hands out the scan id up front (for the pause/stop controls)
+    # before the scan's own milestones.
+    assert types == ["accepted", "start", "host", "done"]
+    assert events[0]["scan_id"]
+    assert events[1]["nhosts"] == 1
+    assert events[2]["host"]["services"][0]["port"] == 445
+    assert events[-1]["scan_id"] == events[0]["scan_id"]   # same id at done
+    assert events[-1]["nmap_used"] is True
     # query-string config flowed through the same allowlist as POST
     assert captured["cfg"].fp_all is True
     assert captured["cfg"].targets == ["10.0.0.5"]
 
 
 def test_stream_done_scan_id_is_exportable(monkeypatch):
-    def fake(cfg, on_event=None):
+    def fake(cfg, on_event=None, control=None):
         if on_event:
             on_event({"type": "host", "host": _host_dict()})
         svc = Service(port=445, proto="tcp", state="open", name="microsoft-ds")
@@ -93,7 +96,7 @@ def test_stream_done_scan_id_is_exportable(monkeypatch):
 
 
 def test_stream_scan_error_emits_error_event(monkeypatch):
-    def boom(cfg, on_event=None):
+    def boom(cfg, on_event=None, control=None):
         raise RuntimeError("engine exploded")
 
     monkeypatch.setattr(server, "run_scan", boom)

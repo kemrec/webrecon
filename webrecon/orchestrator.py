@@ -15,7 +15,7 @@ from .crawler import Crawler, CrawlResult
 from . import discovery, alive, utils
 
 
-async def run(cfg: Config) -> dict:
+async def run(cfg: Config, control=None) -> dict:
     primary_host = utils.host_of(cfg.target)
     if not cfg.scope_hosts:
         cfg.scope_hosts = {primary_host}
@@ -26,7 +26,7 @@ async def run(cfg: Config) -> dict:
         # ---- phase 1: primary crawl ----
         if cfg.do_crawl:
             utils.info(f"phase 1: crawling {cfg.target} (depth={cfg.depth})")
-            async with Crawler(cfg, http) as crawler:
+            async with Crawler(cfg, http, control=control) as crawler:
                 r1 = await crawler.run([cfg.target])
             _merge(agg, r1)
 
@@ -64,7 +64,7 @@ async def run(cfg: Config) -> dict:
             seeds = [f"{scheme}://{utils.with_port(h, tgt_port)}/" for h in new_hosts]
             sub_cfg = _shallow(cfg)
             sub_cfg.scope_hosts = cfg.scope_hosts | new_hosts
-            async with Crawler(sub_cfg, http) as c2:
+            async with Crawler(sub_cfg, http, control=control) as c2:
                 r3 = await c2.run(seeds)
             _merge(agg, r3)
 

@@ -89,7 +89,7 @@ def test_render_and_web_phases_only_when_enabled(monkeypatch):
     host = _host()
     _stub_engine(monkeypatch, host)
 
-    async def _achain(cfg, result):
+    async def _achain(cfg, result, control=None):
         return None
     monkeypatch.setattr(chain_mod, "run_web_chain", _achain)
 
@@ -142,7 +142,7 @@ def _read_stream(base, qs, timeout=10):
 
 
 def test_sse_relays_phase_ticks_verbatim(monkeypatch):
-    def fake(cfg, on_event=None):
+    def fake(cfg, on_event=None, control=None):
         if on_event:
             on_event({"type": "phase", "phase": "nmap"})
             on_event({"type": "start", "nhosts": 1})
@@ -155,9 +155,10 @@ def test_sse_relays_phase_ticks_verbatim(monkeypatch):
         events = _read_stream(base, "target=10.0.0.5")
 
     types = [e["type"] for e in events]
-    assert types == ["phase", "start", "phase", "host", "done"]
-    assert events[0]["phase"] == "nmap"
-    assert events[2]["phase"] == "cve" and events[2]["host"] == "10.0.0.5"
+    # 'accepted' (scan id up front) precedes the scan's own ticks
+    assert types == ["accepted", "phase", "start", "phase", "host", "done"]
+    assert events[1]["phase"] == "nmap"
+    assert events[3]["phase"] == "cve" and events[3]["host"] == "10.0.0.5"
 
 
 # --- frontend wiring ------------------------------------------------------

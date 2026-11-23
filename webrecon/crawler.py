@@ -54,9 +54,10 @@ class CrawlResult:
 
 
 class Crawler:
-    def __init__(self, cfg: Config, http: HTTPClient):
+    def __init__(self, cfg: Config, http: HTTPClient, control=None):
         self.cfg = cfg
         self.http = http
+        self.control = control            # optional ScanControl (pause/stop)
         self.result = CrawlResult()
         self._browser = None
         self._pw = None
@@ -319,6 +320,17 @@ class Crawler:
         async def worker():
             nonlocal budget_hit
             while True:
+                # cooperative pause/stop at the loop boundary (never mid-page):
+                # a stop ends this worker gracefully (partial crawl result, like
+                # the budget); a pause holds here until resumed or stopped.
+                ctl = self.control
+                if ctl is not None:
+                    if ctl.stopped:
+                        return
+                    while ctl.paused:
+                        await asyncio.sleep(0.15)
+                        if ctl.stopped:
+                            return
                 # check the budget at the loop boundary (never mid-page) so a
                 # stopping worker holds no queue item and overshoots by at most
                 # one in-flight page (bounded by page_timeout).
