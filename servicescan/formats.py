@@ -76,6 +76,7 @@ table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:7px 10px;border-bottom:1px solid #23272f;vertical-align:top}
 th{color:#9aa0a6;font-weight:600;font-size:12px}
 .svc{font-weight:600;color:#7fd1ff}
+.svc .stitle{display:block;color:#9aa0a6;font-weight:400;font-size:12px}
 .badge{display:inline-block;padding:1px 6px;border-radius:5px;font-size:11px;font-weight:700;margin-left:4px}
 .kev{background:#b11;color:#fff}.exp{background:#a60;color:#fff}
 .crit{color:#ff6b6b;font-weight:700}.high{color:#ff9f43}.med{color:#ffd93d}.low{color:#9aa0a6}
@@ -130,14 +131,19 @@ def write_html(outdir: str, result) -> None:
                      "<th>CVSS</th><th>EPSS</th><th>flags</th><th>summary</th></tr>")
         for s in h.services:
             ident = e(s.ident())
+            # the fingerprinted HTTP page <title>, shown under the service name
+            title = (s.http or {}).get("title", "")
+            svc_cell = (f"<td class='svc'>{e(s.name)}"
+                        + (f"<span class='stitle'>{e(title)}</span>" if title else "")
+                        + "</td>")
             if not s.cves:
                 parts.append(f"<tr><td class='mono'>{s.port}/{s.proto}</td>"
-                             f"<td class='svc'>{e(s.name)}</td><td colspan='5'>"
+                             f"{svc_cell}<td colspan='5'>"
                              f"{ident}</td></tr>")
                 continue
             for i, c in enumerate(s.cves):
                 portcell = (f"<td class='mono'>{s.port}/{s.proto}</td>"
-                            f"<td class='svc'>{e(s.name)}</td>") if i == 0 else \
+                            f"{svc_cell}") if i == 0 else \
                            "<td></td><td></td>"
                 cls = _sev_class(c.disp_severity(), c.disp_cvss())
                 score = "" if c.cvss is None else f"{c.cvss:.1f}"

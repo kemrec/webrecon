@@ -38,3 +38,12 @@ def test_jsonl_carries_http_title_scripts_and_extrainfo():
     assert row["extrainfo"] == "UNAUTHENTICATED"
     assert row["scripts"][0]["id"] == "minio-auth"
     assert row["cves"][0]["id"] == "CVE-2000-0001"
+
+
+def test_html_shows_page_title():
+    d = tempfile.mkdtemp()
+    formats.write_html(d, _result())
+    with open(os.path.join(d, "report.html"), encoding="utf-8") as fh:
+        doc = fh.read()
+    assert "MinIO Console" in doc
+    assert "stitle" in doc          # rendered via the dedicated title span
