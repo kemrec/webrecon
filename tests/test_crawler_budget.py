@@ -86,3 +86,23 @@ def test_budget_run_returns_not_hangs(monkeypatch):
     result = asyncio.run(asyncio.wait_for(cr.run(["http://x/"]), timeout=10))
     assert isinstance(result.pages, dict)
     assert len(result.pages) < cfg.max_pages
+
+
+class _HangHTTP:
+    """Every fetch hangs forever -- models a server that never finishes sending
+    the body, which (before the per-page hard cap) wedged a worker off the
+    budget-check boundary and hung the whole crawl indefinitely."""
+
+    async def fetch(self, url, *a, **k):
+        await asyncio.sleep(1e9)
+
+
+def test_wedged_page_does_not_hang_the_crawl():
+    # real clock here (the per-page wait_for uses wall time, not the module
+    # clock): a tiny page_hard_timeout must abandon the stuck page so run()
+    # returns instead of hanging forever.
+    cfg = _cfg(time_budget=0.5, max_pages=40, page_hard_timeout=0.2,
+               concurrency=2)
+    cr = Crawler(cfg, _HangHTTP())
+    result = asyncio.run(asyncio.wait_for(cr.run(["http://x/"]), timeout=10))
+    assert isinstance(result.pages, dict)

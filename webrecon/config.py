@@ -31,6 +31,14 @@ class Config:
     # the crawl for many minutes. Set to 0 (or None) for no limit, in which case
     # only max_pages/depth/per-request timeout bound the crawl.
     time_budget: float | None = 300.0
+    # hard per-page cap (seconds). time_budget is only observed at the worker
+    # loop boundary, so a single page wedged mid-fetch (e.g. a server that
+    # trickles the body slower than the per-read timeout, which bounds the gap
+    # between reads, not the total) would keep a worker off the boundary forever
+    # and the budget would never fire. Each page is wrapped in asyncio.wait_for
+    # with this cap so a stuck page is abandoned and the worker returns to check
+    # the budget. None auto-sizes from page_timeout / (timeout * (retries+1)).
+    page_hard_timeout: float | None = None
     # resource throttling for render mode (keeps CPU/RAM bounded):
     render_workers: int = 3               # max concurrent browser tabs/contexts
     # resource types aborted during render — we only need DOM links + JS + the

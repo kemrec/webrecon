@@ -317,6 +317,13 @@ class Crawler:
         deadline = (_monotonic() + budget) if budget else None
         budget_hit = False
 
+        # hard per-page cap so a page wedged mid-fetch can't keep a worker off
+        # the budget check forever. Auto-size to comfortably exceed a legitimate
+        # slow page (render goto, or all fetch retries) when not set explicitly.
+        page_cap = self.cfg.page_hard_timeout or (
+            max(self.cfg.page_timeout / 1000.0,
+                self.cfg.timeout * (self.cfg.retries + 1)) + 20.0)
+
         async def worker():
             nonlocal budget_hit
             while True:
@@ -347,7 +354,14 @@ class Crawler:
                     visited.add(url)
                     progress.update(len(visited), self.cfg.max_pages, f"d{depth}")
                     utils.debug(f"crawl d{depth} [{len(visited)}/{self.cfg.max_pages}] {url}")
-                    await self._process_page(url, depth, queue, visited)
+                    # hard cap: a page that wedges (slow-trickle body, render
+                    # stall) is abandoned so the worker returns to the loop
+                    # boundary and the time budget can actually fire.
+                    await asyncio.wait_for(
+                        self._process_page(url, depth, queue, visited),
+                        timeout=page_cap)
+                except asyncio.TimeoutError:
+                    utils.debug(f"page hard-timeout ({page_cap:g}s), abandoned {url}")
                 except Exception as e:  # noqa: BLE001
                     utils.debug(f"page error {url}: {e}")
                 finally:
@@ -358,7 +372,22 @@ class Crawler:
                      if (self.cfg.render and self._browser)
                      else min(self.cfg.concurrency, 15))
         workers = [asyncio.create_task(worker()) for _ in range(n_workers)]
-        await asyncio.gather(*workers)
+        if deadline is not None:
+            # hard backstop: even if a worker wedges somewhere the per-page cap
+            # doesn't cover (e.g. browser context teardown), force-cancel once
+            # the budget plus one page_cap of grace is spent, so the crawl can
+            # never hang indefinitely past its budget.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*workers),
+                    timeout=max(0.0, deadline - _monotonic()) + page_cap + 5.0)
+            except asyncio.TimeoutError:
+                budget_hit = True
+                for w in workers:
+                    w.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+        else:
+            await asyncio.gather(*workers)
 
         progress.finish()
         if budget_hit:
