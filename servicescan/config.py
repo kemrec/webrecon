@@ -74,10 +74,11 @@ class ScanConfig:
     web_render: bool = False              # use Playwright JS rendering in the chain
     web_depth: int = 1                    # crawl depth per web port
     web_max_pages: int = 60               # page cap per web port
-    web_time_budget: float | None = None  # wall-clock cap (s) on each per-port
-                                          # crawl; None = no limit. --full sets
-                                          # 600. On a slow host the crawl stops
-                                          # gracefully and returns partial results.
+    web_time_budget: float | None = 300.0  # wall-clock cap (s) on each per-port
+                                          # crawl (default 300). --full sets 600;
+                                          # 0 / None = no limit. On a slow host
+                                          # the crawl stops gracefully and returns
+                                          # partial results.
     write_hosts: bool = False             # append harvested cert SANs to /etc/hosts
 
     # output

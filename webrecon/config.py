@@ -25,12 +25,12 @@ class Config:
     include_subdomains: bool = True       # subdomains count as in-scope
     wait_until: str = "networkidle"       # playwright nav wait state
     page_timeout: int = 20000             # ms per page
-    # wall-clock budget (seconds) for the whole crawl loop. None == unlimited
-    # (the historical behaviour); only max_pages/depth/per-request timeout bound
-    # the crawl. When set, the loop stops gracefully once the budget is spent and
-    # returns the partial result gathered so far (no crash) -- a guard against a
-    # slow target stalling the crawl for many minutes.
-    time_budget: float | None = None
+    # wall-clock budget (seconds) for the whole crawl loop. Default 300s: the
+    # loop stops gracefully once the budget is spent and returns the partial
+    # result gathered so far (no crash) -- a guard against a slow target stalling
+    # the crawl for many minutes. Set to 0 (or None) for no limit, in which case
+    # only max_pages/depth/per-request timeout bound the crawl.
+    time_budget: float | None = 300.0
     # resource throttling for render mode (keeps CPU/RAM bounded):
     render_workers: int = 3               # max concurrent browser tabs/contexts
     # resource types aborted during render — we only need DOM links + JS + the

@@ -30,9 +30,10 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("crawl")
     g.add_argument("-d", "--depth", type=int, default=2, help="crawl depth (default 2)")
     g.add_argument("--max-pages", type=int, default=300, help="max pages (default 300)")
-    g.add_argument("--time-budget", type=float, default=None, metavar="SEC",
+    g.add_argument("--time-budget", type=float, default=300.0, metavar="SEC",
                    help="wall-clock budget for the crawl; stops gracefully and "
-                        "returns the partial result once spent (default: no limit)")
+                        "returns the partial result once spent (default 300; "
+                        "0 = no limit)")
     g.add_argument("--no-render", action="store_true",
                    help="disable Playwright JS rendering (HTTP-only, faster)")
     g.add_argument("--headful", action="store_true", help="run browser headed (debug)")

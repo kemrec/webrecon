@@ -119,7 +119,7 @@ webrecon example.com -H "Cookie: sid=abc" -H "X-Api-Key: k" \
 |------|---------|---------|
 | `-d, --depth` | `2` | crawl depth |
 | `--max-pages` | `300` | hard page cap |
-| `--time-budget SEC` | none | wall-clock cap on the crawl; stops gracefully and returns the partial result once spent |
+| `--time-budget SEC` | `300` | wall-clock cap on the crawl; stops gracefully and returns the partial result once spent (`0` = no limit) |
 | `--no-render` | off | disable Playwright, HTTP-only |
 | `--headful` | off | run browser headed (debug) |
 | `--render-workers` | `3` | max concurrent browser tabs in render mode |
@@ -715,7 +715,7 @@ What the flags do (all require, or imply, `--web`):
 | `--web-render` | enable Playwright JS rendering (catches JS-injected links; slower, needs Chromium) | off (on under `--full`) |
 | `--web-depth N` | crawl depth per web port | 1 (3 under `--full`) |
 | `--web-max-pages N` | hard page cap per web port | 60 (300 under `--full`) |
-| `--web-time-budget SEC` | wall-clock cap per web port; stops gracefully with partial results | no limit (600s under `--full`) |
+| `--web-time-budget SEC` | wall-clock cap per web port; stops gracefully with partial results (`0` = no limit) | 300 (600 under `--full`) |
 | `--write-hosts` | also append harvested cert SANs -> IP to `/etc/hosts` | off |
 
 `--full` is just a convenience profile: it sets render on and the deeper

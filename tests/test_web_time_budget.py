@@ -14,8 +14,14 @@ def _cfg_from(argv):
     return cli.cfg_from_args(cli.build_parser().parse_args(argv))
 
 
-def test_cli_default_no_budget():
-    assert _cfg_from(["10.0.0.5"]).web_time_budget is None
+def test_cli_default_is_300():
+    assert _cfg_from(["10.0.0.5"]).web_time_budget == 300.0
+
+
+def test_cli_zero_means_no_limit():
+    # an explicit 0 opts out of the budget (unlimited crawl)
+    assert _cfg_from(["10.0.0.5", "--web", "--web-time-budget", "0"]
+                     ).web_time_budget == 0.0
 
 
 def test_cli_full_sets_600():
