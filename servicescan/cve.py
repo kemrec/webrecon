@@ -38,9 +38,11 @@ _CPE_MAP = {
     "apache": ("apache", "http_server"),
     "httpd": ("apache", "http_server"),
     "nginx": ("f5", "nginx"),                 # NVD moved nginx CVEs to the "f5"
-                                              # vendor after F5 acquired nginx;
-                                              # the old "nginx:nginx" cpeName now
-                                              # returns ZERO (missed every CVE).
+                                              # vendor after F5 acquired nginx (the
+                                              # old "nginx:nginx" cpeName returns
+                                              # ZERO). 2024+ CVEs live under a
+                                              # SECOND product, nginx_open_source,
+                                              # queried via _CPE_EXTRA below.
     "mysql": ("oracle", "mysql"),
     "mariadb": ("mariadb", "mariadb"),
     "redis": ("redis", "redis"),
@@ -65,6 +67,18 @@ _CPE_MAP = {
     "oracle weblogic server": ("oracle", "weblogic_server"),
     "weblogic": ("oracle", "weblogic_server"),
     "appwrite": ("appwrite", "appwrite"),
+}
+
+# Some products are split across more than one NVD catalog entry (NVD renamed or
+# forked the product), so a lookup under the primary name alone misses CVEs filed
+# under the other. nginx is the live example: older CVEs sit under "f5:nginx",
+# but every 2024+ CVE (e.g. CVE-2024-7347, the mp4 worker-memory overwrite, and
+# CVE-2025-53859) is filed under "f5:nginx_open_source". We query the primary map
+# entry AND each extra base here, then union the results. (nginx_plus is the
+# commercial fork with a separate rNN version scheme -- a plain open-source nginx
+# banner must not borrow its CVEs, so it is deliberately excluded.)
+_CPE_EXTRA: dict[str, list[tuple[str, str]]] = {
+    "nginx": [("f5", "nginx_open_source")],
 }
 
 # OSV is reliable only when queried WITH an ecosystem (PyPI, npm, Go, Packagist,
@@ -674,6 +688,20 @@ async def correlate(cfg: ScanConfig, http, services: list[Service],
                         if found:
                             utils.debug(f":{svc.port} nvd cpe->kw fallback hit "
                                         f"({len(found)})")
+                # products split across multiple NVD catalog entries (e.g. nginx
+                # also lives under nginx_open_source for 2024+ CVEs): query each
+                # extra base and union, so a rename/fork never zeroes out recent
+                # CVEs. want_version anchors the range filter exactly as above.
+                for xvendor, xprod in _CPE_EXTRA.get(svc.product.strip().lower(), []):
+                    xcpe = f"cpe:2.3:a:{xvendor}:{xprod}:{nver or '*'}:*:*:*:*:*:*:*"
+                    xprods = set(products) | {xprod.lower()}
+                    xhits = await query_nvd(http, cfg, xcpe, None, cache=cache,
+                                            products=xprods, want_version=nver)
+                    for c in xhits:
+                        found.setdefault(c.id, c)
+                    if xhits:
+                        utils.debug(f":{svc.port} nvd extra base {xvendor}:{xprod} "
+                                    f"(+{len(xhits)})")
                 # product identified but NO version: the CPE above was a wildcard
                 # (all-version) match, so NVD returned every CVE for the product.
                 # Flag it -- the listed CVEs are not version-confirmed.

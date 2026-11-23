@@ -220,3 +220,49 @@ def test_query_nvd_no_demote_when_version_unknown():
         http, cfg, cpe="cpe:2.3:a:openbsd:openssh:*:*:*:*:*:*:*:*",
         keyword=None, products={"openssh"}, want_version=""))
     assert out[0].env_note == "" and out[0].effective_cvss is None
+
+
+class _ByProductNvdHTTP:
+    """Returns a different NVD payload depending on which product the query is
+    for, so the nginx multi-base union is observable. Checks substrings in order."""
+    def __init__(self, routes):
+        self._routes = routes          # list of (needle, payload-dict)
+
+    async def fetch(self, url, method="GET", headers=None, read_body=True):
+        for needle, payload in self._routes:
+            if needle in url:
+                return _NvdResp(json.dumps(payload))
+        return _NvdResp(json.dumps(_nvd_payload()))   # empty
+
+
+def test_correlate_nginx_unions_open_source_base():
+    # NVD split nginx: the legacy "f5:nginx" entry holds only older CVEs, while
+    # every 2024+ CVE (CVE-2024-7347 etc.) is filed under "f5:nginx_open_source".
+    # correlate must query BOTH bases and union, or recent nginx CVEs are missed.
+    from servicescan.models import Service
+    old = ("CVE-OLD", _conf("cpe:2.3:a:f5:nginx:1.27.0:*:*:*:*:*:*:*"))
+    oss = ("CVE-OSS", _conf("cpe:2.3:a:f5:nginx_open_source:*:*:*:*:*:*:*:*",
+                            versionStartIncluding="1.5.13",
+                            versionEndExcluding="1.27.1"))
+    http = _ByProductNvdHTTP([
+        ("nginx_open_source", _nvd_payload(oss)),   # check the longer name first
+        ("f5:nginx:", _nvd_payload(old)),
+    ])
+    cfg = ScanConfig(target="x", nvd=True, osv=False, epss=False, kev=False,
+                     min_cvss=0.0, kev_high_only=False, cve_cache=False)
+    svc = Service(port=80, proto="tcp", state="open", name="http",
+                  product="nginx", version="1.27.0")
+    asyncio.run(cve.correlate(cfg, http, [svc]))
+    ids = {c.id for c in svc.cves}
+    assert ids == {"CVE-OLD", "CVE-OSS"}      # both bases unioned
+
+    # a product with no extra base is unaffected: only its single base is queried
+    http2 = _ByProductNvdHTTP([
+        ("http_server", _nvd_payload(
+            ("CVE-A", _conf("cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*")))),
+        ("nginx_open_source", _nvd_payload(("CVE-X", _conf("x")))),
+    ])
+    svc2 = Service(port=80, proto="tcp", state="open", name="http",
+                   product="apache", version="2.4.49")
+    asyncio.run(cve.correlate(cfg, http2, [svc2]))
+    assert {c.id for c in svc2.cves} == {"CVE-A"}   # no stray open_source query
