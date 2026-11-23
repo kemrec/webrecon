@@ -11,11 +11,17 @@ Produces a CrawlResult aggregating everything for downstream modules.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 
 from .config import Config
 from .http_client import HTTPClient
 from . import utils, extract, secrets, tech
+
+
+# Clock indirection so tests can drive the crawl time-budget deterministically
+# without monkeypatching the stdlib `time.monotonic` (which asyncio itself uses).
+_monotonic = time.monotonic
 
 
 # Lazy handle to servicescan's shared technology catalog + matcher. Imported on
@@ -304,8 +310,21 @@ class Crawler:
         for s in seeds:
             await queue.put((s, 0))
 
+        # wall-clock budget: stop the loop gracefully once spent and return the
+        # partial result. None == unlimited (historical behaviour).
+        budget = self.cfg.time_budget
+        deadline = (_monotonic() + budget) if budget else None
+        budget_hit = False
+
         async def worker():
+            nonlocal budget_hit
             while True:
+                # check the budget at the loop boundary (never mid-page) so a
+                # stopping worker holds no queue item and overshoots by at most
+                # one in-flight page (bounded by page_timeout).
+                if deadline is not None and _monotonic() >= deadline:
+                    budget_hit = True
+                    return
                 try:
                     url, depth = await asyncio.wait_for(queue.get(), timeout=2.0)
                 except asyncio.TimeoutError:
@@ -330,6 +349,9 @@ class Crawler:
         await asyncio.gather(*workers)
 
         progress.finish()
+        if budget_hit:
+            utils.warn(f"crawl time budget ({budget:g}s) reached; returning "
+                       f"partial result ({len(self.result.pages)} pages crawled)")
         utils.good(f"crawl done: {len(self.result.pages)} pages, "
                    f"{len(self.result.urls)} urls, {len(self.result.js_files)} JS files")
         return self.result

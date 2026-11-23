@@ -119,6 +119,7 @@ webrecon example.com -H "Cookie: sid=abc" -H "X-Api-Key: k" \
 |------|---------|---------|
 | `-d, --depth` | `2` | crawl depth |
 | `--max-pages` | `300` | hard page cap |
+| `--time-budget SEC` | none | wall-clock cap on the crawl; stops gracefully and returns the partial result once spent |
 | `--no-render` | off | disable Playwright, HTTP-only |
 | `--headful` | off | run browser headed (debug) |
 | `--render-workers` | `3` | max concurrent browser tabs in render mode |
@@ -154,7 +155,8 @@ bounded without losing discovery:
   typical heavy page this cuts completed network work by ~65–70%. Use
   `--no-block-resources` to load them anyway.
 - **Hard caps** on pages (`--max-pages`), depth (`-d`), per-page time
-  (`--page-timeout`) and JS parse size (`--max-js-bytes`).
+  (`--page-timeout`), total crawl wall-clock (`--time-budget`) and JS parse
+  size (`--max-js-bytes`).
 - Render is **off** inside the `--web` chain unless you pass `--web-render` /
   `--full`; plain HTTP crawling barely uses the CPU at all.
 

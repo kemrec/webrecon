@@ -30,6 +30,9 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("crawl")
     g.add_argument("-d", "--depth", type=int, default=2, help="crawl depth (default 2)")
     g.add_argument("--max-pages", type=int, default=300, help="max pages (default 300)")
+    g.add_argument("--time-budget", type=float, default=None, metavar="SEC",
+                   help="wall-clock budget for the crawl; stops gracefully and "
+                        "returns the partial result once spent (default: no limit)")
     g.add_argument("--no-render", action="store_true",
                    help="disable Playwright JS rendering (HTTP-only, faster)")
     g.add_argument("--headful", action="store_true", help="run browser headed (debug)")
@@ -120,6 +123,7 @@ def cfg_from_args(a: argparse.Namespace) -> Config:
         target=utils.ensure_scheme(a.target),
         depth=a.depth,
         max_pages=a.max_pages,
+        time_budget=a.time_budget,
         render=not a.no_render,
         headful=a.headful,
         wait_until=a.wait_until,
