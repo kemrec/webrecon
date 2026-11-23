@@ -185,6 +185,9 @@
         <label>max pages
           <input type="number" id="web_max_pages" min="1" step="1" placeholder="60">
         </label>
+        <label>time budget (s)
+          <input type="number" id="web_time_budget" min="1" step="any" placeholder="none">
+        </label>
       </div>
       <div class="row">
         <button type="submit" id="go">Scan</button>
@@ -286,6 +289,8 @@ function buildQuery() {
     if (!isNaN(wd) && wd > 0) p.set("web_depth", wd);
     const wm = parseInt($("web_max_pages").value, 10);
     if (!isNaN(wm) && wm > 0) p.set("web_max_pages", wm);
+    const wt = parseFloat($("web_time_budget").value);
+    if (!isNaN(wt) && wt > 0) p.set("web_time_budget", wt);
   }
   return p.toString();
 }

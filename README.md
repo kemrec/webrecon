@@ -843,7 +843,7 @@ params). Only an allowlisted subset of options is honoured — `target`
 `nse_scripts`, `fingerprint`, `fp_all`, `render`, `cam_creds`, `realm`, `scan_rate`, `cve`,
 the per-feed CVE sources `nvd` / `osv` / `epss` / `kev`, `nvd_api_key`, `min_cvss`,
 `kev_high_only`, `exploits`, `timeout`, `concurrency`, the `--web` crawl
-chain (`web`, `web_render`, `web_depth`, `web_max_pages`), and `save_to_disk`.
+chain (`web`, `web_render`, `web_depth`, `web_max_pages`, `web_time_budget`), and `save_to_disk`.
 These are all scan *semantics*; host-filesystem / subprocess-path knobs
 (`nmap_path`, `nmap_args`, `outdir`) are deliberately **not** reachable from the
 web surface. With the web chain enabled, each web port's crawl summary (pages /

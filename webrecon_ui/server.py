@@ -227,6 +227,16 @@ def _as_int_or_none(v):
     return int(v) if v not in (None, "") else None
 
 
+def _as_pos_float_or_none(v):
+    # a wall-clock budget in seconds (scan semantics; never a path/subprocess
+    # value). Blank -> None (no limit); a non-positive value is treated as no
+    # limit too, matching the engine (a falsy budget = unlimited).
+    if v in (None, ""):
+        return None
+    f = float(v)
+    return f if f > 0 else None
+
+
 def _as_realm(v):
     # AD/Kerberos realm for the TCP-88 AS-REQ posture check. A plain string that
     # becomes a DER KerberosString in the probe (no shell, no path); empty -> None.
@@ -300,6 +310,7 @@ _ALLOWED = {
     "web_render":    ("web_render", _as_bool),
     "web_depth":     ("web_depth", lambda v: max(1, int(v))),
     "web_max_pages": ("web_max_pages", lambda v: max(1, int(v))),
+    "web_time_budget": ("web_time_budget", _as_pos_float_or_none),
 }
 
 
