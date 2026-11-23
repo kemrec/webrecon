@@ -47,6 +47,9 @@ class Config:
     block_resources: set[str] = field(
         default_factory=lambda: {"image", "media", "font"})
     max_js_bytes: int = 20_000_000        # skip parsing JS bundles bigger than this
+    save_js: bool = False                 # write fetched JS bodies to <outdir>/js
+                                          # (+ manifest.tsv) for external secret
+                                          # scanning, e.g. trufflehog filesystem
     secrets_aggressive: bool = False      # opt-in entropy sweep for generic secrets
 
     # networking

@@ -26,6 +26,13 @@ def write_all(outdir: str, data: dict) -> None:
     # the attack surface). Off-scope references go to external.txt as intel.
     _w(os.path.join(outdir, "urls.txt"), sorted(data.get("urls", [])))
     _w(os.path.join(outdir, "js_files.txt"), sorted(data.get("js_files", [])))
+    # JS provenance: each JS URL and the page(s) that referenced it (the saved
+    # bodies + their local filenames are under js/manifest.tsv).
+    js_src = data.get("js_sources", {}) or {}
+    if js_src:
+        _w(os.path.join(outdir, "js_sources.tsv"),
+           ["js_url\treferenced_from"]
+           + [f"{u}\t{','.join(sorted(p))}" for u, p in sorted(js_src.items())])
     _w(os.path.join(outdir, "endpoints.txt"), sorted(data.get("endpoints", [])))
     ext = sorted(data.get("external_urls", []))
     if ext:

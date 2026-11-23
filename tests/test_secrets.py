@@ -1,3 +1,6 @@
+import base64
+import binascii
+
 from webrecon import secrets
 
 
@@ -42,6 +45,42 @@ def test_new_provider_patterns():
     for expected, blob in samples.items():
         out = secrets.scan(blob, "x")
         assert expected in _types(out), f"{expected} not detected in {blob!r}"
+
+
+def test_expanded_provider_patterns():
+    samples = {
+        "GitLab Pipeline Trigger": "glptt-" + "0" * 40,
+        "Doppler Token": "dp.pt." + "a" * 43,
+        "Replicate API Token": "r8_" + "A" * 37,
+        "Airtable PAT": "pat" + "A" * 14 + "." + "a" * 64,
+        "Tailscale Key": "tskey-auth-kABCDEF-0123456789abcdef",
+        "Fly.io Token": "fo1_" + "A" * 43,
+    }
+    for expected, blob in samples.items():
+        out = secrets.scan(f'x="{blob}"', "x")
+        assert expected in _types(out), f"{expected} not detected"
+
+
+def test_base64_decoded_secret_is_found():
+    tok = "ghp_" + "A" * 36
+    blob = base64.b64encode(f"GITHUB_TOKEN={tok}".encode()).decode()
+    out = secrets.scan(f'cfg = "{blob}"', "app.js")
+    hit = [f for f in out if f.type.startswith("GitHub Token")]
+    assert hit and hit[0].match_preview == tok
+    assert "base64-decoded" in hit[0].type
+
+
+def test_hex_decoded_secret_is_found():
+    hx = binascii.hexlify(b"key AKIAIOSFODNN7EXAMPLE end").decode()
+    out = secrets.scan(f'd = "{hx}"', "app.js")
+    assert any(f.type.startswith("AWS Access Key ID") and "hex-decoded" in f.type
+               for f in out)
+
+
+def test_decode_pass_no_false_positive_on_random_minified():
+    # a long base64-looking minified identifier that decodes to binary garbage
+    out = secrets.scan('var x="aGVsbG93b3JsZHRoaXNpc25vdGFzZWNyZXRqdXN0dGV4dA";', "x")
+    assert all("decoded" not in f.type for f in out)
 
 
 def test_placeholder_values_suppressed():

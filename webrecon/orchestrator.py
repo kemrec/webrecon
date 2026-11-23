@@ -140,6 +140,7 @@ async def run(cfg: Config, control=None) -> dict:
             "urls": in_urls,
             "external_urls": ext_urls,
             "js_files": sorted(agg.js_files),
+            "js_sources": {u: sorted(p) for u, p in agg.js_sources.items()},
             "endpoints": in_endpoints,
             "params": in_params,
             "subdomains": sorted(all_subs),
@@ -174,6 +175,8 @@ def _merge(dst: CrawlResult, src: CrawlResult) -> None:
     dst.pages.update(src.pages)
     dst.urls |= src.urls
     dst.js_files |= src.js_files
+    for u, parents in src.js_sources.items():
+        dst.js_sources.setdefault(u, set()).update(parents)
     dst.endpoints |= src.endpoints
     dst.hosts |= src.hosts
     for ep, keys in src.params.items():

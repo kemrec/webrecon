@@ -11,12 +11,29 @@ Produces a CrawlResult aggregating everything for downstream modules.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import os
+import re as _re
 import time
 from dataclasses import dataclass, field
 
 from .config import Config
 from .http_client import HTTPClient
 from . import utils, extract, secrets, tech
+
+
+def js_filename(url: str) -> str:
+    """Deterministic, collision-safe local filename for a saved JS URL. Keeps a
+    readable host_path stem (so the file is recognisable on disk) plus a short
+    hash of the full URL so two different URLs never map to one file."""
+    h = hashlib.sha1(url.encode("utf-8", "replace")).hexdigest()[:10]
+    stem = _re.sub(r"^https?://", "", url)
+    stem = _re.sub(r"[?#].*$", "", stem)          # drop query/fragment
+    stem = _re.sub(r"[^A-Za-z0-9._-]", "_", stem)  # fs-safe
+    stem = stem[:80].strip("._-") or "js"
+    if not stem.endswith(".js"):
+        stem += ".js"
+    return f"{stem}.{h}.js"
 
 
 # Clock indirection so tests can drive the crawl time-budget deterministically
@@ -45,6 +62,7 @@ class CrawlResult:
     pages: dict[str, int] = field(default_factory=dict)        # url -> status
     urls: set[str] = field(default_factory=set)                # all discovered URLs
     js_files: set[str] = field(default_factory=set)            # external JS URLs
+    js_sources: dict[str, set[str]] = field(default_factory=dict)  # JS URL -> pages that referenced it
     endpoints: set[str] = field(default_factory=set)           # endpoint-ish strings
     params: dict[str, set[str]] = field(default_factory=dict)  # endpoint -> param names
     secret_findings: list = field(default_factory=list)
@@ -62,6 +80,8 @@ class Crawler:
         self._browser = None
         self._pw = None
         self._cat_specs = None            # cached (js_vars, dom_specs)
+        self._js_dir = None               # <outdir>/js, created lazily on first save
+        self._js_saved: set[str] = set()  # JS URLs whose body we wrote to disk
 
     async def __aenter__(self):
         if self.cfg.render:
@@ -196,13 +216,54 @@ class Crawler:
             return True
         return utils.in_scope(u, self.cfg.scope_hosts, self.cfg.include_subdomains)
 
-    async def _process_js(self, js_url: str) -> None:
+    def _save_js(self, js_url: str, text: str) -> None:
+        """Write a fetched JS body under <outdir>/js so an external secret
+        scanner (trufflehog filesystem mode) can sweep the full bundle text.
+        No-op unless cfg.save_js is set. Filename preserves provenance via the
+        js/manifest.tsv written at end of run()."""
+        if not getattr(self.cfg, "save_js", False) or not self.cfg.outdir:
+            return
+        try:
+            if self._js_dir is None:
+                self._js_dir = os.path.join(self.cfg.outdir, "js")
+                os.makedirs(self._js_dir, exist_ok=True)
+            with open(os.path.join(self._js_dir, js_filename(js_url)),
+                      "w", encoding="utf-8") as fh:
+                fh.write(text)
+            self._js_saved.add(js_url)
+        except Exception as e:  # noqa: BLE001
+            utils.debug(f"save js {js_url}: {type(e).__name__}: {e}")
+
+    def _write_js_manifest(self) -> None:
+        """Map every saved JS file back to its URL and the page(s) that linked
+        it, so a secret found by trufflehog in js/<file> is instantly traced to
+        its origin (the IP:port is already the enclosing output directory)."""
+        if not self._js_saved or not self._js_dir:
+            return
+        try:
+            rows = ["filename\tjs_url\treferenced_from"]
+            for u in sorted(self._js_saved):
+                parents = ",".join(sorted(self.result.js_sources.get(u, [])))
+                rows.append(f"{js_filename(u)}\t{u}\t{parents}")
+            with open(os.path.join(self._js_dir, "manifest.tsv"),
+                      "w", encoding="utf-8") as fh:
+                fh.write("\n".join(rows) + "\n")
+        except Exception as e:  # noqa: BLE001
+            utils.debug(f"js manifest: {type(e).__name__}: {e}")
+
+    async def _process_js(self, js_url: str, parent: str | None = None) -> None:
+        # record provenance for EVERY referencing page, before the dedup return
+        if parent:
+            self.result.js_sources.setdefault(js_url, set()).add(parent)
         if js_url in self.result.js_files:
             return
         self.result.js_files.add(js_url)
         r = await self.http.fetch(js_url)
         if not r.ok or not r.text:
             return
+        # save the full body first (even oversized bundles -- a prime place for
+        # buried keys), then skip only the in-process parse of huge files.
+        self._save_js(js_url, r.text)
         if len(r.text) > self.cfg.max_js_bytes:
             utils.debug(f"skip large JS ({len(r.text)}B > "
                         f"{self.cfg.max_js_bytes}B cap) {js_url}")
@@ -285,7 +346,7 @@ class Crawler:
                 continue
             self.result.hosts.add(utils.host_of(u))
             if utils.looks_like_js(u) and self.cfg.do_js_extract:
-                js_tasks.append(self._process_js(u))
+                js_tasks.append(self._process_js(u, parent=url))
         if js_tasks:
             await asyncio.gather(*js_tasks)
 
@@ -393,6 +454,10 @@ class Crawler:
         if budget_hit:
             utils.warn(f"crawl time budget ({budget:g}s) reached; returning "
                        f"partial result ({len(self.result.pages)} pages crawled)")
+        self._write_js_manifest()
+        if self._js_saved:
+            utils.good(f"saved {len(self._js_saved)} JS file(s) -> {self._js_dir}/ "
+                       f"(+ manifest.tsv)")
         utils.good(f"crawl done: {len(self.result.pages)} pages, "
                    f"{len(self.result.urls)} urls, {len(self.result.js_files)} JS files")
         return self.result

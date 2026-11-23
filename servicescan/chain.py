@@ -198,6 +198,10 @@ async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
             outdir=outdir,
             quiet=True,
         )
+        # save every fetched JS body under <outdir>/js (+ manifest.tsv) so the
+        # final trufflehog filesystem sweep can mine them for secrets; the
+        # per-port outdir already encodes the IP:port provenance.
+        wcfg.save_js = True
         # pivot on cert SANs, not public CT logs: skip crt.sh, keep vhost fuzz
         wcfg.do_subdomains = False
         wcfg.scope_hosts = {seed_host} | ({ip} if ip else set()) | extra

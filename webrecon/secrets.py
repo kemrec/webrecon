@@ -12,6 +12,7 @@ actionable output.
 """
 from __future__ import annotations
 
+import base64
 import math
 import re
 from dataclasses import dataclass, asdict
@@ -96,6 +97,27 @@ _PROVIDER = [
     ("Mapbox Secret Token",      "high",   r"\bsk\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b"),
     ("Sentry DSN (secret)",      "medium", r"\bhttps://[0-9a-f]{32}:[0-9a-f]{32}@[a-z0-9.\-]+/[0-9]+\b"),
     ("Facebook Access Token",    "medium", r"\bEAA[A-Za-z0-9]{90,}\b"),
+    # --- more VCS / CI / registries / SaaS (distinct prefixes -> low FP) ---
+    ("GitLab Pipeline Trigger",  "high",   r"\bglptt-[0-9a-f]{40}\b"),
+    ("GitLab Runner Reg Token",  "high",   r"\bGR1348941[0-9A-Za-z_\-]{20}\b"),
+    ("Doppler Token",            "high",   r"\bdp\.(?:pt|st|sa|ct|scim|audit)\.[A-Za-z0-9]{40,44}\b"),
+    ("Pulumi Access Token",      "high",   r"\bpul-[0-9a-f]{40}\b"),
+    ("PlanetScale Password",     "high",   r"\bpscale_pw_[A-Za-z0-9_\-\.]{32,}\b"),
+    ("PlanetScale Token",        "high",   r"\bpscale_tkn_[A-Za-z0-9_\-\.]{32,}\b"),
+    ("Fly.io Token",             "high",   r"\bfo1_[A-Za-z0-9_\-]{43}\b"),
+    ("Clojars Deploy Token",     "high",   r"\bCLOJARS_[a-z0-9]{60}\b"),
+    ("RubyGems API Key",         "high",   r"\brubygems_[a-f0-9]{48}\b"),
+    ("NuGet API Key",            "high",   r"\boy2[a-z0-9]{43}\b"),
+    ("Airtable PAT",             "high",   r"\bpat[A-Za-z0-9]{14}\.[a-f0-9]{64}\b"),
+    ("Replicate API Token",      "high",   r"\br8_[A-Za-z0-9]{37}\b"),
+    ("Dynatrace Token",          "high",   r"\bdt0c01\.[A-Z0-9]{24}\.[A-Z0-9]{64}\b"),
+    ("Contentful CMA Token",     "high",   r"\bCFPAT-[A-Za-z0-9_\-]{43}\b"),
+    ("Figma PAT",                "high",   r"\bfigd_[A-Za-z0-9_\-]{40,}\b"),
+    ("Tailscale Key",            "high",   r"\btskey-(?:auth|api|client)-[A-Za-z0-9]+-[A-Za-z0-9]+\b"),
+    ("Sentry Auth Token",        "high",   r"\bsntr(?:ys|yu)_[A-Za-z0-9+/=_\-]{10,}\b"),
+    ("Buildkite Agent Token",    "high",   r"\bbkua_[a-z0-9]{40}\b"),
+    ("MS Teams Webhook",         "high",   r"https://[a-z0-9]+\.webhook\.office\.com/webhookb2/[0-9a-f\-]+@[0-9a-f\-]+/IncomingWebhook/[0-9a-f]+/[0-9a-f\-]+"),
+    ("Cloudflare Global API Key","medium", r"(?i)cloudflare.{0,20}['\"][0-9a-f]{37}['\"]"),
     # --- generic high-value shapes ---
     ("JWT",                      "medium", r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
     ("Private Key Block",        "high",   r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"),
@@ -144,6 +166,56 @@ _PLACEHOLDER_VALUES = {
     "yourapikey", "your_token", "youremail", "your_email", "username",
     "user", "admin", "email", "process.env", "import.meta.env",
 }
+
+
+# ---------------------------------------------------------------------------
+# Decode pass: a secret is often one encoding layer deep (a base64 blob in a JS
+# config, a hex-packed string). Find such blobs, decode the ones that come out
+# as mostly-printable text, and re-run the provider/generic rules on the result.
+# One level only (we don't re-decode decoded output), and bounded so a big
+# minified bundle can't blow up cost.
+# ---------------------------------------------------------------------------
+_B64_BLOB = re.compile(r"[A-Za-z0-9+/_\-]{24,}={0,2}")
+_HEX_BLOB = re.compile(r"\b[0-9a-fA-F]{40,}\b")
+_DECODE_MAX_CANDIDATES = 2000     # cap blobs examined per blob-type
+_DECODE_MAX_BLOB_LEN = 4096       # skip absurdly long blobs
+
+
+def _printable_ratio(b: bytes) -> float:
+    if not b:
+        return 0.0
+    ok = sum(1 for c in b if c in (9, 10, 13) or 32 <= c <= 126)
+    return ok / len(b)
+
+
+def _decode_candidates(text: str):
+    """Yield (decoded_text, encoding_label, blob_start) for base64/hex blobs in
+    `text` that decode to >=8 bytes of mostly-printable text."""
+    for rx, enc in ((_B64_BLOB, "base64"), (_HEX_BLOB, "hex")):
+        seen: set[str] = set()       # per-encoding: a hex blob is also valid b64
+        n = 0
+        for m in rx.finditer(text):
+            if n >= _DECODE_MAX_CANDIDATES:
+                break
+            blob = m.group(0)
+            if len(blob) > _DECODE_MAX_BLOB_LEN or blob in seen:
+                continue
+            seen.add(blob)
+            n += 1
+            try:
+                if enc == "base64":
+                    s = blob.replace("-", "+").replace("_", "/")
+                    s += "=" * ((-len(s)) % 4)
+                    dec = base64.b64decode(s, validate=False)
+                else:
+                    if len(blob) % 2:
+                        continue
+                    dec = bytes.fromhex(blob)
+            except Exception:  # noqa: BLE001
+                continue
+            if len(dec) < 8 or _printable_ratio(dec) < 0.90:
+                continue
+            yield dec.decode("utf-8", "replace"), enc, m.start()
 
 
 def _shannon_entropy(s: str) -> float:
@@ -253,5 +325,35 @@ def scan(text: str, source: str, aggressive: bool = False) -> list[Finding]:
                 continue
             add("High-entropy string (aggressive)", "low",
                 value, m.start(1), m.end(1))
+
+    # decode pass: re-run the provider + generic-assignment rules on base64/hex
+    # blobs that decode to printable text, so a secret buried one encoding layer
+    # deep is still caught. Findings are tagged with the encoding; line/offset
+    # point at the encoded blob in the original text.
+    for dec_text, enc, pos in _decode_candidates(text):
+        line = _line_of(text, pos)
+
+        def _add_decoded(ftype, sev, value):
+            key = (f"{ftype} ({enc})", value[:60])
+            if key in seen:
+                return
+            seen.add(key)
+            findings.append(Finding(
+                type=f"{ftype} ({enc}-decoded)", severity=sev,
+                match_preview=value, source=source,
+                context=f"decoded from {enc}: {dec_text[:150]}", line=line))
+
+        for name, sev, pat in _PROVIDER:
+            for dm in re.finditer(pat, dec_text):
+                _add_decoded(name, sev, dm.group(0))
+        for gm in _GENERIC_ASSIGN.finditer(dec_text):
+            kw = gm.group(1).lower()
+            val = gm.group(2)
+            if val.lower() in _PLACEHOLDER_VALUES or re.fullmatch(r"[\d.]+", val):
+                continue
+            if len(val) >= 8 or _shannon_entropy(val) >= 3.0:
+                sev = ("high" if any(t in kw for t in
+                       ("secret", "password", "pwd", "token", "key")) else "medium")
+                _add_decoded(f"Generic secret ({kw})", sev, val)
 
     return findings

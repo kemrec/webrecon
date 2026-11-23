@@ -223,13 +223,37 @@ def _print_nuclei_hint(outdir: str | None) -> None:
             out_abs = os.path.join(base, out)
             cmds.append((f"nuclei -l {src_abs} -silent -o {out_abs} 2>/dev/null",
                          label))
-    if not cmds:
+    if cmds:
+        print(f"{C.B}{'-'*66}{C.R}")
+        print(f"  {C.B}next: scan the discovered services with nuclei{C.R}")
+        for cmd, label in cmds:
+            print(f"  {C.GRY}# {label}{C.R}")
+            print(f"  {cmd}")
+    _print_trufflehog_hint(base)
+
+
+def _print_trufflehog_hint(base: str) -> None:
+    """If the --web chain saved JS bodies, show a copy-pasteable trufflehog
+    filesystem command to secret-scan them. The saved tree keeps IP:port in the
+    path and js/manifest.tsv maps each file back to its source page, so a hit is
+    traceable without re-searching where the JS came from. Assumes trufflehog is
+    installed on the host; the operator runs it as the final step."""
+    web_dir = os.path.join(base, "web")
+    if not os.path.isdir(web_dir):
         return
+    # only suggest it when at least one js/ dir actually holds saved bodies
+    has_js = any(os.path.basename(root) == "js"
+                 and any(f != "manifest.tsv" for f in files)
+                 for root, _dirs, files in os.walk(web_dir))
+    if not has_js:
+        return
+    out_abs = os.path.join(base, "trufflehog.json")
     print(f"{C.B}{'-'*66}{C.R}")
-    print(f"  {C.B}next: scan the discovered services with nuclei{C.R}")
-    for cmd, label in cmds:
-        print(f"  {C.GRY}# {label}{C.R}")
-        print(f"  {cmd}")
+    print(f"  {C.B}next: secret-scan the saved JS with trufflehog{C.R}")
+    print(f"  {C.GRY}# filesystem mode over every saved JS body "
+          f"(js/manifest.tsv maps a hit back to its source URL + page){C.R}")
+    print(f"  trufflehog filesystem {web_dir} "
+          f"--results=verified,unknown --json > {out_abs} 2>/dev/null")
 
 
 def _print_service(s) -> None:
