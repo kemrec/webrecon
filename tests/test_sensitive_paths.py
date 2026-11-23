@@ -171,6 +171,128 @@ def test_kibana_hit():
     assert "kibana" in found
 
 
+def test_jolokia_hit():
+    body = json.dumps({"request": {"type": "list"},
+                       "value": {"java.lang": {}}, "status": 200})
+    found, _ = _probe({"/jolokia/list": _Resp(200, body, "application/json")})
+    assert found["jolokia"]["severity"] == "high"
+
+
+def test_docker_api_hit():
+    body = json.dumps({"Version": "20.10", "ApiVersion": "1.41",
+                       "GoVersion": "go1.16"})
+    found, _ = _probe({"/version": _Resp(200, body, "application/json")})
+    assert found["docker-api"]["severity"] == "high"
+
+
+def test_k8s_api_hit():
+    body = json.dumps({"kind": "NamespaceList", "apiVersion": "v1", "items": []})
+    found, _ = _probe({"/api/v1/namespaces": _Resp(200, body, "application/json")})
+    assert found["k8s-api"]["severity"] == "high"
+
+
+def test_phpinfo_hit():
+    body = ("<html><head><title>phpinfo()</title></head><body>"
+            "<h1>PHP Version 8.1.2</h1></body></html>")
+    found, _ = _probe({"/phpinfo.php": _Resp(200, body, "text/html")})
+    assert found["phpinfo"]["severity"] == "medium"
+
+
+def test_ignition_hit():
+    found, _ = _probe({"/_ignition/health-check": _Resp(
+        200, '{"can_execute_commands":true}', "application/json")})
+    assert found["laravel-ignition"]["severity"] == "high"
+
+
+def test_symfony_profiler_hit():
+    body = "<html><head><title>Symfony Profiler</title></head><body>x</body></html>"
+    found, _ = _probe({"/_profiler": _Resp(200, body, "text/html")})
+    assert "symfony-profiler" in found
+
+
+def test_telescope_hit():
+    body = "<html><head><title>Telescope</title></head><body>app</body></html>"
+    found, _ = _probe({"/telescope/requests": _Resp(200, body, "text/html")})
+    assert "laravel-telescope" in found
+
+
+def test_wp_user_enum_hit():
+    body = '[{"id":1,"name":"admin","slug":"admin"},{"id":2,"slug":"editor"}]'
+    found, _ = _probe({"/wp-json/wp/v2/users": _Resp(200, body, "application/json")})
+    assert found["wp-user-enum"]["severity"] == "medium"
+
+
+def test_private_key_hit():
+    body = ("-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            "b3BlbnNzaC1rZXktdjEAAAAA...fake...\n"
+            "-----END OPENSSH PRIVATE KEY-----\n")
+    found, _ = _probe({"/id_rsa": _Resp(200, body)})
+    assert found["private-key"]["severity"] == "high"
+
+
+def test_sql_dump_hit():
+    body = ("-- MySQL dump 10.13\nCREATE TABLE `users` (`id` int);\n"
+            "INSERT INTO `users` VALUES (1,'admin');\n")
+    found, _ = _probe({"/dump.sql": _Resp(200, body)})
+    assert found["sql-dump"]["severity"] == "high"
+
+
+def test_sqlite_db_hit_binary_magic():
+    raw = b"SQLite format 3\x00" + b"\x00" * 64
+    found, _ = _probe({"/db.sqlite3": _Resp(200, "", "application/octet-stream",
+                                            raw=raw)})
+    assert found["sqlite-db"]["severity"] == "high"
+
+
+def test_npmrc_hit():
+    found, _ = _probe({"/.npmrc": _Resp(
+        200, "//registry.npmjs.org/:_authToken=npm_faketesttoken\n")})
+    assert found["npmrc"]["severity"] == "high"
+
+
+def test_aws_credentials_hit():
+    body = "[default]\naws_access_key_id=AKIAFAKETEST\naws_secret_access_key=abc/fake\n"
+    found, _ = _probe({"/.aws/credentials": _Resp(200, body)})
+    assert found["aws-credentials"]["severity"] == "high"
+
+
+def test_docker_config_hit():
+    body = '{"auths":{"registry.example":{"auth":"ZmFrZTpmYWtl"}}}'
+    found, _ = _probe({"/.docker/config.json": _Resp(200, body, "application/json")})
+    assert found["docker-config"]["severity"] == "high"
+
+
+def test_kube_config_hit():
+    body = ("apiVersion: v1\nclusters:\n- cluster:\n    server: https://k8s:6443\n"
+            "current-context: default\n")
+    found, _ = _probe({"/.kube/config": _Resp(200, body, "text/yaml")})
+    assert found["kube-config"]["severity"] == "high"
+
+
+def test_graphql_introspection_hit():
+    body = '{"data":{"__schema":{"queryType":{"name":"Query"}}}}'
+    found, _ = _probe({"/graphql": _Resp(200, body, "application/json")})
+    assert found["graphql-introspection"]["severity"] == "medium"
+
+
+def test_django_debug_hit():
+    class _H:
+        async def fetch(self, url, *a, **k):
+            from urllib.parse import urlsplit
+            if "-webrecon-probe" in urlsplit(url).path:
+                return _Resp(404, "Page not found (404). Using the URLconf defined "
+                                  "in myproj.urls, Django tried these URL patterns")
+            return _Resp(404, "nope")
+    out = _run(probes.probe_sensitive_paths(_H(), "http://t.local:8080/"))
+    assert any(f["type"] == "django-debug" for f in out)
+
+
+def test_werkzeug_debugger_hit():
+    js = "var CONSOLE_MODE = false; /* Werkzeug debugger console */"
+    found, _ = _probe({"/": _Resp(200, js, "application/javascript")})
+    assert "werkzeug-debugger" in found
+
+
 def test_autoindex_hit():
     body = ("<html><head><title>Index of /uploads</title></head><body>"
             "<h1>Index of /uploads</h1><a href='../'>Parent Directory</a>"
@@ -192,7 +314,11 @@ def test_spa_catch_all_yields_nothing():
         "/.git/config", "/.git/HEAD", "/.svn/entries", "/.hg/requires",
         "/actuator", "/actuator/env", "/actuator/mappings", "/.env",
         "/.htpasswd", "/web.config", "/_cluster/health", "/_all_dbs",
-        "/api/status", "/metrics")}
+        "/api/status", "/metrics", "/jolokia/list", "/version",
+        "/api/v1/namespaces", "/phpinfo.php", "/_ignition/health-check",
+        "/_profiler", "/telescope/requests", "/wp-json/wp/v2/users",
+        "/id_rsa", "/dump.sql", "/.npmrc", "/.aws/credentials",
+        "/.docker/config.json", "/.kube/config", "/graphql")}
     found, _ = _probe(routes)
     assert found == {}
 

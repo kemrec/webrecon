@@ -174,6 +174,73 @@ CHECKS: list[Check] = [
           "/_all_dbs", "high", regex=r'\[\s*("?_(users|replicator|global_changes)")'),
     Check("kibana", "Kibana status endpoint exposed",
           "/api/status", "medium", all_needles=('"status"', '"version"', '"number"')),
+
+    # ---- JMX / container / orchestrator HTTP APIs (unauth -> often host RCE) ----
+    Check("jolokia", "Unauthenticated Jolokia JMX-over-HTTP endpoint",
+          "/jolokia/list", "high", all_needles=('"request"', '"value"')),
+    Check("jolokia", "Unauthenticated Jolokia JMX-over-HTTP endpoint",
+          "/actuator/jolokia/list", "high", all_needles=('"request"', '"value"')),
+    Check("docker-api", "Unauthenticated Docker Engine API (host takeover)",
+          "/version", "high", all_needles=('"ApiVersion"', '"GoVersion"')),
+    Check("k8s-api", "Unauthenticated Kubernetes API server",
+          "/api/v1/namespaces", "high", all_needles=('"kind"', '"NamespaceList"')),
+    Check("k8s-api", "Unauthenticated Kubernetes API server",
+          "/api/v1", "high", all_needles=('"kind"', '"APIResourceList"')),
+
+    # ---- framework debug / info surfaces ----
+    Check("phpinfo", "Exposed phpinfo() output (full PHP config)",
+          "/phpinfo.php", "medium", html_ok=True,
+          all_needles=("phpinfo()", "PHP Version")),
+    Check("phpinfo", "Exposed phpinfo() output (full PHP config)",
+          "/info.php", "medium", html_ok=True,
+          all_needles=("phpinfo()", "PHP Version")),
+    Check("laravel-ignition", "Laravel Ignition debug endpoint (CVE-2021-3129 RCE)",
+          "/_ignition/health-check", "high", needles=('"can_execute_commands"',)),
+    Check("symfony-profiler", "Symfony web profiler exposed",
+          "/_profiler", "medium", html_ok=True,
+          needles=("Symfony Profiler", "sf-profiler")),
+    Check("laravel-telescope", "Laravel Telescope dashboard exposed",
+          "/telescope/requests", "medium", html_ok=True,
+          needles=("window.Telescope", "<title>Telescope")),
+
+    # ---- CMS unauthenticated info disclosure ----
+    Check("wp-user-enum", "WordPress REST user enumeration (unauthenticated)",
+          "/wp-json/wp/v2/users", "medium",
+          regex=r'\[\s*\{[^}]*"slug"\s*:'),
+
+    # ---- backup / key / dump files ----
+    Check("private-key", "Exposed private key file",
+          "/id_rsa", "high",
+          regex=r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"),
+    Check("private-key", "Exposed private key file",
+          "/.ssh/id_rsa", "high",
+          regex=r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"),
+    Check("private-key", "Exposed private key file",
+          "/server.key", "high",
+          regex=r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"),
+    Check("sql-dump", "Exposed SQL database dump",
+          "/dump.sql", "high",
+          regex=r"(?i)(CREATE TABLE|INSERT INTO|-- MySQL dump|PostgreSQL database dump)"),
+    Check("sql-dump", "Exposed SQL database dump",
+          "/backup.sql", "high",
+          regex=r"(?i)(CREATE TABLE|INSERT INTO|-- MySQL dump|PostgreSQL database dump)"),
+    Check("sql-dump", "Exposed SQL database dump",
+          "/database.sql", "high",
+          regex=r"(?i)(CREATE TABLE|INSERT INTO|-- MySQL dump|PostgreSQL database dump)"),
+    Check("sqlite-db", "Exposed SQLite database file",
+          "/db.sqlite3", "high", binary=(b"SQLite format 3\x00",)),
+    Check("sqlite-db", "Exposed SQLite database file",
+          "/database.sqlite", "high", binary=(b"SQLite format 3\x00",)),
+    Check("npmrc", "Exposed .npmrc (registry auth token)",
+          "/.npmrc", "high", regex=r"(?m)^\s*(//.+/:)?_authToken\s*=|_auth\s*="),
+    Check("aws-credentials", "Exposed AWS credentials file",
+          "/.aws/credentials", "high",
+          regex=r"(?i)aws_(access_key_id|secret_access_key)\s*="),
+    Check("docker-config", "Exposed Docker registry auth config",
+          "/.docker/config.json", "high", all_needles=('"auths"',)),
+    Check("kube-config", "Exposed kubeconfig (cluster credentials)",
+          "/.kube/config", "high",
+          regex=r"(?m)^(apiVersion|clusters|current-context|client-(key|certificate)-data)\s*:"),
 ]
 
 # directory listing / autoindex -- applied to a short list of common dirs so we
@@ -277,6 +344,80 @@ async def _probe_autoindex(http, base: str) -> list[dict]:
     return out
 
 
+_GRAPHQL_PATHS = ("/graphql", "/api/graphql", "/v1/graphql", "/query", "/graphiql")
+
+
+async def _probe_graphql(http, base: str) -> dict | None:
+    """Confirm an introspection-enabled GraphQL endpoint by actually running a
+    tiny introspection query and checking the schema comes back."""
+    q = {"query": "{__schema{queryType{name}}}"}
+    for p in _GRAPHQL_PATHS:
+        url = base.rstrip("/") + p
+        try:
+            r = await http.fetch(url, method="POST", json=q)
+        except Exception:  # noqa: BLE001
+            continue
+        if r and r.status == 200 and r.text \
+                and '"__schema"' in r.text and '"queryType"' in r.text:
+            return {
+                "type": "graphql-introspection",
+                "title": "GraphQL introspection enabled (full schema disclosure)",
+                "severity": "medium",
+                "path": p,
+                "url": url,
+                "evidence": "introspection query returned __schema",
+            }
+    return None
+
+
+async def _probe_django_debug(http, base: str) -> dict | None:
+    """A Django app with DEBUG=True renders its settings/URLconf on an error
+    page. We request a path that cannot exist and look for the debug 404's
+    signature -- a normal 404 page never carries it."""
+    import uuid
+    url = base.rstrip("/") + f"/{uuid.uuid4().hex[:12]}-webrecon-probe"
+    try:
+        r = await http.fetch(url)
+    except Exception:  # noqa: BLE001
+        return None
+    body = (r.text if r else "") or ""
+    hit = ("Using the URLconf defined in" in body) or \
+          ("DisallowedHost" in body and "ALLOWED_HOSTS" in body) or \
+          ("You're seeing this error because you have" in body and "DEBUG" in body)
+    if hit:
+        return {
+            "type": "django-debug",
+            "title": "Django DEBUG=True (settings / traceback disclosure)",
+            "severity": "medium",
+            "path": "/",
+            "url": base.rstrip("/") + "/",
+            "evidence": "debug error page exposes URLconf / settings",
+        }
+    return None
+
+
+async def _probe_werkzeug(http, base: str) -> dict | None:
+    """The Werkzeug/Flask interactive debugger serves its own JS resource even
+    when pin-locked; its presence means the debugger is enabled."""
+    url = base.rstrip("/") + "/?__debugger__=yes&cmd=resource&f=debugger.js"
+    try:
+        r = await http.fetch(url)
+    except Exception:  # noqa: BLE001
+        return None
+    body = (r.text if r else "") or ""
+    if r and r.status == 200 and ("CONSOLE_MODE" in body or
+                                  ("Werkzeug" in body and "debugger" in body.lower())):
+        return {
+            "type": "werkzeug-debugger",
+            "title": "Werkzeug interactive debugger enabled",
+            "severity": "medium",
+            "path": "/",
+            "url": base.rstrip("/") + "/",
+            "evidence": "debugger.js resource served (__debugger__)",
+        }
+    return None
+
+
 _SEV_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -289,6 +430,9 @@ async def probe_sensitive_paths(http, base_url: str, cfg=None) -> list[dict]:
 
     tasks = [_run_check(http, base, c) for c in CHECKS]
     tasks.append(_probe_heapdump_link(http, base))
+    tasks.append(_probe_graphql(http, base))
+    tasks.append(_probe_django_debug(http, base))
+    tasks.append(_probe_werkzeug(http, base))
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
     findings: list[dict] = []
@@ -297,6 +441,14 @@ async def probe_sensitive_paths(http, base_url: str, cfg=None) -> list[dict]:
             findings.append(g)
         # BaseException from a task is swallowed: a probe must never abort the set
     findings.extend(await _probe_autoindex(http, base))
+
+    # CORS reflection is a header-verified misconfiguration; its findings flow
+    # through the same exposure stream (distinct type, so dedupe keeps it).
+    try:
+        from . import cors
+        findings.extend(await cors.check_cors(http, base, cfg))
+    except Exception:  # noqa: BLE001
+        pass
 
     # dedupe by type: keep the highest-severity hit per type (first on ties)
     best: dict[str, dict] = {}
