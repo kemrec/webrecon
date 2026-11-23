@@ -64,3 +64,16 @@ def test_no_path_traversal_outside_allowlist():
                      "/static/index.html", "/static/../server.py"):
             r = httpx.get(base + path, timeout=5)
             assert r.status_code == 404, path
+
+
+def test_page_wires_greyed_download_during_scan():
+    # exports work only on the completed/cached scan, so the download panel is
+    # shown greyed+disabled during a scan (not hidden) with a hint, and enabled
+    # on completion -- so the operator doesn't click a dead/absent button.
+    with _running_server() as base:
+        body = httpx.get(base + "/", timeout=5).text
+    assert "setDownloadsState" in body
+    assert "available when the scan finishes" in body
+    assert "#downloads.pending" in body              # the greyed style
+    assert 'setDownloadsState("pending")' in body    # entered at scan start
+    assert 'setDownloadsState(scanId ? "ready" : "hidden")' in body

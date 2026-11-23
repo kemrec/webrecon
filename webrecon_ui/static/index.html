@@ -97,7 +97,11 @@
   a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
   .muted { color:var(--muted); }
   .empty { color:var(--muted); padding:20px; text-align:center; }
-  .dl { display:flex; gap:10px; margin-top:10px; }
+  .dl { display:flex; gap:10px; margin-top:10px; align-items:center; }
+  /* while a scan runs the panel is visible but greyed + inert, so the operator
+     sees the download controls exist yet knows they are not ready mid-scan */
+  #downloads.pending { opacity:.5; }
+  #downloads.pending button, #downloads.pending select { cursor:not-allowed; }
   /* saved-dir row: plain block so the [hidden] attribute always wins (no display override) */
   #saved-row { margin-top:10px; }
   #saved-row > * { margin-right:8px; vertical-align:middle; }
@@ -532,6 +536,21 @@ function setStatus(msg, isErr) {
   const s = $("status"); s.textContent = msg; s.className = isErr ? "err" : "";
 }
 
+// The export endpoints work off the cached, COMPLETED ScanResult, which the
+// server only mints (with a scan_id) after the whole scan -- web chain included
+// -- finishes. So during a scan there is nothing to download. Rather than hide
+// the controls (operator clicks a missing/dead button and thinks it's broken),
+// show them greyed + disabled with a hint, and enable them on completion.
+function setDownloadsState(state) {   // "hidden" | "pending" | "ready"
+  const dl = $("downloads");
+  if (state === "hidden") { dl.hidden = true; dl.classList.remove("pending"); return; }
+  dl.hidden = false;
+  const pending = state === "pending";
+  dl.classList.toggle("pending", pending);
+  for (const c of [$("dl-go"), $("dl-all"), $("fmt")]) c.disabled = pending;
+  $("dl-note").textContent = pending ? "available when the scan finishes" : "";
+}
+
 // High-level "what is the scan doing right now" line. The SSE stream emits a
 // {type:"phase"} tick at each sub-phase boundary (nmap / fingerprint / exposure
 // / render / cve / web); between the coarse host milestones these are the only
@@ -640,7 +659,7 @@ function doScan(ev) {
   if (!target) { setStatus("Enter a target.", true); return; }
   if (es) { es.close(); es = null; }
   $("go").disabled = true;
-  $("downloads").hidden = true;
+  setDownloadsState("pending");         // visible but greyed until the scan ends
   $("results").innerHTML = "";
   EXPANDED.clear(); COLLAPSED.clear();   // fresh expand/collapse state per scan
   lastOutdir = null; $("saved-row").hidden = true;   // clear prior save-to-disk path
@@ -677,7 +696,7 @@ function doScan(ev) {
       const secs = ((Date.now() - t0) / 1000).toFixed(1);
       const ns = hosts.reduce((n, h) => n + (h.services || []).length, 0);
       setStatus(`Done in ${secs}s — ${ns} service(s) across ${hosts.length} host(s)${msg.nmap_used ? " (nmap)" : ""}.`);
-      if (scanId) $("downloads").hidden = false;
+      setDownloadsState(scanId ? "ready" : "hidden");
       if (msg.outdir) {
         lastOutdir = msg.outdir;
         $("saved-path").textContent = msg.outdir;
@@ -688,12 +707,14 @@ function doScan(ev) {
       endScan();
     } else if (msg.type === "error") {
       setStatus("Error: " + (msg.error || "scan failed"), true);
+      setDownloadsState("hidden");             // no result was cached
       endScan();
     }
   };
   es.onerror = () => {
     if (!es) return;                           // normal close after 'done'
     setStatus("Stream interrupted.", true);
+    setDownloadsState("hidden");               // no scan_id -> nothing to export
     endScan();
   };
 }
