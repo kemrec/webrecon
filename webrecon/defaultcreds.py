@@ -44,7 +44,11 @@ class Panel:
     # (for Basic: a 401 whose WWW-Authenticate realm carries one of these).
     tech_markers: tuple[str, ...] = ()
     detect_needles: tuple[str, ...] = ()
-    # form/json field names + any constant extra fields
+    # path to GET for detection, when it differs from login_path (e.g. a
+    # POST-only API login whose presence is confirmed from the SPA root).
+    detect_path: str = ""
+    # form/json field names + any constant extra fields. An empty field_user
+    # means the panel has no username field (e.g. Jupyter's password-only login).
     field_user: str = "username"
     field_pass: str = "password"
     extra_fields: dict = field(default_factory=dict)
@@ -84,6 +88,36 @@ PANELS: list[Panel] = [
         token_regex=r'name="token"\s+value="(?P<tok>[^"]+)"',
         token_field="token",
     ),
+    Panel(
+        name="RabbitMQ Management", type="rabbitmq-management",
+        login_path="/api/overview", method="basic",
+        creds=(("guest", "guest"), ("admin", "admin"),
+               ("administrator", "administrator")),
+        success=('"rabbitmq_version"', '"management_version"', '"product_version"'),
+        tech_markers=("rabbitmq",),
+        detect_needles=("RabbitMQ",),
+    ),
+    Panel(
+        name="Portainer", type="portainer",
+        login_path="/api/auth", method="json",
+        creds=(("admin", "admin"), ("admin", "password"),
+               ("admin", "portainer"), ("admin", "portainer123")),
+        success=('"jwt"',),
+        tech_markers=("portainer",),
+        detect_path="/", detect_needles=("Portainer", "portainer.app"),
+        field_user="username", field_pass="password",
+    ),
+    Panel(
+        name="Jupyter", type="jupyter",
+        login_path="/login", method="form",
+        creds=(("", ""), ("", "jupyter"), ("", "password"), ("", "admin")),
+        success=("jupyter-config-data", "JupyterLab"),
+        tech_markers=("jupyter",),
+        detect_needles=("Jupyter", "_xsrf"),
+        field_user="", field_pass="password",
+        token_regex=r'name="_xsrf"\s+value="(?P<tok>[^"]+)"',
+        token_field="_xsrf",
+    ),
 ]
 
 
@@ -95,7 +129,7 @@ def _tech_present(panel: Panel, tech: set[str], server: str) -> bool:
 async def _detect(http, base: str, panel: Panel, tech: set[str]) -> tuple[bool, str]:
     """Return (present, server_header). Present if a tech marker matches or the
     login page carries a detection signature (401 Basic realm for basic auth)."""
-    url = base.rstrip("/") + panel.login_path
+    url = base.rstrip("/") + (panel.detect_path or panel.login_path)
     try:
         r = await http.fetch(url, read_body=True)
     except Exception:  # noqa: BLE001
@@ -141,8 +175,9 @@ async def _try_basic(http, url: str, panel: Panel) -> dict | None:
 
 async def _try_json(http, url: str, panel: Panel) -> dict | None:
     for user, pw in panel.creds[:_MAX_ATTEMPTS]:
-        payload = {panel.field_user: user, panel.field_pass: pw,
-                   **panel.extra_fields}
+        payload = {panel.field_pass: pw, **panel.extra_fields}
+        if panel.field_user:
+            payload[panel.field_user] = user
         try:
             r = await http.fetch(url, method="POST", json=payload, read_body=True)
         except Exception:  # noqa: BLE001
@@ -168,8 +203,9 @@ async def _try_form(http, base: str, url: str, panel: Panel) -> dict | None:
         except Exception:  # noqa: BLE001
             token = ""
     for user, pw in panel.creds[:_MAX_ATTEMPTS]:
-        payload = {panel.field_user: user, panel.field_pass: pw,
-                   **panel.extra_fields}
+        payload = {panel.field_pass: pw, **panel.extra_fields}
+        if panel.field_user:
+            payload[panel.field_user] = user
         if panel.token_field and token:
             payload[panel.token_field] = token
         try:

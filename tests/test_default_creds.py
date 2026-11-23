@@ -140,6 +140,72 @@ def test_phpmyadmin_default_login_with_token():
             found["phpMyAdmin"]["password"]) == ("root", "")
 
 
+# --- RabbitMQ Management (HTTP Basic) ---------------------------------------
+def test_rabbitmq_guest_guest_confirmed():
+    def h(method, path, auth, data, json):
+        if path != "/api/overview":
+            return None
+        if auth is None:
+            return _Resp(401, "", headers={
+                "www-authenticate": 'Basic realm="RabbitMQ Management"'})
+        if tuple(auth) == ("guest", "guest"):
+            return _Resp(200, '{"rabbitmq_version":"3.9.13",'
+                              '"management_version":"3.9.13"}')
+        return _Resp(401, "", headers={"www-authenticate": "Basic"})
+    found, _ = _run(h)
+    f = found["RabbitMQ Management"]
+    assert f["severity"] == "critical"
+    assert (f["username"], f["password"]) == ("guest", "guest")
+
+
+# --- Portainer (JSON login, detected from SPA root) -------------------------
+def test_portainer_default_login_confirmed():
+    def h(method, path, auth, data, json):
+        if path == "/" and method == "GET":
+            return _Resp(200, "<html><title>Portainer</title></html>")
+        if path == "/api/auth" and method == "POST":
+            if json and json.get("username") == "admin" \
+                    and json.get("password") == "admin":
+                return _Resp(200, '{"jwt":"eyJhbGciOiJ.fake.token"}',
+                             content_type="application/json")
+            return _Resp(422, '{"message":"Invalid credentials"}')
+        return None
+    found, _ = _run(h)
+    assert found["Portainer"]["severity"] == "critical"
+    assert found["Portainer"]["username"] == "admin"
+
+
+def test_portainer_wrong_creds_no_finding():
+    def h(method, path, auth, data, json):
+        if path == "/" and method == "GET":
+            return _Resp(200, "<html><title>Portainer</title></html>")
+        if path == "/api/auth" and method == "POST":
+            return _Resp(422, '{"message":"Invalid credentials"}')
+        return None
+    found, _ = _run(h)
+    assert "Portainer" not in found
+
+
+# --- Jupyter (password-only form + _xsrf token) -----------------------------
+def test_jupyter_password_login_confirmed():
+    def h(method, path, auth, data, json):
+        if path == "/login" and method == "GET":
+            return _Resp(200, '<html>Jupyter Notebook'
+                              '<input type="hidden" name="_xsrf" value="tok123">'
+                              '<input name="password"></html>')
+        if path == "/login" and method == "POST":
+            if data and data.get("password") == "jupyter" \
+                    and data.get("_xsrf") == "tok123":
+                return _Resp(200, '<html><script id="jupyter-config-data">'
+                                  '{}</script></html>')
+            return _Resp(200, '<html>Jupyter <input name="password"> invalid</html>')
+        return None
+    found, _ = _run(h)
+    assert found["Jupyter"]["severity"] == "critical"
+    assert found["Jupyter"]["password"] == "jupyter"
+    assert found["Jupyter"]["username"] == ""
+
+
 # --- detection gate ---------------------------------------------------------
 def test_absent_panels_are_not_attempted():
     """Everything 404s and no tech markers -> no detection, no login requests."""
