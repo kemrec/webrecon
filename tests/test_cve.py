@@ -162,3 +162,61 @@ def test_query_nvd_cpe_path_keeps_product_absent():
         http, cfg, cpe="cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
         keyword=None, products={"http_server"}, want_version="2.4.49"))
     assert {c.id for c in out} == {"CVE-OTHER"}
+
+
+def test_only_unbounded_match():
+    unb = {"configurations":
+           _conf("cpe:2.3:a:openbsd:openssh:*:*:*:*:*:*:*:*")}
+    assert cve._only_unbounded_match(unb, {"openssh"}) is True
+    # a real version bound present -> legitimately scoped, not unbounded
+    bounded = {"configurations":
+               _conf("cpe:2.3:a:openbsd:openssh:*:*:*:*:*:*:*:*",
+                     versionEndExcluding="9.8")}
+    assert cve._only_unbounded_match(bounded, {"openssh"}) is False
+    # an explicit version in the CPE field is also a bound
+    exact = {"configurations":
+             _conf("cpe:2.3:a:openbsd:openssh:4.7p1:*:*:*:*:*:*:*")}
+    assert cve._only_unbounded_match(exact, {"openssh"}) is False
+    # product never named -> nothing of ours to demote
+    other = {"configurations":
+             _conf("cpe:2.3:a:other:thing:*:*:*:*:*:*:*:*")}
+    assert cve._only_unbounded_match(other, {"openssh"}) is False
+
+
+def test_query_nvd_demotes_unbounded_wildcard_cve():
+    # OpenSSH 9.6p1: a legacy CVE whose only openssh node is an unbounded
+    # wildcard (no version range at all) attaches to EVERY build and otherwise
+    # reads as a live finding (the 2008-CVE-on-a-2026-SSH false positive). It is
+    # demoted to LOW with a caveat but kept as intel; a properly version-scoped
+    # CVE on the same product is left untouched.
+    legacy = ("CVE-2008-9999",
+              _conf("cpe:2.3:a:openbsd:openssh:*:*:*:*:*:*:*:*"))
+    scoped = ("CVE-2024-6387",
+              _conf("cpe:2.3:a:openbsd:openssh:*:*:*:*:*:*:*:*",
+                    versionEndExcluding="9.8"))
+    http = _NvdHTTP(_nvd_payload(legacy, scoped))
+    cfg = ScanConfig(target="x")
+    out = asyncio.run(cve.query_nvd(
+        http, cfg, cpe="cpe:2.3:a:openbsd:openssh:9.6p1:*:*:*:*:*:*:*",
+        keyword=None, products={"openssh"}, want_version="9.6p1"))
+    by = {c.id: c for c in out}
+    assert set(by) == {"CVE-2008-9999", "CVE-2024-6387"}   # kept, never dropped
+    d = by["CVE-2008-9999"]
+    assert d.effective_cvss == 0.0
+    assert d.disp_severity() == "LOW"
+    assert d.env_note                                       # caveat present
+    s = by["CVE-2024-6387"]
+    assert s.effective_cvss is None and s.env_note == ""    # scoped: untouched
+
+
+def test_query_nvd_no_demote_when_version_unknown():
+    # with no detected version the whole service is flagged unscoped elsewhere;
+    # query_nvd must not demote here (nothing to compare against).
+    legacy = ("CVE-2008-9999",
+              _conf("cpe:2.3:a:openbsd:openssh:*:*:*:*:*:*:*:*"))
+    http = _NvdHTTP(_nvd_payload(legacy))
+    cfg = ScanConfig(target="x")
+    out = asyncio.run(cve.query_nvd(
+        http, cfg, cpe="cpe:2.3:a:openbsd:openssh:*:*:*:*:*:*:*:*",
+        keyword=None, products={"openssh"}, want_version=""))
+    assert out[0].env_note == "" and out[0].effective_cvss is None

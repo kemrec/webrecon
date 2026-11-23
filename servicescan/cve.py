@@ -253,6 +253,42 @@ def version_applies(cve_obj: dict, products: set[str], want_version: str,
     return any(_match_cpe(m, want_version) for m in matches)
 
 
+def _only_unbounded_match(cve_obj: dict, products: set[str]) -> bool:
+    """True iff EVERY CPE node naming our product is an unbounded wildcard --
+    version ``*``/``-`` with no versionStart/End bound at all.
+
+    Such a node matches our detected version only because NVD states no range
+    whatsoever, which is the signature of legacy, pre-version-range CVEs (e.g.
+    CVE-2008-3844, the 2008 Red Hat OpenSSH trojaned-package incident, which is
+    not even an OpenSSH code flaw) wrongly reading as a live HIGH against a
+    modern build. The caller demotes these -- keep them as intel, drop them out
+    of the live crit/high counts -- rather than deleting (an unbounded CPE can,
+    rarely, genuinely mean "all versions"). False when the product never appears
+    or ANY matching node carries a real version bound (then it is legitimately
+    scoped and must not be demoted)."""
+    seen = False
+    for conf in cve_obj.get("configurations", []):
+        for node in conf.get("nodes", []):
+            for m in node.get("cpeMatch", []):
+                if not m.get("vulnerable", False):
+                    continue
+                parts = m.get("criteria", "").lower().split(":")
+                prod = parts[4] if len(parts) > 4 else ""
+                vend = parts[3] if len(parts) > 3 else ""
+                if not any(p and (p == prod or p == vend) for p in products):
+                    continue
+                seen = True
+                cpe_ver = parts[5] if len(parts) > 5 else "*"
+                bounded = (cpe_ver not in ("*", "-", "")) or any(
+                    m.get(k) for k in ("versionStartIncluding",
+                                       "versionStartExcluding",
+                                       "versionEndIncluding",
+                                       "versionEndExcluding"))
+                if bounded:
+                    return False
+    return seen
+
+
 # ---------------------------------------------------------------------------
 # NVD
 # ---------------------------------------------------------------------------
@@ -392,10 +428,30 @@ async def query_nvd(http, cfg: ScanConfig, cpe: str | None,
                         f"{len(before)}->{len(vulns)}")
 
     try:
-        return parse_nvd({"vulnerabilities": vulns})
+        parsed = parse_nvd({"vulnerabilities": vulns})
     except Exception as e:  # noqa: BLE001
         utils.debug(f"nvd parse: {e}")
         return []
+
+    # Demote legacy CVEs that match ONLY via an unbounded wildcard CPE (NVD gives
+    # no version range) when we DO know the version: they attach to every build
+    # and otherwise read as live findings (e.g. a 2008 CVE on a 2026 OpenSSH).
+    # Keep them as intel but drive display/counts off a demoted effective score.
+    demoted = 0
+    if want_version and products:
+        by_id = {c.id: c for c in parsed}
+        for it in vulns:
+            cobj = it.get("cve", {})
+            c = by_id.get(cobj.get("id"))
+            if c is not None and _only_unbounded_match(cobj, products):
+                c.env_note = ("NVD gives this CPE no version range, so it may "
+                              "not apply to this version.")
+                c.effective_cvss = 0.0
+                c.effective_severity = "LOW"
+                demoted += 1
+    if demoted:
+        utils.debug(f"nvd: demoted {demoted} unbounded-wildcard CVE(s)")
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -670,7 +726,7 @@ async def correlate(cfg: ScanConfig, http, services: list[Service],
             # are never trimmed before they are ranked.
             svc.cves = cves
             if svc.cves:
-                crit = sum(1 for c in svc.cves if (c.cvss or 0) >= 9)
+                crit = sum(1 for c in svc.cves if (c.disp_cvss() or 0) >= 9)
                 utils.hit(f":{svc.port} {svc.ident()} -> {len(svc.cves)} CVEs "
                           f"({crit} critical)")
 
