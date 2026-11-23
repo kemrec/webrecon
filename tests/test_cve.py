@@ -22,6 +22,23 @@ def test_make_cpe():
     assert cve.make_cpe("totally-unknown-xyz", "1.0") is None
 
 
+def test_nginx_maps_to_f5_vendor():
+    # NVD reclassified nginx under the "f5" vendor after F5 acquired nginx; the
+    # old "nginx:nginx" cpeName returns ZERO from NVD, so the map must target
+    # f5 or EVERY nginx CVE is silently missed (false negatives at any version).
+    assert cve.make_cpe("nginx", "1.18.0") == \
+        "cpe:2.3:a:f5:nginx:1.18.0:*:*:*:*:*:*:*"
+    # a real f5:nginx CVE node (CVE-2021-23017: resolver off-by-one, fixed in
+    # 1.20.1) must apply to an older nginx and not to a patched one, matched via
+    # our "nginx" product token against the CPE's product field.
+    obj = _cve(criteria="cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
+               versionEndExcluding="1.20.1")
+    assert cve.version_applies(obj, {"nginx"}, "1.18.0",
+                               require_product=True) is True
+    assert cve.version_applies(obj, {"nginx"}, "1.30.6",
+                               require_product=True) is False
+
+
 def test_cpe22_to_23():
     assert cve.cpe22_to_23("cpe:/a:apache:http_server:2.4.49") == \
         "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*"

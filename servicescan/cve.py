@@ -37,7 +37,10 @@ _CPE_MAP = {
     "apache httpd": ("apache", "http_server"),
     "apache": ("apache", "http_server"),
     "httpd": ("apache", "http_server"),
-    "nginx": ("nginx", "nginx"),
+    "nginx": ("f5", "nginx"),                 # NVD moved nginx CVEs to the "f5"
+                                              # vendor after F5 acquired nginx;
+                                              # the old "nginx:nginx" cpeName now
+                                              # returns ZERO (missed every CVE).
     "mysql": ("oracle", "mysql"),
     "mariadb": ("mariadb", "mariadb"),
     "redis": ("redis", "redis"),
