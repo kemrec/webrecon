@@ -670,7 +670,7 @@ Key flags: `-iL/--target-file`, `-p/--ports`, `--top-ports`, `--rate` (nmap `--m
 `--no-nmap`, `--udp`, `--nse`, `--nse-scripts`, `--fp-all`, `--render`, `--no-cam-creds`, `--realm/--domain`, `--no-cve`,
 `--no-nvd`, `--no-osv`, `--no-epss`, `--no-kev`, `--exploits`, `--nvd-api-key`,
 `--min-cvss`, `--all-cves`, `--kev-high`, `--no-cache`, `--cache-ttl`, `--web`, `--full`, `--web-render`,
-`--web-depth`, `--web-max-pages`, `--write-hosts`, `-c/--concurrency`,
+`--web-depth`, `--web-max-pages`, `--web-time-budget`, `--write-hosts`, `-c/--concurrency`,
 `-t/--timeout`, `-o/--outdir`. Full list: `servicescan -h`.
 
 Every scan writes, alongside `scan.json`: `services.txt`, `cves.txt`,
@@ -701,6 +701,7 @@ servicescan 10.0.0.5 --web                              # default chain (fast)
 servicescan 10.0.0.5 --full                             # thorough chain (one flag)
 servicescan 10.0.0.5 --web --web-render                 # default + JS rendering
 servicescan 10.0.0.5 --web --web-depth 2 --web-max-pages 150   # deeper/wider crawl
+servicescan 10.0.0.5 --web --web-time-budget 120        # cap each crawl at 2 min
 servicescan 10.0.0.5 --web --write-hosts                # also persist cert SANs
 servicescan 10.0.0.5 --full --web-depth 5               # full profile, depth tuned
 ```
@@ -714,10 +715,11 @@ What the flags do (all require, or imply, `--web`):
 | `--web-render` | enable Playwright JS rendering (catches JS-injected links; slower, needs Chromium) | off (on under `--full`) |
 | `--web-depth N` | crawl depth per web port | 1 (3 under `--full`) |
 | `--web-max-pages N` | hard page cap per web port | 60 (300 under `--full`) |
+| `--web-time-budget SEC` | wall-clock cap per web port; stops gracefully with partial results | no limit (600s under `--full`) |
 | `--write-hosts` | also append harvested cert SANs -> IP to `/etc/hosts` | off |
 
 `--full` is just a convenience profile: it sets render on and the deeper
-depth/page limits so you do not have to spell them out. **Any `--web-*` flag you
+depth/page/time limits so you do not have to spell them out. **Any `--web-*` flag you
 pass still wins**, e.g. `--full --web-depth 5` keeps everything `--full` turns on
 but uses depth 5.
 

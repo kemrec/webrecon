@@ -130,6 +130,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="crawl depth per web port (default 1, or 3 under --full)")
     wb.add_argument("--web-max-pages", type=int, default=None,
                     help="page cap per web port (default 60, or 300 under --full)")
+    wb.add_argument("--web-time-budget", type=float, default=None, metavar="SEC",
+                    help="wall-clock cap on each per-port crawl; stops "
+                         "gracefully with partial results once spent "
+                         "(default: no limit, or 600s under --full)")
     wb.add_argument("--write-hosts", action="store_true",
                     help="append harvested cert SANs -> IP to /etc/hosts "
                          "(needs root; for use by other tools)")
@@ -200,6 +204,8 @@ def cfg_from_args(a: argparse.Namespace) -> ScanConfig:
         web_depth=(a.web_depth if a.web_depth is not None else (3 if a.full else 1)),
         web_max_pages=(a.web_max_pages if a.web_max_pages is not None
                        else (300 if a.full else 60)),
+        web_time_budget=(a.web_time_budget if a.web_time_budget is not None
+                         else (600.0 if a.full else None)),
         write_hosts=a.write_hosts,
         concurrency=a.concurrency,
         timeout=a.timeout,
