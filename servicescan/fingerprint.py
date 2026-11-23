@@ -4182,10 +4182,51 @@ def _mark_exposure(svc, name, product, kind, version, script_id, crit_output):
                                       "without credentials)."})
 
 
+# Server-response-header tokens an HTTP "ops" product stamps on its own replies,
+# each equal to the keyword the name/port-gated probe below matches on. An ops
+# service on a non-standard port is fingerprinted by nmap only as a generic
+# server (MinIO, for one, shows up as "golang net/http"), so its probe never
+# fires on name/port alone; folding the token into `name` lets it run on any
+# port. Only products whose Server header is genuinely self-identifying belong
+# here -- a generic "nginx"/"Go-http" header would misroute.
+_SERVER_HEADER_PRODUCT_TOKENS = ("minio", "docker", "couchdb")
+
+
+async def _http_server_product_hint(host: str, port: int, timeout: float,
+                                    tls_guess: bool) -> str:
+    """One read-only GET / on an HTTP service: return a product keyword when the
+    Server response header self-identifies a product our exposure probes handle,
+    else "". Retries the opposite TLS mode once if the first try isn't HTTP, so a
+    custom-port HTTPS service is still read."""
+    for tls in (tls_guess, not tls_guess):
+        r = await _http_get_once(host, port, "/", timeout, tls)
+        if r is None:
+            continue
+        server = r[1].get("server", "").lower()
+        for tok in _SERVER_HEADER_PRODUCT_TOKENS:
+            if tok in server:
+                return tok
+        return ""   # got an HTTP reply; Server didn't self-identify -- done
+    return ""
+
+
 async def check_exposure(cfg: ScanConfig, host: str, svc: Service) -> None:
     """Run the read-only unauth check that matches this service, if any."""
     name = (svc.name or "").lower()
     port = svc.port
+
+    # An HTTP ops service on a non-standard port is fingerprinted by nmap only as
+    # a generic server (e.g. MinIO -> "golang net/http"), so none of the
+    # name/port-gated product probes below would fire. When the port speaks HTTP
+    # and nmap hasn't already named one of these products, read the root Server
+    # header once and fold a self-identifying token into `name`, so the matching
+    # probe runs no matter which port the service listens on.
+    if (is_web_service(svc)
+            and not any(t in name for t in _SERVER_HEADER_PRODUCT_TOKENS)):
+        hint = await _http_server_product_hint(
+            host, port, cfg.timeout, is_tls_service(svc))
+        if hint:
+            name = f"{name} {hint}".strip()
 
     if "redis" in name or port in _REDIS_PORTS:
         res = await redis_probe(host, port, cfg.timeout)

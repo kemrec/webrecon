@@ -264,3 +264,34 @@ def test_dispatch_portainer_uninit_is_alert():
               "/api/users/admin/check": _http(b"404 Not Found", b"")}
     svc = _check("portainer", _router(routes))
     assert "portainer-unauth" in {sc["id"] for sc in svc.scripts}
+
+
+# --- Server-header router: catch an ops product on a non-standard port -------
+# nmap fingerprints MinIO on a custom port only as a generic "golang net/http"
+# server, so svc.name is "http" and the name/port-gated minio branch never
+# fires. The Server-header sniff at the top of check_exposure must fold "minio"
+# into the name so the probe still runs.
+def test_dispatch_minio_detected_via_server_header_on_generic_name():
+    routes = {
+        "/minio/health/live": _http(b"200 OK", b"", {"Server": "MinIO"}),
+        "/": _http(b"200 OK", b"<ListAllMyBucketsResult/>", {"Server": "MinIO"}),
+    }
+    svc = _check("http", _router(routes))      # generic nmap name, no "minio"
+    assert "minio-unauth" in {sc["id"] for sc in svc.scripts}
+
+
+def test_server_header_router_does_not_misroute_generic_go_server():
+    # A plain Go net/http server (no self-identifying Server token) must not be
+    # routed to any ops probe.
+    routes = {"/": _http(b"200 OK", b"hello", {"Server": "Go-http-server/1.1"})}
+    svc = _check("http", _router(routes))
+    assert not any(t in sc["id"]
+                   for sc in svc.scripts
+                   for t in fp._SERVER_HEADER_PRODUCT_TOKENS)
+
+
+def test_http_server_product_hint_reads_server_token():
+    routes = {"/": _http(b"403 Forbidden", b"", {"Server": "MinIO"})}
+    hint = _run(_router(routes),
+                lambda h, p, t: fp._http_server_product_hint(h, p, t, False))
+    assert hint == "minio"
