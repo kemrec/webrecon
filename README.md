@@ -39,6 +39,7 @@ This repo ships **two CLIs and a browser console**, all sharing one async core:
 | **Liveness check** | Probes discovered URLs and hosts; reports status, final URL, title, and `Server` header. |
 | **Subdomain enumeration** | Passive enum via crt.sh (Certificate Transparency) + optional wordlist. |
 | **Cert → vhost discovery** | Reads `subjectAltName` DNS names from the target's TLS certificate, then fuzzes the `Host:` header against the shared IP to surface hidden virtual hosts (baseline-divergence detection). |
+| **Sensitive-path probe** | Content-verified checklist run per web port: exposed VCS dirs (`.git` / `.svn` / `.hg`), Spring Boot Actuator (`/actuator`, `/env`, `/mappings`, and heapdump — confirmed via the link index, never downloaded), secrets-in-files (`.env`, `.htpasswd`, `web.config`, `.DS_Store`), status/debug surfaces (Apache `server-status`, Go `pprof`, Prometheus `metrics`), unauthenticated datastore HTTP (Elasticsearch / CouchDB / Kibana), and directory listings. Every hit is gated on a response-body signature — never a bare 200 — so soft-404s and SPA shells don't produce false positives. Written to `exposures.txt`. |
 | **Secret scanning** | 50+ provider rules (gitleaks / truffleHog family): AWS / Azure / GCP / DigitalOcean / Vault / GitHub / GitLab / Atlassian / Slack / Discord / Telegram / Twilio / SendGrid / Stripe / Square / PayPal / npm / PyPI / OpenAI / Anthropic / HuggingFace / Shopify / Datadog / New Relic / Postman / Databricks / Notion / Grafana / Mapbox / Dropbox keys, JWTs, private-key blocks, DB connection strings, basic-auth-in-URL, and generic `password=/token=/secret=/apikey=/username=` assignments — with entropy + placeholder filtering. `--aggressive` adds an opt-in entropy sweep for secret-shaped strings under unrecognised key names (gitleaks `generic-api-key`; noisier, rated low). Findings carry the full value (operator tool, not redacted), severity-tagged, with source + line. |
 | **Clean output** | Full `report.json` plus greppable `*.txt` lists, and a colored console summary. |
 
@@ -112,6 +113,7 @@ webrecon example.com -H "Cookie: sid=abc" -H "X-Api-Key: k" \
 | `vhost`   | cert SAN + Host-header vhost fuzzing |
 | `alive`   | liveness probing |
 | `openapi` | OpenAPI/Swagger spec discovery + route extraction |
+| `paths`   | content-verified sensitive-path probe (`.git` / Actuator / `.env` / datastores / dir-listing) |
 
 ### Common options
 
@@ -187,6 +189,7 @@ single-directory behaviour). Files in each run directory:
 - `params.txt` — `endpoint<TAB>param1,param2`
 - `subdomains.txt`, `alive.txt`, `vhosts.txt`
 - `secrets.txt` — `[SEVERITY] type  value  source:line` (full value, not redacted)
+- `exposures.txt` — content-verified sensitive-path hits (`[SEVERITY] title<TAB>url<TAB>evidence`)
 - `tech.txt` — detected technologies (server, framework, CMS, JS libs)
 - `forms.txt` — `METHOD<TAB>action-url<TAB>field1,field2` for every HTML form
 - `openapi.txt` — any OpenAPI/Swagger spec found (`spec-url<TAB>title vN<TAB>N paths<TAB>N endpoints`); its routes also merge into `endpoints.txt` / `params.txt` / `urls.txt`

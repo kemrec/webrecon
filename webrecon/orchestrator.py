@@ -2,6 +2,7 @@
 
 Phase order:
   1. crawl (render + JS mining + secrets)          -> seeds hosts/urls
+  1b. sensitive-path probe (content-verified)       -> exposure findings
   2. discovery (cert SANs, crt.sh, vhost fuzz)      -> new hosts
   3. crawl discovered live hosts (shallow)          -> endpoints on vhosts/subs
   4. alive probe (urls + hosts)
@@ -29,6 +30,23 @@ async def run(cfg: Config, control=None) -> dict:
             async with Crawler(cfg, http, control=control) as crawler:
                 r1 = await crawler.run([cfg.target])
             _merge(agg, r1)
+
+        # ---- phase 1b: sensitive-path probe (content-verified) ----
+        # Runs against this exact base URL (scheme://host:port), so in the
+        # servicescan --web chain it is per-port and its output lands in the
+        # per-port dir for free. Every hit is gated on a body signature.
+        sensitive_paths: list = []
+        if getattr(cfg, "do_sensitive_paths", True):
+            utils.info("phase 1b: content-verified sensitive-path probe")
+            try:
+                from . import probes
+                sensitive_paths = await probes.probe_sensitive_paths(
+                    http, cfg.target, cfg)
+                if sensitive_paths:
+                    utils.good(f"sensitive-path probe: {len(sensitive_paths)} "
+                               f"exposure(s) confirmed")
+            except Exception as e:  # noqa: BLE001
+                utils.warn(f"sensitive-path probe failed ({e}); continuing")
 
         # ---- phase 2: discovery ----
         disco = None
@@ -153,6 +171,7 @@ async def run(cfg: Config, control=None) -> dict:
             "tech": sorted(agg.tech),
             "forms": in_forms,
             "openapi": openapi_specs,
+            "sensitive_paths": sensitive_paths,
         }
         return data
     finally:

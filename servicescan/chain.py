@@ -241,6 +241,7 @@ async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
         _secrets = data.get("secrets", []) or []
         _params = data.get("params", {}) or {}
         _endpoints = data.get("endpoints", []) or []
+        _exposures = data.get("sensitive_paths", []) or []
         svc.web = {
             "url": url,
             "scheme": scheme,
@@ -263,7 +264,16 @@ async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
             "param_list": [{"ep": ep, "names": (names or [])[:12]}
                            for ep, names in list(_params.items())[:_WEB_SAMPLE]],
             "secret_list": _secrets[:_WEB_SAMPLE],
+            # content-verified sensitive-path exposures (.git, actuator, .env,
+            # unauth datastores, dir-listing, ...). Full list in exposures.txt.
+            "exposures": len(_exposures),
+            "exposure_list": _exposures[:_WEB_SAMPLE],
         }
         nv = len(svc.web["vhosts"])
         if nv:
             utils.hit(f":{svc.port} web chain found {nv} vhost(s) on {ip or seed_host}")
+        ne = len(_exposures)
+        if ne:
+            eh = sum(1 for e in _exposures if e.get("severity") == "high")
+            utils.hit(f":{svc.port} web chain confirmed {ne} exposure(s)"
+                      f"{f' ({eh} high)' if eh else ''} on {ip or seed_host}")

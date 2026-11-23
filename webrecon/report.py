@@ -68,6 +68,12 @@ def write_all(outdir: str, data: dict) -> None:
                       f"{','.join(f.get('params', []))}")
     _w(os.path.join(outdir, "forms.txt"), flines)
 
+    exposures = data.get("sensitive_paths", []) or []
+    if exposures:
+        _w(os.path.join(outdir, "exposures.txt"),
+           [f"[{e['severity'].upper()}] {e['title']}\t{e['url']}\t{e.get('evidence','')}"
+            for e in exposures])
+
     specs = data.get("openapi", [])
     if specs:
         olines = [f"{s.get('url','')}\t{s.get('title','')} "
@@ -116,7 +122,22 @@ def console_summary(data: dict) -> None:
     if techs:
         print(f"  {C.CYN}technologies{C.R}      : {', '.join(techs[:12])}"
               f"{' ...' if len(techs) > 12 else ''}")
+    exposures = s.get("sensitive_paths", []) or []
+    if exposures:
+        eh = sum(1 for e in exposures if e["severity"] == "high")
+        exp_col = C.RED if eh else C.YEL
+        print(f"  {exp_col}exposures{C.R}         : {len(exposures)} "
+              f"({C.RED}{eh} high{C.R})")
     print(f"{C.B}{'='*60}{C.R}")
+
+    if exposures:
+        print(f"{C.MAG}{C.B}  Sensitive-path exposures:{C.R}")
+        for e in exposures:
+            col = C.RED if e["severity"] == "high" else (
+                C.YEL if e["severity"] == "medium" else C.GRY)
+            print(f"   {col}[{e['severity'][:1].upper()}]{C.R} {e['title']}  "
+                  f"{C.GRY}{e['url']}{C.R}")
+        print()
 
     if sec:
         print(f"{C.MAG}{C.B}  Top secret findings:{C.R}")

@@ -84,6 +84,14 @@ class Config:
     do_vhost: bool = True
     do_alive: bool = True
     do_openapi: bool = True               # probe for OpenAPI/Swagger specs
+    # content-verified probe for exposed sensitive paths (.git, Spring Boot
+    # Actuator, .env, directory listings, unauth datastores, ...). Every hit is
+    # gated on a body signature, not just a 200, so false positives are rare.
+    do_sensitive_paths: bool = True
+    # opt-in: try a tiny known-default credential set against detected admin
+    # panels (one attempt per panel, no brute-force). OFF by default -- it sends
+    # login requests and can trip account lockouts, so it is never implicit.
+    try_default_creds: bool = False
 
     # wordlists / sources
     vhost_wordlist: str | None = None

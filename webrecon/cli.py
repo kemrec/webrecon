@@ -85,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     sel = p.add_argument_group("phases")
     sel.add_argument("--only", default=None,
                      help="comma list of phases to RUN: "
-                          "crawl,js,secrets,subs,vhost,alive,openapi")
+                          "crawl,js,secrets,subs,vhost,alive,openapi,paths")
     sel.add_argument("--skip", default=None,
                      help="comma list of phases to SKIP (same names)")
 
@@ -105,7 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
 _PHASE_ATTR = {
     "crawl": "do_crawl", "js": "do_js_extract", "secrets": "do_secrets",
     "subs": "do_subdomains", "vhost": "do_vhost", "alive": "do_alive",
-    "openapi": "do_openapi",
+    "openapi": "do_openapi", "paths": "do_sensitive_paths",
 }
 
 

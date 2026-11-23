@@ -46,6 +46,11 @@ class Response:
     length: int
     ok: bool
     error: str | None = None
+    # first bytes of the body, always populated (the body is already fully in
+    # memory — httpx read it non-streaming). Lets content-signature checks match
+    # binary magic (e.g. .DS_Store 'Bud1') without a second fetch. Capped so a
+    # large/binary body never bloats the Response.
+    raw: bytes = b""
 
 
 class HTTPClient:
@@ -111,6 +116,7 @@ class HTTPClient:
                         content_type=r.headers.get("content-type", ""),
                         length=int(r.headers.get("content-length", len(r.content or b""))),
                         ok=True,
+                        raw=(r.content or b"")[:8192],
                     )
                 except Exception as e:  # noqa: BLE001
                     last_err = f"{type(e).__name__}: {e}"
