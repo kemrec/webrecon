@@ -361,6 +361,8 @@ function renderService(svc, hostIp) {
   const ident = el("div");
   ident.appendChild(el("span", null, idv));
   if (svc.extrainfo) { ident.appendChild(document.createTextNode(" ")); ident.appendChild(el("span", "muted", "· " + svc.extrainfo)); }
+  const pageTitle = svc.http && svc.http.title;
+  if (pageTitle) { ident.appendChild(document.createTextNode(" ")); ident.appendChild(el("span", "muted", '· "' + pageTitle + '"')); }
   idTd.appendChild(ident);
 
   // summary chips (compact counts, shown whether or not the row is expanded)

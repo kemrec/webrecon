@@ -54,6 +54,8 @@ def write_jsonl(outdir: str, result) -> None:
             obj = {"host": hid, "hostname": hn, "port": s.port,
                    "proto": s.proto, "name": s.name, "product": s.product,
                    "version": s.version, "confidence": s.confidence,
+                   "extrainfo": s.extrainfo, "http": s.http,
+                   "scripts": s.scripts,
                    "cves": [c.to_dict() for c in s.cves]}
             fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
