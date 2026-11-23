@@ -78,6 +78,22 @@
   .web { margin:6px 0 0; font-size:12px; color:var(--muted); }
   .web .lead { color:var(--accent); font-weight:600; }
   .web .secret { color:var(--alert); font-weight:700; }
+  .mono { font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .web-head { cursor:default; }
+  .web.has-items .web-head { cursor:pointer; }
+  .web-body { display:none; margin:6px 0 2px 14px; }
+  .web.web-open .web-body { display:block; }
+  .web-sec-h { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.4px; margin:8px 0 3px; }
+  .web-list { margin:0; padding:0; list-style:none; display:flex; flex-direction:column; gap:3px; }
+  .web-list li { font-size:12px; word-break:break-all; }
+  .secrets li { display:flex; gap:7px; align-items:baseline; flex-wrap:wrap;
+                padding:4px 8px; border-radius:5px; background:var(--panel2);
+                border-left:3px solid var(--alert); }
+  .secrets li .id { font-weight:700; }
+  .sev-b { font-size:10px; font-weight:700; padding:0 5px; border-radius:3px; text-transform:uppercase; }
+  .sev-b.high { background:var(--alert); color:#fff; }
+  .sev-b.medium { background:var(--warn); color:#111; }
+  .sev-b.low { background:var(--panel2); color:var(--muted); border:1px solid var(--line); }
   a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
   .muted { color:var(--muted); }
   .empty { color:var(--muted); padding:20px; text-align:center; }
@@ -389,20 +405,80 @@ function renderService(svc, hostIp) {
 
   if (hasWeb) {
     const w = svc.web;
-    const div = el("div", "web");
-    div.appendChild(Object.assign(el("span", "lead"), { textContent: "web chain → " }));
+    const wrap = el("div", "web");
+    const secList = w.secret_list || [], epList = w.endpoint_list || [],
+          paramList = w.param_list || [];
+    const hasItems = secList.length || epList.length || paramList.length;
+    if (hasItems) wrap.classList.add("has-items");
+
+    // counts header — click to expand the actual items below (like the
+    // service-row accordion; the full set is in the saved output tree).
+    const head = el("div", "web-head");
+    head.appendChild(el("span", "caret", hasItems ? "▸" : ""));
+    head.appendChild(Object.assign(el("span", "lead"), { textContent: "web chain → " }));
     const bits = [`${w.pages || 0} pages`, `${w.urls || 0} urls`,
                   `${w.endpoints || 0} endpoints`, `${w.params || 0} params`];
-    div.appendChild(document.createTextNode(bits.join(" · ")));
+    head.appendChild(document.createTextNode(bits.join(" · ")));
     if (w.secrets) {
-      div.appendChild(document.createTextNode(" · "));
-      div.appendChild(Object.assign(el("span", "secret"), { textContent: `${w.secrets} secrets` }));
+      head.appendChild(document.createTextNode(" · "));
+      head.appendChild(Object.assign(el("span", "secret"), { textContent: `${w.secrets} secrets` }));
     }
     if (w.vhosts && w.vhosts.length)
-      div.appendChild(document.createTextNode(` · ${w.vhosts.length} vhosts`));
+      head.appendChild(document.createTextNode(` · ${w.vhosts.length} vhosts`));
     if (w.tech && w.tech.length)
-      div.appendChild(document.createTextNode(" · tech: " + w.tech.slice(0, 6).join(", ")));
-    detail.appendChild(div);
+      head.appendChild(document.createTextNode(" · tech: " + w.tech.slice(0, 6).join(", ")));
+    wrap.appendChild(head);
+
+    if (hasItems) {
+      const body = el("div", "web-body");
+      // secrets first (operator priority); values shown unredacted, as on disk
+      if (secList.length) {
+        body.appendChild(el("div", "web-sec-h", `secrets (${w.secrets})`));
+        const ul = el("ul", "web-list secrets");
+        for (const s of secList) {
+          const li = el("li");
+          li.appendChild(Object.assign(el("span", "sev-b " + (s.severity || "low")),
+            { textContent: s.severity || "?" }));
+          li.appendChild(Object.assign(el("span", "id"), { textContent: s.type || "secret" }));
+          li.appendChild(Object.assign(el("span", "mono"), { textContent: (s.match_preview || "").slice(0, 80) }));
+          if (s.source) li.appendChild(Object.assign(el("span", "muted"), { textContent: "· " + s.source }));
+          ul.appendChild(li);
+        }
+        if (w.secrets > secList.length)
+          ul.appendChild(Object.assign(el("li", "muted"), { textContent: `+ ${w.secrets - secList.length} more (in saved output)` }));
+        body.appendChild(ul);
+      }
+      if (epList.length) {
+        body.appendChild(el("div", "web-sec-h", `endpoints (${w.endpoints})`));
+        const ul = el("ul", "web-list");
+        for (const e of epList) ul.appendChild(Object.assign(el("li", "mono"), { textContent: e }));
+        if (w.endpoints > epList.length)
+          ul.appendChild(Object.assign(el("li", "muted"), { textContent: `+ ${w.endpoints - epList.length} more` }));
+        body.appendChild(ul);
+      }
+      if (paramList.length) {
+        body.appendChild(el("div", "web-sec-h", `params (${w.params})`));
+        const ul = el("ul", "web-list");
+        for (const p of paramList) {
+          const li = el("li", "mono");
+          li.appendChild(document.createTextNode(p.ep || ""));
+          if (p.names && p.names.length)
+            li.appendChild(Object.assign(el("span", "muted"), { textContent: "  " + p.names.join(", ") }));
+          ul.appendChild(li);
+        }
+        if (w.params > paramList.length)
+          ul.appendChild(Object.assign(el("li", "muted"), { textContent: `+ ${w.params - paramList.length} more` }));
+        body.appendChild(ul);
+      }
+      wrap.appendChild(body);
+
+      head.addEventListener("click", (ev) => {
+        ev.stopPropagation();            // don't toggle the parent service row
+        const open = wrap.classList.toggle("web-open");
+        head.querySelector(".caret").textContent = open ? "▾" : "▸";
+      });
+    }
+    detail.appendChild(wrap);
   }
   idTd.appendChild(detail);
   tr.appendChild(idTd);

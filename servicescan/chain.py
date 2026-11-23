@@ -23,6 +23,9 @@ from webrecon import orchestrator as web_orch, report as web_report
 
 _WEB_NAMES = ("http", "https", "http-alt", "http-proxy", "https-alt")
 _HOSTS_MARK = "# servicescan --web (cert SANs)"
+# per-service cap on the actual web items echoed into svc.web for the UI to
+# expand (endpoints / params / secrets). The full set is always on disk.
+_WEB_SAMPLE = 60
 
 
 # shared with report.py (nuclei target list): one definition of "is this web /
@@ -222,21 +225,31 @@ async def _chain_host(cfg: ScanConfig, host: Host, multi: bool,
                 if action and fields:
                     all_params.setdefault(action, set()).update(fields)
 
+        _secrets = data.get("secrets", []) or []
+        _params = data.get("params", {}) or {}
+        _endpoints = data.get("endpoints", []) or []
         svc.web = {
             "url": url,
             "scheme": scheme,
             "outdir": wcfg.outdir,
             "pages": len(data.get("pages", {})),
             "urls": len(data.get("urls", [])),
-            "endpoints": len(data.get("endpoints", [])),
-            "params": len(data.get("params", {})),
+            "endpoints": len(_endpoints),
+            "params": len(_params),
             "vhosts": data.get("vhosts", []),
-            "secrets": len(data.get("secrets", [])),
+            "secrets": len(_secrets),
             "subdomains": data.get("subdomains", []),
             # technologies the crawl identified (hand-written sigs + the shared
             # catalog, incl. JS-global/DOM apps when web rendering was on). CVE
             # for the versioned ones comes from servicescan's own --render pass.
             "tech": data.get("tech", []),
+            # bounded samples of the ACTUAL findings so the UI can expand the
+            # web summary into real items (the counts above stay authoritative;
+            # the full, unbounded set is in the saved output tree / zip).
+            "endpoint_list": _endpoints[:_WEB_SAMPLE],
+            "param_list": [{"ep": ep, "names": (names or [])[:12]}
+                           for ep, names in list(_params.items())[:_WEB_SAMPLE]],
+            "secret_list": _secrets[:_WEB_SAMPLE],
         }
         nv = len(svc.web["vhosts"])
         if nv:
