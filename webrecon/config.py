@@ -55,6 +55,13 @@ class Config:
     # networking
     concurrency: int = 40                 # async concurrency for probes/fetches
     timeout: float = 12.0                 # seconds per HTTP request
+    # hard total cap (seconds) per fetch attempt. httpx's `timeout` bounds the
+    # gap between network reads, NOT the total time, so a server that trickles
+    # the body slower than `timeout` keeps a request alive forever -- which hung
+    # whole scans in the non-crawl phases (alive/openapi/vhost, outside the crawl
+    # budget). Every fetch attempt is wrapped in asyncio.wait_for with this cap.
+    # None auto-sizes to max(timeout * 3, 30).
+    request_hard_timeout: float | None = None
     retries: int = 1
     user_agent: str = DEFAULT_UA
     verify_tls: bool = False              # recon default: don't fail on bad certs

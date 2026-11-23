@@ -54,6 +54,10 @@ class HTTPClient:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._sem = asyncio.Semaphore(cfg.concurrency)
+        # hard total cap per attempt (httpx's timeout is per-read, not total, so
+        # a slow-trickle body would otherwise hang forever).
+        self._hard_timeout = (getattr(cfg, "request_hard_timeout", None)
+                              or max(float(cfg.timeout) * 3.0, 30.0))
         headers = {"User-Agent": cfg.user_agent, **cfg.extra_headers}
         limits = httpx.Limits(max_connections=cfg.concurrency * 2,
                               max_keepalive_connections=cfg.concurrency)
@@ -85,7 +89,12 @@ class HTTPClient:
         for attempt in range(self.cfg.retries + 1):
             async with self._sem:
                 try:
-                    r = await self._client.request(method, url, headers=headers)
+                    # hard total cap: httpx reads the full body inside request()
+                    # (non-streaming), so wrapping this bounds a trickled body
+                    # that the per-read timeout alone would let hang forever.
+                    r = await asyncio.wait_for(
+                        self._client.request(method, url, headers=headers),
+                        timeout=self._hard_timeout)
                     body = ""
                     if read_body:
                         ctype = r.headers.get("content-type", "")
