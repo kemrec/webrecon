@@ -266,3 +266,28 @@ def test_correlate_nginx_unions_open_source_base():
                    product="apache", version="2.4.49")
     asyncio.run(cve.correlate(cfg, http2, [svc2]))
     assert {c.id for c in svc2.cves} == {"CVE-A"}   # no stray open_source query
+
+
+def test_correlate_nginx2root_boundary_via_open_source():
+    # nginx2root (Nov 2026, CVE-2026-123007 et al.): five HTTP/2/HTTP/3/resolver/
+    # mail use-after-free CVEs, all filed under f5:nginx_open_source, affecting up
+    # to 1.31.8 and fixed in 1.31.9/1.30.7. A representative one must be matched on
+    # an affected version and pruned on the fix -- proving the open_source base +
+    # the version range gate together give correct nginx2root coverage.
+    from servicescan.models import Service
+    n2r = ("CVE-2026-123007",
+           _conf("cpe:2.3:a:f5:nginx_open_source:*:*:*:*:*:*:*:*",
+                 versionStartIncluding="1.9.5", versionEndExcluding="1.31.9"))
+    http = _ByProductNvdHTTP([("nginx_open_source", _nvd_payload(n2r))])
+    cfg = ScanConfig(target="x", nvd=True, osv=False, epss=False, kev=False,
+                     min_cvss=0.0, kev_high_only=False, cve_cache=False)
+
+    affected = Service(port=80, proto="tcp", state="open", name="http",
+                       product="nginx", version="1.27.0")
+    asyncio.run(cve.correlate(cfg, http, [affected]))
+    assert "CVE-2026-123007" in {c.id for c in affected.cves}
+
+    fixed = Service(port=80, proto="tcp", state="open", name="http",
+                    product="nginx", version="1.31.9")
+    asyncio.run(cve.correlate(cfg, http, [fixed]))
+    assert "CVE-2026-123007" not in {c.id for c in fixed.cves}
