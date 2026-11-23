@@ -37,6 +37,18 @@
   button.ghost:hover { background:var(--panel2); }
   #status { color:var(--muted); font-size:13px; min-height:18px; }
   #status.err { color:var(--alert); }
+  #progress { margin:10px 0 2px; }
+  #live-history { display:flex; flex-direction:column; gap:1px; margin-bottom:3px; }
+  #live-history > div { color:var(--muted); opacity:.5; font-size:12px;
+    font-family:ui-monospace,Menlo,Consolas,monospace; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; }
+  #live-action { display:flex; align-items:center; gap:8px; color:var(--fg);
+    font-size:13px; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .spin { width:12px; height:12px; flex:0 0 auto; border-radius:50%;
+    border:2px solid var(--line); border-top-color:var(--accent);
+    animation:spin .7s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation:none; } }
   .host-h { display:flex; align-items:baseline; gap:10px; margin:6px 0 10px; }
   .host-h .ip { font-size:15px; font-weight:600; }
   .host-h .meta { color:var(--muted); font-size:12px; }
@@ -159,6 +171,11 @@
         <span id="status"></span>
       </div>
     </form>
+  </div>
+
+  <div id="progress" hidden>
+    <div id="live-history"></div>
+    <div id="live-action"><span class="spin"></span><span id="live-text"></span></div>
   </div>
 
   <div id="results"></div>
@@ -439,6 +456,42 @@ function setStatus(msg, isErr) {
   const s = $("status"); s.textContent = msg; s.className = isErr ? "err" : "";
 }
 
+// High-level "what is the scan doing right now" line. The SSE stream emits a
+// {type:"phase"} tick at each sub-phase boundary (nmap / fingerprint / exposure
+// / render / cve / web); between the coarse host milestones these are the only
+// sign of life during long stretches (CVE correlation especially). We surface
+// the current phase on a spinner line, with the few previous ones dimmed above.
+const PHASE_LABELS = {
+  nmap:        () => "Scanning ports (nmap) …",
+  fingerprint: (h) => `${h} · fingerprinting services …`,
+  exposure:    (h) => `${h} · checking for exposed services …`,
+  render:      (h) => `${h} · rendering web pages …`,
+  cve:         (h) => `${h} · correlating CVEs (NVD / OSV) …`,
+  web:         () => "Web chain · handing web ports to webrecon …",
+};
+function phaseText(msg) {
+  const f = PHASE_LABELS[msg.phase];
+  return f ? f(msg.host || "") : null;
+}
+function pushPhase(text) {
+  if (!text) return;
+  const hist = $("live-history");
+  const cur = $("live-text").textContent;
+  if (cur) {
+    const line = document.createElement("div");
+    line.textContent = cur;
+    hist.prepend(line);
+    while (hist.children.length > 3) hist.removeChild(hist.lastChild);
+  }
+  $("live-text").textContent = text;
+  $("progress").hidden = false;
+}
+function clearProgress() {
+  $("progress").hidden = true;
+  $("live-history").innerHTML = "";
+  $("live-text").textContent = "";
+}
+
 async function fetchAndSave(fmt, fallbackName) {
   if (!scanId) return;
   const note = $("dl-note"); note.textContent = "";
@@ -500,6 +553,7 @@ async function openFolder() {
 function endScan() {
   if (es) { es.close(); es = null; }
   $("go").disabled = false;
+  clearProgress();
 }
 
 // Live scan over Server-Sent Events: hosts render as each one finishes, instead
@@ -514,6 +568,7 @@ function doScan(ev) {
   $("results").innerHTML = "";
   EXPANDED.clear(); COLLAPSED.clear();   // fresh expand/collapse state per scan
   lastOutdir = null; $("saved-row").hidden = true;   // clear prior save-to-disk path
+  clearProgress();                                   // fresh live-phase panel
   const hosts = [];
   let expected = null;
   const t0 = Date.now();
@@ -522,7 +577,9 @@ function doScan(ev) {
   es = new EventSource("/api/scan/stream?" + buildQuery());
   es.onmessage = (e) => {
     let msg; try { msg = JSON.parse(e.data); } catch (_) { return; }
-    if (msg.type === "start") {
+    if (msg.type === "phase") {
+      pushPhase(phaseText(msg));
+    } else if (msg.type === "start") {
       expected = msg.nhosts;
       setStatus(expected
         ? `Scanning ${target} … ${expected} host(s) with open ports`

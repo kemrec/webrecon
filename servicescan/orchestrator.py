@@ -30,8 +30,13 @@ async def run(cfg: ScanConfig, on_event=None) -> ScanResult:
     `on_event`, if given, is a plain callable invoked with small JSON-able dicts
     as milestones are reached -- {"type":"start","nhosts":N} once hosts are
     discovered, then {"type":"host","host":<host.to_dict()>} as each host's
-    fingerprint/exposure/CVE work completes. It drives the web UI's live stream;
-    it is best-effort (exceptions are swallowed) and never changes the result.
+    fingerprint/exposure/CVE work completes. Between those coarse milestones it
+    also emits high-level progress ticks {"type":"phase","phase":<name>,
+    "host":<label>} at each sub-phase boundary (nmap / fingerprint / exposure /
+    render / cve / web), so a live consumer can show what the scan is doing
+    during the long silent stretches instead of a frozen label. Phase ticks
+    carry no results and are advisory. It drives the web UI's live stream; it is
+    best-effort (exceptions are swallowed) and never changes the result.
     """
     def _emit(ev):
         if on_event is not None:
@@ -45,6 +50,7 @@ async def run(cfg: ScanConfig, on_event=None) -> ScanResult:
 
     # ---- phase 1: discover hosts + open ports ----
     if cfg.use_nmap and nmap_engine.nmap_available(cfg.nmap_path):
+        _emit({"type": "phase", "phase": "nmap"})
         hosts, _xml = await nmap_engine.run_nmap(cfg)
         result.nmap_used = True
     else:
@@ -77,16 +83,21 @@ async def run(cfg: ScanConfig, on_event=None) -> ScanResult:
             conn_host = h.ip or h.hostname
             if nhosts > 1:
                 utils.info(f"host {h.label()}: {len(h.services)} open service(s)")
+            label = h.label()
             if cfg.fingerprint:
+                _emit({"type": "phase", "phase": "fingerprint", "host": label})
                 await fingerprint.run_fingerprint(cfg, http, conn_host, h.services)
+                _emit({"type": "phase", "phase": "exposure", "host": label})
                 await fingerprint.run_exposure_checks(cfg, conn_host, h.services)
                 await fingerprint.run_discovery_probes(cfg, http, conn_host,
                                                        h.services)
             if cfg.render:
                 # render web-port roots to catch JS-global/DOM-only catalog apps
                 # BEFORE CVE so their versioned hits correlate (opt-in).
+                _emit({"type": "phase", "phase": "render", "host": label})
                 await fingerprint.run_render_catalog(cfg, conn_host, h.services)
             if cfg.cve:
+                _emit({"type": "phase", "phase": "cve", "host": label})
                 utils.info(f"correlating CVEs (NVD / OSV) for {h.label()}")
                 await cve.correlate(cfg, http, h.services)
                 # environmental refinement: demote ALPACA (CVE-2021-3618) on
@@ -100,6 +111,7 @@ async def run(cfg: ScanConfig, on_event=None) -> ScanResult:
     # ---- optional phase 4: web chain (hand web ports to webrecon) ----
     if cfg.web:
         from . import chain
+        _emit({"type": "phase", "phase": "web"})
         utils.info("web chain: handing discovered web ports to webrecon")
         await chain.run_web_chain(cfg, result)
         # the chain enriches services with a `web` summary AFTER the per-host

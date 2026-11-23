@@ -24,7 +24,7 @@ This repo ships **two CLIs and a browser console**, all sharing one async core:
 |------|---------|
 | **`webrecon`** | web app crawler & recon (crawl + JS + params + alive + subdomains + vhost + secrets) |
 | **`servicescan`** | port/service/version discovery (nmap + own fingerprint layer) with NVD/OSV CVE correlation |
-| **`webrecon-ui`** | browser-based operator console for `servicescan` (localhost; `python -m webrecon_ui`) — live SSE scan, CVE/exposure highlighting, the `--web` crawl chain, every output format as a download |
+| **`webrecon-ui`** | browser-based operator console for `servicescan` (localhost; `python -m webrecon_ui`) — live SSE scan with per-phase progress, CVE/exposure highlighting, the `--web` crawl chain, every output format as a download |
 
 ---
 
